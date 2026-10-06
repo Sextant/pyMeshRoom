@@ -23,11 +23,11 @@ Usability:
 Core functionality fixed:
 * Radio is a dedicated KISS modem, and can focus on sending and receiving packets
 * Much better persistence using storage instead of memory
-   *SQLite databases for members, posts, sync states, routes, and shared secrets
-   *Multiple routes per member with recency-weighted success rates, trying alternates before flood fallback
+   * SQLite databases for members, posts, sync states, routes, and shared secrets
 * More robust core functionality with passive mesh monitoring/mapping for better message delivery
    * Time via linux host (NTP)
    * A map of the mesh, learned from every packet heard (2/3-byte IDs only), so the room can build routes it was never told
+   * Multiple routes per member with recency-weighted success rates, trying alternates before flood fallback
    * A planned attempt order: best route, alternate, best again, next, flood; then backoff and give-up, instead of fixed retries
    * Newcomers reached direct on the first push: the companion directory knows where they are before they join by passively monitoring the mesh
    * Route shortcuts: unneeded hops are skipped when the room reaches a repeater directly, confirmed both ways
