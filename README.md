@@ -61,7 +61,7 @@ Install
    * dashboard: Set web UI admin password
 * Usage
    * Run ```python3 meshroom.py --config meshroom.json```
-*Updating:
+* Updating:
    * Stop meshroom
    * Clone again
    * Start meshroom
