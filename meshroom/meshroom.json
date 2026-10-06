@@ -1,0 +1,84 @@
+{
+  "_about": "meshroom settings. Sections are only for readability: any setting may also sit at the top level. Keys starting with _ are notes.",
+
+  "room": {
+    "name": "PiRoom",
+    "lat": 0.00,
+    "lon": 0.00,
+    "identity": "modem",
+    "advert_interval_min": 60,
+    "flood_advert_interval_h": 12
+  },
+
+  "access": {
+    "_note": "room_password \"\" = open room: anyone can join with a blank password. Use different admin and web passwords.",
+    "admin_password": "changeme",
+    "room_password": "",
+    "allow_read_only": false
+  },
+
+  "radio": {
+    "serial": "/dev/ttyACM0",
+    "baud": 115200,
+    "radio_freq_mhz": 910.525,
+    "radio_bw_khz": 62.5,
+    "radio_sf": 7,
+    "radio_cr": 5,
+    "radio_tx_power_dbm": null,
+    "path_hash_mode": 1
+  },
+
+  "modem_csma": {
+    "_note": "KISS channel access: txdelay and slottime in 10 ms units, persistence 0-255 (128 = 50% chance per slot).",
+    "kiss_txdelay": 1,
+    "kiss_persistence": 128,
+    "kiss_slottime": 5
+  },
+
+  "posts": {
+    "max_posts": 10,
+    "catchup_max": 3,
+    "dedupe_window_s": 300
+  },
+
+  "delivery": {
+    "_note": "Gaps are waits between pushes: base + per hop (direct routes), or the flood value.",
+    "push_gap_base_ms": 1000,
+    "push_gap_hop_ms": 2000,
+    "push_gap_flood_ms": 10000,
+    "push_quiet_ms": 1500,
+    "extra_acks": 1
+  },
+
+  "routing": {
+    "route_halflife_h": 6,
+    "topology_halflife_h": 24,
+    "routes_per_member": 6
+  },
+
+  "neighbours": {
+    "discovery_interval_min": 10,
+    "trace_neighbours": true,
+    "trace_min_interval_s": 60
+  },
+
+  "messages": {
+    "_note": "{room} is replaced with the room name.",
+    "welcome_new_members": true,
+    "welcome_message": "DM from room: You have successfully logged in!",
+    "welcome_advert_hint": "DM from room: Your name is unknown, please send a flood advert.",
+    "kick_message": "DM from room: You have been kicked and will need to log in again.",
+    "ban_message": "DM from room: You have been banned and your client will now be ignored."
+  },
+
+  "dashboard": {
+    "web_port": 8081,
+    "web_bind": "0.0.0.0",
+    "web_password": "changeme"
+  },
+
+  "system": {
+    "data_dir": "/opt/meshroom/data",
+    "log_level": "INFO"
+  }
+}
