@@ -51,18 +51,17 @@ Additional useful features:
    * Messages: configurable welcome (with an advert reminder), plus kick/ban notices.
    * Passively collects SNR and Route data from traces as they pass by.
 
-#Installation/usage:
+#Installation/usage
+Install
 * Clone repo to a linux machine that has a KISS meshcore modem connected via USB.
 * Make a copy of meshroom.json.example to meshroom.json and edit:
    * room: Set name and coordinates
    * access: Set room join password and room admin password
    * radio: Set USB interface and params for your region
    * dashboard: Set web UI admin password
-Run!
-
-```python3 meshroom.py --config meshroom.json```
-
-Updating:
+* Usage
+   * Run ```python3 meshroom.py --config meshroom.json```
+*Updating:
    * Stop meshroom
    * Clone again
    * Start meshroom
