@@ -72,6 +72,24 @@
     "ban_message": "DM from room: You have been banned and your client will now be ignored."
   },
 
+  "mqtt": {
+    "_note": "MQTT augmentation: also listen to the observer network. RF is always used for fallback and route calculations. Switches can be flipped on the dashboard (admin) and are saved here.",
+    "mqtt_enabled": false,
+    "mqtt_ack_ingest": true,
+    "mqtt_msg_ingest": true,
+    "mqtt_host": "mqtt.gomesh.dev",
+    "mqtt_port": 443,
+    "mqtt_transport": "websockets",
+    "mqtt_ws_path": "/mqtt",
+    "mqtt_tls": true,
+    "mqtt_tls_verify": true,
+    "mqtt_username": "CHANGE-ME",
+    "mqtt_password": "CHANGE-ME-token",
+    "mqtt_topics": [
+      "meshcore/#"
+    ]
+  },
+
   "dashboard": {
     "web_port": 8081,
     "web_bind": "0.0.0.0",
