@@ -2972,7 +2972,7 @@ class RoomServer:
                 public_key=hexs(self.id.pub_key), queue_depth=0, queue_max=int(self.cfg.observer_queue_max), dropped=0,
                 uptime=0, last_rx=0, last_error="", brokers={
                     "gomesh": dict(enabled=bool(self.cfg.observer_gomesh), connected=False, last_publish=0, last_error=""),
-                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error=""))))
+                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}))
 
     def member_inroutes(self, m, n=5):
         """Other paths the member's floods took to reach us (member side first), most seen first, excluding the current."""
