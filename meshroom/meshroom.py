@@ -2966,7 +2966,13 @@ class RoomServer:
             repeaters=rpts[:200], edges=edges,
             bans=[dict(pub=hexs(k), key=hexs(k[:6]), name=v["name"], ts=v["ts"]) for k, v in sorted(self.bans.items(), key=lambda x: -x[1]["ts"])],
             top_links=self.top_links(), discovery_min=self.cfg.discovery_interval_min, hour=self.hour_stats(),
-            sys=self.sys_stats(), observer=self.observer.status() if self.observer else None)
+            sys=self.sys_stats(), observer=self.observer.status() if self.observer else dict(
+                enabled=bool(self.cfg.observer_enabled), iata=str(self.cfg.observer_iata).upper(),
+                status=bool(self.cfg.observer_status), packets=bool(self.cfg.observer_packets), rx=bool(self.cfg.observer_rx),
+                public_key=hexs(self.id.pub_key), queue_depth=0, queue_max=int(self.cfg.observer_queue_max), dropped=0,
+                uptime=0, last_rx=0, last_error="", brokers={
+                    "gomesh": dict(enabled=bool(self.cfg.observer_gomesh), connected=False, last_publish=0, last_error=""),
+                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error=""))))
 
     def member_inroutes(self, m, n=5):
         """Other paths the member's floods took to reach us (member side first), most seen first, excluding the current."""
@@ -3109,6 +3115,12 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="chatin"><input id="chatmsg" maxlength="400" placeholder="Message everyone in the room (sent as the room)" autocomplete="off">
 <span id="chatleft" class="dim small"></span><button id="chatsend" onclick="sendChat()">Send</button></div>
 <div id="chaterr" class="poor small"></div></div>
+<div class="card" id="observercard" style="display:none"><h2>MQTT observer <span class="hdesc">admin only</span></h2>
+<div class="advrow"><label><input id="obs_enabled" type="checkbox"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="4"></label>
+<label><input id="obs_status" type="checkbox"> Status</label><label><input id="obs_packets" type="checkbox"> Packets</label><label><input id="obs_rx" type="checkbox"> RX</label>
+<label><input id="obs_gomesh" type="checkbox"> GoMesh</label><label><input id="obs_meshmapper" type="checkbox"> MeshMapper</label>
+<label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
+<table id="observerstatus" style="margin-top:10px"></table></div>
 <div class="card"><h2>Best neighbour repeaters <span class="dim small">(by trace packet loss)</span></h2><table id="toplinks"></table></div>
 <div class="card"><h2>Members <span class="hdesc">Room members &middot; tap a row for details</span></h2><table id="members"></table></div>
 <div class="card"><h2>Suspended <span class="hdesc">Inactive members, will be returned to member list when they are heard on the mesh</span></h2><table id="suspended"></table></div>
@@ -3152,8 +3164,20 @@ async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chat
  if(r.ok){$("chatmsg").value="";chatLeft();setTimeout(()=>loadChat(false),700)}
  else{let e="Could not send";try{e=(await r.json()).error||e}catch(x){}if(r.status===401){e="Your admin session has expired: log in again.";session()}$("chaterr").textContent=e}}
 async function session(){try{const r=await (await fetch("api/session")).json();ADMIN=r.admin;LOGIN_ON=r.login_enabled}catch(e){}
- const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);
+ const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
+function observerState(o,key){
+ const d=o||{enabled:false,iata:"SJC",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
+ if(ADMIN){$("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"SJC";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
+  $("obs_gomesh").checked=!(d.brokers&&d.brokers.gomesh)&&true||!!(d.brokers&&d.brokers.gomesh.enabled);$("obs_meshmapper").checked=!(d.brokers&&d.brokers.meshmapper)&&true||!!(d.brokers&&d.brokers.meshmapper.enabled);$("obs_queue").value=d.queue_max||1000;}
+ const bs=d.brokers||{}, row=n=>{const b=bs[n]||{},s=b.connected?'<span class="good">connected</span>':'<span class="poor">disconnected</span>';return `<tr><td>${n}</td><td>${s}</td><td>${b.last_publish?ago(b.last_publish)+" ago":"never"}</td><td class="small">${esc(b.last_error||"-")}</td></tr>`};
+ $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||key)}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
+  `<tr><th>Broker</th><th>State</th><th>Last publish</th><th colspan="3">Last error</th></tr>`+row("gomesh")+row("meshmapper")+(d.last_error?`<tr><th>Observer</th><td colspan="5" class="poor">${esc(d.last_error)}</td></tr>`:"");
+}
+async function saveObserver(){
+ const body={observer_enabled:$("obs_enabled").checked,observer_iata:$("obs_iata").value.trim().toUpperCase(),observer_status:$("obs_status").checked,observer_packets:$("obs_packets").checked,observer_rx:$("obs_rx").checked,observer_gomesh:$("obs_gomesh").checked,observer_meshmapper:$("obs_meshmapper").checked,observer_queue_max:Number($("obs_queue").value)};
+ const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Saved; broker settings are being refreshed.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
+}
 function loginClick(){if(ADMIN){fetch("api/logout",{method:"POST"}).then(()=>session().then(load));return}
  $("loginerr").textContent="";$("pw").value="";$("loginbox").style.display="flex";setTimeout(()=>$("pw").focus(),50)}
 function closeLogin(){$("loginbox").style.display="none"}
@@ -3218,6 +3242,7 @@ async function load(){
   `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_ok!=null?` &middot; <b class="${Hs.push_ok>=80?"good":Hs.push_ok>=50?"mid":"poor"}">${Hs.push_ok}%</b> delivered`:""}</span>`,
   `<span class="dim small">last ${Hs.minutes>=60?"hour":Hs.minutes+" min"}</span>`].join(""):'<span class="dim small">stats appear after the first minute</span>';
  $("rclock").textContent="up "+ago(Date.now()/1000-R.uptime).replace("s"," s")+(R.clock_ok?"":"  CLOCK NOT SYNCED");
+ observerState(st.observer,R.key);
  const k=[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks],["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
  $("kpis").innerHTML=k.map(x=>`<div class="kpi"><span class="dim small">${x[0]}</span><b>${esc(x[1])}</b></div>`).join("");
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
@@ -3470,6 +3495,33 @@ class WebUI:
                     return self._send(200, '{"ok":true}', cookie="mr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 if not self._is_admin():                        # everything below changes things: admins only
                     return self._send(401, '{"error":"log in first"}')
+                if parts == ["api", "observer"]:
+                    try:
+                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                    except ValueError:
+                        return self._send(400, '{"error":"invalid JSON"}')
+                    bool_keys = ("observer_enabled", "observer_status", "observer_packets", "observer_rx",
+                                 "observer_gomesh", "observer_meshmapper")
+                    updates = {}
+                    for key in bool_keys:
+                        if key in body:
+                            if not isinstance(body[key], bool):
+                                return self._send(400, json.dumps({"error": "%s must be true or false" % key}))
+                            updates[key] = body[key]
+                    if "observer_iata" in body:
+                        iata = str(body["observer_iata"]).strip().upper()
+                        if len(iata) != 3 or any(c < "A" or c > "Z" for c in iata):
+                            return self._send(400, '{"error":"IATA must be exactly three letters"}')
+                        updates["observer_iata"] = iata
+                    if "observer_queue_max" in body:
+                        qmax = body["observer_queue_max"]
+                        if isinstance(qmax, bool) or not isinstance(qmax, int) or not 10 <= qmax <= 10000:
+                            return self._send(400, '{"error":"queue maximum must be an integer from 10 to 10000"}')
+                        updates["observer_queue_max"] = qmax
+                    if not updates:
+                        return self._send(400, '{"error":"no observer settings supplied"}')
+                    events.put(("observer_config", updates))     # persisted and applied by the main loop
+                    return self._send(200, json.dumps({"ok": True, "updates": updates}))
                 if parts == ["api", "advert"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
@@ -3583,7 +3635,12 @@ def main():
     room.events_put = events.put
     room.events_q = events
     observer = None
-    if cfg.observer_enabled:
+
+    def start_observer():
+        """Start the optional worker without allowing its failure to stop MeshRoom."""
+        nonlocal observer
+        if observer or not cfg.observer_enabled:
+            return
         try:
             # Kept optional: installations that do not opt in never import
             # paho-mqtt and retain their existing MeshRoom behavior.
@@ -3595,6 +3652,7 @@ def main():
             # An observer failure must never prevent the radio room from
             # starting.  The error is visible in the normal MeshRoom log.
             log.error("MQTT observer disabled: %s", e)
+    start_observer()
     if cfg.web_port:
         try:
             room.publish_web_state()
@@ -3616,6 +3674,7 @@ def main():
 
     def handle(ev):
         """One event. Returns False to stop."""
+        nonlocal observer
         kind = ev[0]
         if kind == "rx":
             room.on_rx(*ev[1:])
@@ -3639,6 +3698,14 @@ def main():
             room.suggest_route(ev[1], ev[2])
             room.web_dirty = True
         elif kind == "web_wake":
+            room.web_dirty = True
+        elif kind == "observer_config":
+            for key, value in ev[1].items():
+                cfg.set(key, value)
+            if observer:
+                observer.refresh()                            # worker owns all network lifecycle changes
+            else:
+                start_observer()
             room.web_dirty = True
         elif kind == "dberror":
             log.error("database write failed: %s", ev[1])

@@ -46,7 +46,7 @@ def make_auth_token(identity, public_key, audience, ttl=3600):
 class ObserverBridge:
     """Non-blocking handoff between MeshRoom RX and MQTT observer workers."""
 
-    def __init__(self, cfg, identity):
+    def __init__(self, cfg, identity, start=True):
         self.cfg = cfg
         self.identity = identity
         self.public_key = identity.pub_key.hex().upper()
@@ -61,15 +61,19 @@ class ObserverBridge:
         self.last_publish = {}
         self.last_rx = 0.0
         self._lock = threading.Lock()
-        self.thread = threading.Thread(target=self._run, name="mqtt-observer", daemon=True)
-        self.thread.start()
+        self._refresh = threading.Event()
+        self.thread = None
+        if start:
+            self.thread = threading.Thread(target=self._run, name="mqtt-observer", daemon=True)
+            self.thread.start()
 
     def submit_rx(self, raw, snr, rssi):
         """Queue an RX observation without ever waiting on network I/O."""
         received_at = time.time()
         # Do not enqueue at all when packet reporting is disabled.  This is a
         # receive-path-only operation: no network or serial work happens here.
-        if not (getattr(self.cfg, "observer_packets", True) and
+        if not (getattr(self.cfg, "observer_enabled", False) and
+                getattr(self.cfg, "observer_packets", True) and
                 getattr(self.cfg, "observer_rx", True)):
             return
         item = (bytes(raw), float(snr), int(rssi), received_at)
@@ -90,7 +94,8 @@ class ObserverBridge:
             self.q.put_nowait(None)
         except queue.Full:
             pass
-        self.thread.join(timeout=5)
+        if self.thread:
+            self.thread.join(timeout=5)
         for client in self.clients.values():
             try:
                 client.loop_stop()
@@ -99,6 +104,8 @@ class ObserverBridge:
                 pass
 
     def _enabled(self):
+        if not getattr(self.cfg, "observer_enabled", False):
+            return []
         out = []
         if getattr(self.cfg, "observer_gomesh", True):
             out.append("gomesh")
@@ -121,6 +128,9 @@ class ObserverBridge:
             return {
                 "enabled": bool(getattr(self.cfg, "observer_enabled", False)),
                 "iata": self.iata,
+                "status": bool(getattr(self.cfg, "observer_status", True)),
+                "packets": bool(getattr(self.cfg, "observer_packets", True)),
+                "rx": bool(getattr(self.cfg, "observer_rx", True)),
                 "public_key": self.public_key,
                 "queue_depth": self.q.qsize(),
                 "queue_max": self.q.maxsize,
@@ -151,6 +161,39 @@ class ObserverBridge:
     def _set_connected(self, name, value):
         with self._lock:
             self.connected[name] = bool(value)
+
+    def refresh(self):
+        """Apply changed observer settings from the worker, never the RX path."""
+        self._refresh.set()
+
+    def _disconnect(self, name, offline=True):
+        client = self.clients.pop(name, None)
+        if client is None:
+            return
+        if offline:
+            self._publish_status(name, online=False, client=client)
+        try:
+            client.disconnect()
+            client.loop_stop()
+        except Exception as e:
+            self._record_error(name, e)
+        self._set_connected(name, False)
+
+    def _sync_clients(self, mqtt, rebuild=False):
+        """Reconcile broker settings in the observer worker thread."""
+        self.iata = str(getattr(self.cfg, "observer_iata", "SJC")).upper()
+        self.q.maxsize = max(10, int(getattr(self.cfg, "observer_queue_max", 1000)))
+        enabled = set(self._enabled())
+        if rebuild:
+            for name in list(self.clients):
+                self._disconnect(name)
+        else:
+            for name in list(self.clients):
+                if name not in enabled:
+                    self._disconnect(name)
+        for name in enabled:
+            if name not in self.clients:
+                self._connect(name, mqtt)
 
     def _connect(self, name, mqtt):
         host, port, audience = BROKERS[name]
@@ -219,7 +262,7 @@ class ObserverBridge:
 
     def _publish_packet(self, name, raw, snr, rssi, received_at):
         client = self.clients.get(name)
-        if client is None or not self.connected.get(name):
+        if name not in self._enabled() or client is None or not self.connected.get(name):
             return False
         ptype, route, payload_len = self._packet_metadata(raw)
         dt = datetime.fromtimestamp(received_at, timezone.utc)
@@ -250,14 +293,14 @@ class ObserverBridge:
             self._record_error(name, e)
         return False
 
-    def _publish_status(self, name):
+    def _publish_status(self, name, online=True, client=None):
         if not getattr(self.cfg, "observer_status", True):
             return False
-        client = self.clients.get(name)
-        if client is None or not self.connected.get(name):
+        client = client or self.clients.get(name)
+        if client is None or (online and (name not in self._enabled() or not self.connected.get(name))):
             return False
         try:
-            result = client.publish(self._topic("status"), self._status_message(True), qos=0, retain=True)
+            result = client.publish(self._topic("status"), self._status_message(online), qos=0, retain=True)
             if getattr(result, "rc", 0) == 0:
                 with self._lock:
                     self.last_publish[name] = time.time()
@@ -275,11 +318,13 @@ class ObserverBridge:
             log.error("observer enabled but paho-mqtt is missing")
             return
 
-        for name in self._enabled():
-            self._connect(name, mqtt)
+        self._sync_clients(mqtt)
 
         next_status = time.monotonic() + STATUS_INTERVAL
         while self.running:
+            if self._refresh.is_set():
+                self._refresh.clear()
+                self._sync_clients(mqtt, rebuild=True)
             try:
                 item = self.q.get(timeout=1.0)
             except queue.Empty:
