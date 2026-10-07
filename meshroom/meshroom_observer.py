@@ -131,6 +131,27 @@ class ObserverBridge:
             self.last_error[name] = str(e)
             log.error("observer %s connection setup failed: %s", name, e)
 
+    def _topic(self, kind):
+        return "meshcore/%s/%s/%s" % (self.iata, self.public_key, kind)
+
+    @staticmethod
+    def _packet_metadata(raw):
+        """Extract fields required by the standard MeshCore observer payload."""
+        if not raw:
+            return 0, "?", 0
+        header = raw[0]
+        route_type = header & 0x03
+        packet_type = (header >> 2) & 0x0F
+        route = ("F", "F", "D", "D")[route_type]
+        i = 1 + (4 if route_type in (0, 3) else 0)
+        if i >= len(raw):
+            return packet_type, route, 0
+        path_len = raw[i]
+        hash_size = (path_len >> 6) + 1
+        path_bytes = (path_len & 63) * hash_size
+        payload_len = max(0, len(raw) - i - 1 - path_bytes)
+        return packet_type, route, payload_len
+
     def _run(self):
         try:
             import paho.mqtt.client as mqtt
