@@ -202,4 +202,7 @@ class ObserverBridge:
                 continue
             if item is None:
                 break
-            # Packet publishing is added separately; keep broker lifecycle isolated here.
+            raw, snr, rssi, received_at = item
+            # Broker failures are independent: one destination cannot suppress the other.
+            for name in list(self.clients):
+                self._publish_packet(name, raw, snr, rssi, received_at)
