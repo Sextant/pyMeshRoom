@@ -3121,6 +3121,11 @@ Separate with commas. Type a name or id for suggestions.</div>
 <label><input id="obs_gomesh" type="checkbox"> GoMesh</label><label><input id="obs_meshmapper" type="checkbox"> MeshMapper</label>
 <label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
 <table id="observerstatus" style="margin-top:10px"></table></div>
+<div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members</span></h2>
+<div class="advrow"><label><input id="welcome_enabled" type="checkbox"> Send welcome DM</label><button onclick="saveWelcome()">Save welcome settings</button><span id="welcomemsg" class="small dim"></span></div>
+<div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
+<div style="margin-top:8px"><label>Name-unknown hint <span class="dim small">(optional; appended when the member has not sent an advert)</span><br><textarea id="welcome_hint" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
+<div class="hint">Use <code>{room}</code> for the room name. The rendered welcome message and optional hint together may be at most 151 UTF-8 bytes.</div></div>
 <div class="card"><h2>Best neighbour repeaters <span class="dim small">(by trace packet loss)</span></h2><table id="toplinks"></table></div>
 <div class="card"><h2>Members <span class="hdesc">Room members &middot; tap a row for details</span></h2><table id="members"></table></div>
 <div class="card"><h2>Suspended <span class="hdesc">Inactive members, will be returned to member list when they are heard on the mesh</span></h2><table id="suspended"></table></div>
@@ -3140,7 +3145,7 @@ function score(m){if(m.delivery==null)return'<span class="dim">new</span>';const
  return `<span class="${c}">${m.delivery}%</span> <span class="dim small">${m.avg_attempts} tries &middot; ${m.deliveries}</span>`}
 function route(r){return r==null?'<span class="dim">unknown (flood)</span>':r.length?r.map(esc).join(" &rsaquo; "):'direct'}
 let EXP=new Set(),map=null,layer=null,RPTS=[],MEMBERS=[],LAST=null,ADMIN=false,LOGIN_ON=false;
-let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false;
+let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false,WELCOME_LOADED=false;
 function bytesOf(t){return new TextEncoder().encode(t).length}
 function chatLeft(){const n=CHAT_MAX-bytesOf($("chatmsg").value);$("chatleft").textContent=n+" left";$("chatleft").className=n<0?"poor small":"dim small";$("chatsend").disabled=n<0}
 async function loadChat(reset){if(!ADMIN||CHAT_BUSY)return;CHAT_BUSY=true;
@@ -3164,7 +3169,7 @@ async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chat
  if(r.ok){$("chatmsg").value="";chatLeft();setTimeout(()=>loadChat(false),700)}
  else{let e="Could not send";try{e=(await r.json()).error||e}catch(x){}if(r.status===401){e="Your admin session has expired: log in again.";session()}$("chaterr").textContent=e}}
 async function session(){try{const r=await (await fetch("api/session")).json();ADMIN=r.admin;LOGIN_ON=r.login_enabled}catch(e){}
- const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);
+ const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=ADMIN?"":"none";$("welcomecard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);if(ADMIN&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
 function observerState(o,key){
  const d=o||{enabled:false,iata:"SJC",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
@@ -3177,6 +3182,13 @@ function observerState(o,key){
 async function saveObserver(){
  const body={observer_enabled:$("obs_enabled").checked,observer_iata:$("obs_iata").value.trim().toUpperCase(),observer_status:$("obs_status").checked,observer_packets:$("obs_packets").checked,observer_rx:$("obs_rx").checked,observer_gomesh:$("obs_gomesh").checked,observer_meshmapper:$("obs_meshmapper").checked,observer_queue_max:Number($("obs_queue").value)};
  const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Saved; broker settings are being refreshed.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
+}
+async function loadWelcome(){
+ const r=await fetch("api/welcome");if(!r.ok)return;const d=await r.json();$("welcome_enabled").checked=!!d.welcome_new_members;$("welcome_message").value=d.welcome_message||"";$("welcome_hint").value=d.welcome_advert_hint||"";WELCOME_LOADED=true;
+}
+async function saveWelcome(){
+ const body={welcome_new_members:$("welcome_enabled").checked,welcome_message:$("welcome_message").value,welcome_advert_hint:$("welcome_hint").value};
+ const r=await fetch("api/welcome",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Welcome settings saved.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("welcomemsg").textContent=m;
 }
 function loginClick(){if(ADMIN){fetch("api/logout",{method:"POST"}).then(()=>session().then(load));return}
  $("loginerr").textContent="";$("pw").value="";$("loginbox").style.display="flex";setTimeout(()=>$("pw").focus(),50)}
@@ -3467,6 +3479,15 @@ class WebUI:
                     msgs = [dict(ts=ts, who=room.chat_label(a), room=(a == room.id.pub_key), text=txt)
                             for ts, a, txt, to in posts if to is None and ts > since]
                     return self._send(200, json.dumps({"messages": msgs, "max_bytes": MAX_POST_TEXT_LEN}))
+                if path == "/api/welcome":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    return self._send(200, json.dumps({
+                        "welcome_new_members": bool(cfg.welcome_new_members),
+                        "welcome_message": str(cfg.welcome_message),
+                        "welcome_advert_hint": str(cfg.welcome_advert_hint),
+                        "max_bytes": MAX_POST_TEXT_LEN,
+                    }))
                 self._send(404, '{"error":"not found"}')
 
             def _post(self):
@@ -3521,6 +3542,34 @@ class WebUI:
                     if not updates:
                         return self._send(400, '{"error":"no observer settings supplied"}')
                     events.put(("observer_config", updates))     # persisted and applied by the main loop
+                    return self._send(200, json.dumps({"ok": True, "updates": updates}))
+                if parts == ["api", "welcome"]:
+                    try:
+                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                    except ValueError:
+                        return self._send(400, '{"error":"invalid JSON"}')
+                    updates = {}
+                    if "welcome_new_members" in body:
+                        if not isinstance(body["welcome_new_members"], bool):
+                            return self._send(400, '{"error":"welcome_new_members must be true or false"}')
+                        updates["welcome_new_members"] = body["welcome_new_members"]
+                    for key in ("welcome_message", "welcome_advert_hint"):
+                        if key in body:
+                            if not isinstance(body[key], str):
+                                return self._send(400, json.dumps({"error": "%s must be text" % key}))
+                            updates[key] = body[key]
+                    if not updates:
+                        return self._send(400, '{"error":"no welcome settings supplied"}')
+                    enabled = updates.get("welcome_new_members", bool(cfg.welcome_new_members))
+                    message = updates.get("welcome_message", str(cfg.welcome_message))
+                    hint = updates.get("welcome_advert_hint", str(cfg.welcome_advert_hint))
+                    if enabled and message:
+                        rendered = message.replace("{room}", str(cfg.name))
+                        if hint:
+                            rendered += " " + hint.replace("{room}", str(cfg.name))
+                        if len(rendered.encode()) > MAX_POST_TEXT_LEN:
+                            return self._send(400, json.dumps({"error": "welcome DM is too long after {room} is replaced (maximum %d UTF-8 bytes)" % MAX_POST_TEXT_LEN}))
+                    events.put(("welcome_config", updates))      # main loop persists updates before a member can receive them
                     return self._send(200, json.dumps({"ok": True, "updates": updates}))
                 if parts == ["api", "advert"]:
                     try:
@@ -3707,6 +3756,9 @@ def main():
             else:
                 start_observer()
             room.web_dirty = True
+        elif kind == "welcome_config":
+            for key, value in ev[1].items():
+                cfg.set(key, value)
         elif kind == "dberror":
             log.error("database write failed: %s", ev[1])
         elif kind == "txbusy":
