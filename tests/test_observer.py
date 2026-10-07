@@ -64,6 +64,50 @@ class ObserverTests(unittest.TestCase):
         finally:
             bridge.close()
 
+    def test_rf_statistics_count_each_kiss_rx_once_and_expire_old_buckets(self):
+        bridge = ObserverBridge(config(observer_packets=False), FakeIdentity(), start=False)
+        try:
+            bridge.submit_rx(b"one", 1.0, -90)
+            bridge.submit_rx(b"two", 2.0, -91)
+            self.assertEqual(bridge.q.qsize(), 0)  # packet reporting is gated off
+            stats = bridge.statistics()
+            self.assertEqual(stats["rf_total"], 2)
+            self.assertEqual(stats["rf_current_ppm"], 2)
+            self.assertEqual(stats["rf_last_60m"], 2)
+            self.assertEqual(stats["rf_peak_ppm"], 2)
+            with bridge._lock:
+                bridge.rf_buckets[int(time.time() // 60) - 60] = 99
+            stats = bridge.statistics()
+            self.assertEqual(stats["rf_last_60m"], 2)
+            self.assertEqual(len(stats["rf_per_minute"]), 60)
+        finally:
+            bridge.close()
+
+    def test_broker_statistics_are_independent_local_submissions(self):
+        class Client:
+            def __init__(self, rc):
+                self.rc = rc
+
+            def publish(self, *args, **kwargs):
+                return SimpleNamespace(rc=self.rc)
+
+        bridge = ObserverBridge(config(), FakeIdentity(), start=False)
+        try:
+            bridge.clients = {"gomesh": Client(0), "meshmapper": Client(5)}
+            bridge.connected = {"gomesh": True, "meshmapper": True}
+            self.assertTrue(bridge._publish_packet("gomesh", b"\x0a\x00x", 1.5, -90, time.time()))
+            self.assertFalse(bridge._publish_packet("meshmapper", b"\x0a\x00x", 1.5, -90, time.time()))
+            stats = bridge.statistics()["brokers"]
+            self.assertEqual(stats["gomesh"]["attempts"], 1)
+            self.assertEqual(stats["gomesh"]["accepted"], 1)
+            self.assertEqual(stats["gomesh"]["failures"], 0)
+            self.assertGreater(stats["gomesh"]["payload_bytes"], 0)
+            self.assertEqual(stats["meshmapper"]["attempts"], 1)
+            self.assertEqual(stats["meshmapper"]["accepted"], 0)
+            self.assertEqual(stats["meshmapper"]["failures"], 1)
+        finally:
+            bridge.close()
+
     def test_status_exposes_queue_and_broker_diagnostics(self):
         bridge = ObserverBridge(config(), FakeIdentity(), start=False)
         try:

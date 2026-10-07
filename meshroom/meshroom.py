@@ -3092,6 +3092,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #tip{position:fixed;z-index:2000;display:none;max-width:460px;background:#0d1014;border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;pointer-events:none;box-shadow:0 4px 18px #0008}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
+.traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
 </style></head><body>
 <header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
@@ -3115,17 +3116,6 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="chatin"><input id="chatmsg" maxlength="400" placeholder="Message everyone in the room (sent as the room)" autocomplete="off">
 <span id="chatleft" class="dim small"></span><button id="chatsend" onclick="sendChat()">Send</button></div>
 <div id="chaterr" class="poor small"></div></div>
-<div class="card" id="observercard" style="display:none"><h2>MQTT observer <span class="hdesc">admin only</span></h2>
-<div class="advrow"><label><input id="obs_enabled" type="checkbox"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="4"></label>
-<label><input id="obs_status" type="checkbox"> Status</label><label><input id="obs_packets" type="checkbox"> Packets</label><label><input id="obs_rx" type="checkbox"> RX</label>
-<label><input id="obs_gomesh" type="checkbox"> GoMesh</label><label><input id="obs_meshmapper" type="checkbox"> MeshMapper</label>
-<label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
-<table id="observerstatus" style="margin-top:10px"></table></div>
-<div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members</span></h2>
-<div class="advrow"><label><input id="welcome_enabled" type="checkbox"> Send welcome DM</label><button onclick="saveWelcome()">Save welcome settings</button><span id="welcomemsg" class="small dim"></span></div>
-<div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
-<div style="margin-top:8px"><label>Name-unknown hint <span class="dim small">(optional; appended when the member has not sent an advert)</span><br><textarea id="welcome_hint" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
-<div class="hint">Use <code>{room}</code> for the room name. The rendered welcome message and optional hint together may be at most 151 UTF-8 bytes.</div></div>
 <div class="card"><h2>Best neighbour repeaters <span class="dim small">(by trace packet loss)</span></h2><table id="toplinks"></table></div>
 <div class="card"><h2>Members <span class="hdesc">Room members &middot; tap a row for details</span></h2><table id="members"></table></div>
 <div class="card"><h2>Suspended <span class="hdesc">Inactive members, will be returned to member list when they are heard on the mesh</span></h2><table id="suspended"></table></div>
@@ -3133,6 +3123,17 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="card"><h2>Repeater map</h2>
 <div class="mapwrap"><div><div id="map"></div><div id="mapnote" class="dim small"></div></div>
 <div id="rdetail" class="rdetail"><div class="dim pick">Select a repeater from the map</div></div></div></div>
+<div class="card" id="observercard" style="display:none"><h2>MQTT observer <span class="hdesc">admin only</span></h2>
+<div class="advrow"><label><input id="obs_enabled" type="checkbox"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="4"></label>
+<label><input id="obs_status" type="checkbox"> Status</label><label><input id="obs_packets" type="checkbox"> Packets</label><label><input id="obs_rx" type="checkbox"> RX</label>
+<label><input id="obs_gomesh" type="checkbox"> GoMesh</label><label><input id="obs_meshmapper" type="checkbox"> MeshMapper</label>
+<label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
+<table id="observerstatus" style="margin-top:10px"></table><div id="observertraffic"></div></div>
+<div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members</span></h2>
+<div class="advrow"><label><input id="welcome_enabled" type="checkbox"> Send welcome DM</label><button onclick="saveWelcome()">Save welcome settings</button><span id="welcomemsg" class="small dim"></span></div>
+<div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
+<div style="margin-top:8px"><label>Name-unknown hint <span class="dim small">(optional; appended when the member has not sent an advert)</span><br><textarea id="welcome_hint" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
+<div class="hint">Use <code>{room}</code> for the room name. The rendered welcome message and optional hint together may be at most 151 UTF-8 bytes.</div></div>
 <div class="card"><h2>Repeaters heard</h2><table id="rpts"></table></div>
 </main>
 <script>
@@ -3183,6 +3184,15 @@ async function saveObserver(){
  const body={observer_enabled:$("obs_enabled").checked,observer_iata:$("obs_iata").value.trim().toUpperCase(),observer_status:$("obs_status").checked,observer_packets:$("obs_packets").checked,observer_rx:$("obs_rx").checked,observer_gomesh:$("obs_gomesh").checked,observer_meshmapper:$("obs_meshmapper").checked,observer_queue_max:Number($("obs_queue").value)};
  const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Saved; broker settings are being refreshed.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
 }
+function fmtBytes(n){return n<1024?n+" B":n<1048576?(n/1024).toFixed(1)+" KiB":(n/1048576).toFixed(1)+" MiB"}
+function fmtDuration(n){n=Math.max(0,Math.floor(n||0));const h=Math.floor(n/3600),m=Math.floor(n%3600/60),s=n%60;return h?`${h}h ${m}m`:m?`${m}m ${s}s`:`${s}s`}
+function observerTraffic(d){
+ const box=$("observertraffic");if(!ADMIN){box.innerHTML="";return}if(!d||!d.available){box.innerHTML='<h2>Traffic statistics</h2><span class="dim small">Observer statistics are available after the observer is enabled.</span>';return}
+ const v=d.rf_per_minute||[],max=Math.max(0,...v),bars=max?`<div class="traffic-chart">${v.map(n=>`<i title="${n} RF packet${n===1?"":"s"}" class="${n?"":"zero"}" style="height:${n?Math.max(3,Math.round(100*n/max)):1}%"></i>`).join("")}</div><div class="traffic-label dim small"><span>60 minutes ago</span><span>now</span></div>`:'<div class="traffic-chart">'+Array.from({length:60},()=>'<i class="zero"></i>').join("")+'</div><div class="dim small">No RF traffic received in the last 60 minutes.</div>';
+ const b=d.brokers||{},row=n=>{const x=b[n]||{},state=x.connected?'<span class="good">connected</span>':'<span class="poor">disconnected</span>';return `<tr><td>${n}</td><td>${state}</td><td>${x.attempts||0}</td><td>${x.accepted||0}</td><td>${x.failures||0}</td><td>${fmtBytes(x.payload_bytes||0)}</td><td>${x.last_success?ago(x.last_success)+" ago":"never"}</td><td class="small">${esc(x.last_error||"-")}</td></tr>`};
+ box.innerHTML=`<h2>Traffic statistics <span class="hdesc">admin only &middot; local measurements</span></h2><div class="kpis"><div class="kpi"><span class="dim small">RF packets received</span><b>${d.rf_total||0}</b></div><div class="kpi"><span class="dim small">Current traffic</span><b>${d.rf_current_ppm||0}/min</b></div><div class="kpi"><span class="dim small">Peak traffic</span><b>${d.rf_peak_ppm||0}/min</b></div><div class="kpi"><span class="dim small">Last 60 minutes</span><b>${d.rf_last_60m||0}</b></div><div class="kpi"><span class="dim small">Observer uptime</span><b>${fmtDuration(d.uptime)}</b></div><div class="kpi"><span class="dim small">Queue dropped</span><b>${d.dropped||0}</b></div></div><h3>RF traffic: last 60 minutes</h3>${bars}<h3>MQTT broker traffic <span class="hdesc">local publish submissions; QoS 0 does not confirm broker delivery</span></h3><table><tr><th>Broker</th><th>State</th><th>Attempts</th><th>Accepted</th><th>Failures</th><th>Payload bytes</th><th>Last accepted</th><th>Last error</th></tr>${row("gomesh")}${row("meshmapper")}</table>`;
+}
+async function loadObserverTraffic(){if(!ADMIN)return;try{const r=await fetch("api/observer/stats");if(r.ok)observerTraffic(await r.json())}catch(e){}}
 async function loadWelcome(){
  const r=await fetch("api/welcome");if(!r.ok)return;const d=await r.json();$("welcome_enabled").checked=!!d.welcome_new_members;$("welcome_message").value=d.welcome_message||"";$("welcome_hint").value=d.welcome_advert_hint||"";WELCOME_LOADED=true;
 }
@@ -3254,7 +3264,7 @@ async function load(){
   `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_ok!=null?` &middot; <b class="${Hs.push_ok>=80?"good":Hs.push_ok>=50?"mid":"poor"}">${Hs.push_ok}%</b> delivered`:""}</span>`,
   `<span class="dim small">last ${Hs.minutes>=60?"hour":Hs.minutes+" min"}</span>`].join(""):'<span class="dim small">stats appear after the first minute</span>';
  $("rclock").textContent="up "+ago(Date.now()/1000-R.uptime).replace("s"," s")+(R.clock_ok?"":"  CLOCK NOT SYNCED");
- observerState(st.observer,R.key);
+ observerState(st.observer,R.key);if(ADMIN)loadObserverTraffic();
  const k=[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks],["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
  $("kpis").innerHTML=k.map(x=>`<div class="kpi"><span class="dim small">${x[0]}</span><b>${esc(x[1])}</b></div>`).join("");
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
@@ -3466,6 +3476,14 @@ class WebUI:
                         while room.web_state is before and time.monotonic() < deadline:
                             time.sleep(0.02)                        # ...and answer with it, not the stale one
                     return self._send(200, state_bytes())
+                if path == "/api/observer/stats":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    if room.observer is None:
+                        return self._send(200, '{"available":false}')
+                    snapshot = room.observer.statistics()
+                    snapshot["available"] = True
+                    return self._send(200, json.dumps(snapshot))
                 if path == "/api/chat":
                     if not self._is_admin():
                         return self._send(401, '{"error":"log in first"}')

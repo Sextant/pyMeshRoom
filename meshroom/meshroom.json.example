@@ -79,7 +79,7 @@
   },
 
   "observer": {
-    "_note": "Optional MQTT packet observer. Requires python3-paho-mqtt when enabled; it never opens the serial device.",
+    "_note": "Optional MQTT packet observer. Requires python3-paho-mqtt when enabled; it never opens the serial device. Packets and RX are compatibility gates for the same RX-only packet reporting path.",
     "observer_enabled": false,
     "observer_iata": "SJC",
     "observer_status": true,

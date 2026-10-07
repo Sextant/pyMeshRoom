@@ -60,6 +60,12 @@ class ObserverBridge:
         self.last_error = {}
         self.last_publish = {}
         self.last_rx = 0.0
+        self.rf_total = 0
+        self.rf_peak_ppm = 0
+        self.rf_buckets = {}                         # UTC epoch minute -> received RF packet count
+        self.broker_stats = {name: {"attempts": 0, "accepted": 0, "failures": 0,
+                                    "payload_bytes": 0, "last_success": 0.0}
+                             for name in BROKERS}
         self._lock = threading.Lock()
         self._refresh = threading.Event()
         self.thread = None
@@ -70,6 +76,17 @@ class ObserverBridge:
     def submit_rx(self, raw, snr, rssi):
         """Queue an RX observation without ever waiting on network I/O."""
         received_at = time.time()
+        # Count actual KISS RX observations once, before MQTT/reporting gates.
+        # This short locked section only updates in-memory integers and buckets.
+        minute = int(received_at // 60)
+        with self._lock:
+            self.rf_total += 1
+            self.rf_buckets[minute] = self.rf_buckets.get(minute, 0) + 1
+            self.rf_peak_ppm = max(self.rf_peak_ppm, self.rf_buckets[minute])
+            for old_minute in tuple(self.rf_buckets):
+                if old_minute < minute - 59:
+                    del self.rf_buckets[old_minute]
+            self.last_rx = received_at
         # Do not enqueue at all when packet reporting is disabled.  This is a
         # receive-path-only operation: no network or serial work happens here.
         if not (getattr(self.cfg, "observer_enabled", False) and
@@ -77,8 +94,6 @@ class ObserverBridge:
                 getattr(self.cfg, "observer_rx", True)):
             return
         item = (bytes(raw), float(snr), int(rssi), received_at)
-        with self._lock:
-            self.last_rx = received_at
         try:
             self.q.put_nowait(item)
         except queue.Full:
@@ -144,6 +159,31 @@ class ObserverBridge:
                 "brokers": brokers,
             }
 
+    def statistics(self):
+        """Admin-only traffic snapshot. Counts are local observations/submissions, not broker delivery."""
+        minute = int(time.time() // 60)
+        with self._lock:
+            for old_minute in tuple(self.rf_buckets):
+                if old_minute < minute - 59:
+                    del self.rf_buckets[old_minute]
+            buckets = [self.rf_buckets.get(m, 0) for m in range(minute - 59, minute + 1)]
+            brokers = {name: dict(values, connected=bool(self.connected.get(name)),
+                                  last_error=self.last_error.get(name, ""))
+                       for name, values in self.broker_stats.items()}
+            return {
+                "enabled": bool(getattr(self.cfg, "observer_enabled", False)),
+                "uptime": max(0, int(time.time() - self.started)),
+                "rf_total": self.rf_total,
+                "rf_current_ppm": buckets[-1],
+                "rf_peak_ppm": self.rf_peak_ppm,
+                "rf_last_60m": sum(buckets),
+                "rf_per_minute": buckets,
+                "queue_depth": self.q.qsize(),
+                "queue_max": self.q.maxsize,
+                "dropped": self.dropped,
+                "brokers": brokers,
+            }
+
     def _status_message(self, online=True):
         snapshot = self.status()
         return json.dumps({
@@ -164,6 +204,23 @@ class ObserverBridge:
     def _set_connected(self, name, value):
         with self._lock:
             self.connected[name] = bool(value)
+
+    def _record_attempt(self, name, payload):
+        with self._lock:
+            stats = self.broker_stats[name]
+            stats["attempts"] += 1
+            stats["payload_bytes"] += len(payload.encode())
+
+    def _record_publish_result(self, name, accepted):
+        when = time.time()
+        with self._lock:
+            stats = self.broker_stats[name]
+            if accepted:
+                stats["accepted"] += 1
+                stats["last_success"] = when
+                self.last_publish[name] = when
+            else:
+                stats["failures"] += 1
 
     def refresh(self):
         """Apply changed observer settings from the worker, never the RX path."""
@@ -285,14 +342,17 @@ class ObserverBridge:
             "SNR": str(snr),
             "RSSI": str(rssi),
         }
+        payload = json.dumps(message)
         try:
-            result = client.publish(self._topic("packets"), json.dumps(message), qos=0, retain=True)
+            self._record_attempt(name, payload)
+            result = client.publish(self._topic("packets"), payload, qos=0, retain=True)
             if getattr(result, "rc", 0) == 0:
-                with self._lock:
-                    self.last_publish[name] = time.time()
+                self._record_publish_result(name, True)
                 return True
+            self._record_publish_result(name, False)
             self._record_error(name, "publish rc=%s" % result.rc)
         except Exception as e:
+            self._record_publish_result(name, False)
             self._record_error(name, e)
         return False
 
@@ -302,14 +362,17 @@ class ObserverBridge:
         client = client or self.clients.get(name)
         if client is None or (online and (name not in self._enabled() or not self.connected.get(name))):
             return False
+        payload = self._status_message(online)
         try:
-            result = client.publish(self._topic("status"), self._status_message(online), qos=0, retain=True)
+            self._record_attempt(name, payload)
+            result = client.publish(self._topic("status"), payload, qos=0, retain=True)
             if getattr(result, "rc", 0) == 0:
-                with self._lock:
-                    self.last_publish[name] = time.time()
+                self._record_publish_result(name, True)
                 return True
+            self._record_publish_result(name, False)
             self._record_error(name, "status publish rc=%s" % result.rc)
         except Exception as e:
+            self._record_publish_result(name, False)
             self._record_error(name, e)
         return False
 
