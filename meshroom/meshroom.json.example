@@ -43,8 +43,9 @@
 
   "delivery": {
     "_note": "Gaps are waits between pushes: base + per hop (direct routes), or the flood value.",
-    "push_gap_base_ms": 1000,
-    "push_gap_hop_ms": 2000,
+    "push_pace_start_ms": 2000,
+    "push_pace_min_ms": 1500,
+    "push_pace_max_ms": 8000,
     "push_gap_flood_ms": 10000,
     "push_quiet_ms": 1500,
     "extra_acks": 1
