@@ -52,7 +52,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 4.4"
+FIRMWARE_VERSION = "meshroom-py 4.5"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -830,7 +830,8 @@ class Member:
         self.fresh = None                 # (plen, path): route reversed from where we just heard them (tried first)
         self.last_heard = 0               # any packet from them: ACKs, keepalives, logins, posts, requests, adverts
         self.suspended_at = 0             # when they were suspended (wall clock)
-        self.push_healthy = False         # the push in flight counts toward the shared pace
+        self.pace_sample = None           # the push in flight counts toward the shared pace: {"p": expected, "ok": ...}
+        self.timed_sample = None          # its sample if it timed out (a late ACK turns it back into a success)
         self.attempts_avg = None          # recency-weighted attempts per delivered post (1.0 = always first try)
         self.deliveries = 0
         self.attempts_cur = 0             # attempts on the post being delivered
@@ -855,8 +856,9 @@ class RoomServer:
         self.last_pushed = None           # member of the most recent push (its ACK ends the gap early)
         self.last_push_at, self.last_push_flood = 0.0, False
         self.pace = cfg.push_pace_start_ms / 1000.0       # seconds between pushes (self-adjusting)
-        self.pace_hist = collections.deque(maxlen=20)      # outcomes of pushes to healthy members
-        self.pace_hold = 0
+        self.pace_hist = collections.deque(maxlen=30)      # samples: {"ok", "p" (route's rate when sent), "who"}
+        self.pace_last_slow = time.monotonic()
+        self.pace_last_ease = time.monotonic()
         self.inpaths = {}                 # member key8 -> {(plen, path): [w, t]}  paths their floods took to reach us
         self.flood_owner = {}             # flood packet hash -> (member pubkey, expiry): attribute duplicate copies
         self.disc_tag, self.disc_until, self.disc_replies = None, 0.0, 0
@@ -1741,9 +1743,12 @@ class RoomServer:
             self.stats["late_acks" if late is not None else "acks"] += 1
             entry = m.prev_entries[late] if late is not None else m.inflight
             self.attempt_result(m, entry, True, lat_ms)
-            if late is None and m.push_healthy:
-                self.pace_outcome(True)
-            m.push_healthy = False
+            if late is None and m.pace_sample is not None:
+                m.pace_sample["ok"] = True
+                self.pace_outcome(m.pace_sample)
+            elif late is not None and m.timed_sample is not None:
+                m.timed_sample["ok"] = True                 # a late ACK: that "timeout" was delivered after all
+            m.pace_sample = m.timed_sample = None
             if late is None and m.pub == self.last_pushed and self.last_push_flood:
                 self.next_push = min(self.next_push, time.monotonic() + 0.5)   # flood ACK back: the wave is done
             if m.attempts_cur:
@@ -2360,31 +2365,45 @@ class RoomServer:
                 return c[0]["plen"] & 63
         return 0xFF
 
-    def pace_outcome(self, ok):
-        """Shared pace, TCP-style: back off fast when pushes to healthy members start timing out (a busy channel or
-        a saturated repeater), recover slowly while they're delivered. One member's trouble doesn't count."""
-        self.pace_hist.append(ok)
+    def pace_outcome(self, sample):
+        """Shared push pace. Each counted push carries the success rate its route had when it was sent, so the window
+        is judged against what those routes normally deliver: distance alone never looks like congestion. Slow down
+        only when deliveries fall well below that baseline AND the channel is genuinely busy; recover otherwise."""
+        self.pace_hist.append(sample)
         lo, hi = self.cfg.push_pace_min_ms / 1000.0, self.cfg.push_pace_max_ms / 1000.0
-        if self.pace_hold > 0:
-            self.pace_hold -= 1
-            return
-        if len(self.pace_hist) < 10:
-            return
-        loss = 1.0 - sum(self.pace_hist) / float(len(self.pace_hist))
-        if loss > 0.25:
+        n = len(self.pace_hist)
+        if n < 12 or len({x["who"] for x in self.pace_hist}) < 3:
+            return                                          # not enough evidence (and no single member can swing it)
+        delivered = sum(1 for x in self.pace_hist if x["ok"])
+        expected = sum(x["p"] for x in self.pace_hist)
+        busy = self.channel_use(5)
+        if delivered < 0.75 * expected and busy >= 15.0:
             old = self.pace
             self.pace = min(self.pace * 1.5, hi)
-            self.pace_hold = 10
+            self.pace_hist.clear()                          # judge the new pace on fresh evidence
+            self.pace_last_slow = self.pace_last_ease = time.monotonic()
             if self.pace != old:
-                log.info("push pace %.1f s -> %.1f s (%.0f%% of recent pushes to healthy members timed out)", old, self.pace, loss * 100)
-        elif loss < 0.10 and ok and not self.channel_busy():
+                log.info("push pace %.1f s -> %.1f s (delivered %d of %d, routes would normally deliver %.1f; channel use %.0f%%)",
+                         old, self.pace, delivered, n, expected, busy)
+        elif sample["ok"] and delivered >= 0.95 * expected:
             self.pace = max(self.pace - 0.1, lo)
 
-    def channel_busy(self):
-        if not self.minutes:
-            return False
-        x = self.minutes[-1]
-        return (x["tx_ms"] + x["rx_ms"]) / 60000.0 > 0.40
+    def pace_ease(self):
+        """Every 3 minutes without a slowdown, ease 20% back toward the minimum, so the pace can never stick at the top."""
+        now = time.monotonic()
+        lo = self.cfg.push_pace_min_ms / 1000.0
+        if self.pace > lo and now - self.pace_last_slow >= 180 and now - self.pace_last_ease >= 180:
+            old = self.pace
+            self.pace = max(lo, self.pace * 0.8)
+            self.pace_last_ease = now
+            log.info("push pace %.1f s -> %.1f s (no congestion for 3+ min)", old, self.pace)
+
+    def channel_use(self, minutes):
+        """The room's measured channel use (TX + RX airtime), % over the last few minutes."""
+        ms = list(self.minutes)[-minutes:]
+        if not ms:
+            return 0.0
+        return 100.0 * sum(x["tx_ms"] + x["rx_ms"] for x in ms) / (len(ms) * 60000.0)
 
     def flood_gap_done(self, now):
         """After a flooded push, stop waiting once the rebroadcast wave around us has passed: at least 2 s, and the
@@ -2438,9 +2457,11 @@ class RoomServer:
             m.inflight = None
             self.stats["timeouts"] += 1
             self.attempt_result(m, entry, False)
-            if m.push_healthy:
-                self.pace_outcome(False)
-                m.push_healthy = False
+            if m.pace_sample is not None:
+                m.pace_sample["ok"] = False
+                m.timed_sample = m.pace_sample              # kept: a late ACK can still correct it
+                self.pace_outcome(m.pace_sample)
+                m.pace_sample = None
             if m.plan is not None and m.push_failures >= len(m.plan):
                 if m.attempts_cur:                          # undelivered after all of them: a bad sample
                     self.delivery_sample(m, m.attempts_cur + 1)
@@ -2502,8 +2523,10 @@ class RoomServer:
             m.plan, m.plan_retry, m.push_failures = self.build_plan(m, retry=True), True, 0
         entry = m.plan[m.push_failures]
         r_ = entry.get("proven")
-        m.push_healthy = bool(not m.given_up and not m.stuck_since and entry["plen"] is not None and r_ is not None
-                              and r_.rate(now_s(), self.rhalf()) >= 0.7)          # counts toward the shared pace
+        online = now_s() - max(m.last_heard or 0, m.last_activity or 0) < 900
+        first = m.push_failures == 0 and not m.plan_retry
+        m.pace_sample = (dict(ok=None, p=max(0.05, min(0.95, r_.rate(now_s(), self.rhalf()))), who=m.pub[:4])
+                         if (online and first and not m.given_up and entry["plen"] is not None and r_ is not None) else None)
         m.attempts_cur += 1
         data = struct.pack("<I", ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | random.randrange(4)]) \
             + author[:4] + text.encode()
@@ -2745,6 +2768,7 @@ class RoomServer:
         if now >= self.next_topo_flush:
             self.flush_topology()
             self.next_topo_flush = now + 60
+        self.pace_ease()
         if now >= self.next_sys:
             self.sample_system()
             self.next_sys = now + 5
