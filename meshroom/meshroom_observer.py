@@ -10,6 +10,7 @@ import logging
 import queue
 import threading
 import time
+from datetime import datetime, timezone
 
 log = logging.getLogger("meshroom.observer")
 
@@ -151,6 +152,37 @@ class ObserverBridge:
         path_bytes = (path_len & 63) * hash_size
         payload_len = max(0, len(raw) - i - 1 - path_bytes)
         return packet_type, route, payload_len
+
+    def _publish_packet(self, name, raw, snr, rssi, received_at):
+        client = self.clients.get(name)
+        if client is None or not self.connected.get(name):
+            return False
+        ptype, route, payload_len = self._packet_metadata(raw)
+        dt = datetime.fromtimestamp(received_at, timezone.utc)
+        message = {
+            "origin": str(self.cfg.name),
+            "origin_id": self.public_key,
+            "timestamp": dt.isoformat(),
+            "type": "PACKET",
+            "direction": "rx",
+            "time": dt.strftime("%H:%M:%S"),
+            "date": dt.strftime("%m/%d/%Y"),
+            "len": str(len(raw)),
+            "packet_type": str(ptype),
+            "route": route,
+            "payload_len": str(payload_len),
+            "raw": raw.hex().upper(),
+            "SNR": str(snr),
+            "RSSI": str(rssi),
+        }
+        try:
+            result = client.publish(self._topic("packets"), json.dumps(message), qos=0, retain=True)
+            if getattr(result, "rc", 0) == 0:
+                return True
+            self.last_error[name] = "publish rc=%s" % result.rc
+        except Exception as e:
+            self.last_error[name] = str(e)
+        return False
 
     def _run(self):
         try:
