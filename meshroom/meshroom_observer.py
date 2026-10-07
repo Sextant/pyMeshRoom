@@ -96,8 +96,11 @@ class ObserverBridge:
             pass
         if self.thread:
             self.thread.join(timeout=5)
-        for client in self.clients.values():
+        for name, client in list(self.clients.items()):
             try:
+                # A clean shutdown does not invoke MQTT's last will, so make
+                # the retained observer state accurate before disconnecting.
+                self._publish_status(name, online=False, client=client)
                 client.loop_stop()
                 client.disconnect()
             except Exception:

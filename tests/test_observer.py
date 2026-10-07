@@ -77,6 +77,30 @@ class ObserverTests(unittest.TestCase):
         finally:
             bridge.close()
 
+    def test_clean_close_publishes_retained_offline_status(self):
+        class Client:
+            def __init__(self):
+                self.messages = []
+
+            def publish(self, topic, payload, qos, retain):
+                self.messages.append((topic, json.loads(payload), qos, retain))
+                return SimpleNamespace(rc=0)
+
+            def loop_stop(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+        bridge = ObserverBridge(config(), FakeIdentity(), start=False)
+        client = Client()
+        bridge.clients["gomesh"] = client
+        bridge.connected["gomesh"] = True
+        bridge.close()
+        self.assertEqual(len(client.messages), 1)
+        self.assertFalse(client.messages[0][1]["online"])
+        self.assertTrue(client.messages[0][3])
+
 
 if __name__ == "__main__":
     unittest.main()
