@@ -51,7 +51,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 3.8"
+FIRMWARE_VERSION = "meshroom-py 3.9"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -2964,6 +2964,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .chatlog .msg{padding:3px 0;border-bottom:1px solid #1f262e}.chatlog .when{color:var(--dim);font-size:11px;margin-right:6px}
 .chatlog .who{font-weight:600;margin-right:6px}.chatlog .who.room{color:var(--acc)}
 .chatin{display:flex;gap:8px;align-items:center;margin-top:8px}.chatin input{flex:1;padding:7px 9px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}
+.advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
 .mbox.wide{width:520px}.ac{position:relative}.aclist{background:#0d1014;border:1px solid var(--line);border-top:none;
  border-radius:0 0 4px 4px;max-height:200px;overflow:auto;display:none}.aclist div{padding:5px 8px;cursor:pointer;font-size:13px}
 .aclist div.on,.aclist div:hover{background:#243447}.hint{color:var(--dim);font-size:12px;margin:6px 0}#sgprev{font-size:12px;margin-top:6px;min-height:16px}#members td{vertical-align:middle}
@@ -2984,6 +2985,10 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div id="loginerr" class="poor small"></div><div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end"><button onclick="closeLogin()">Cancel</button><button onclick="doLogin()">Log in</button></div></div></div>
 <main>
 <div class="card"><div class="kpis" id="kpis"></div></div>
+<div class="card" id="advcard" style="display:none"><h2>Room adverts</h2><div class="advrow">
+<div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
+<div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
+<span id="advmsg" class="dim small"></span></div></div>
 <div class="card" id="chatcard" style="display:none"><h2>Room chat</h2>
 <div id="chatlog" class="chatlog"><div class="dim">loading...</div></div>
 <div class="chatin"><input id="chatmsg" maxlength="400" placeholder="Message everyone in the room (sent as the room)" autocomplete="off">
@@ -3020,12 +3025,18 @@ async function loadChat(reset){if(!ADMIN||CHAT_BUSY)return;CHAT_BUSY=true;
    div.innerHTML=`<span class="when">${new Date(m.ts*1000).toLocaleString()}</span><span class="who ${m.room?"room":""}">${esc(m.who)}</span>${esc(m.text)}`;
    L.appendChild(div);CHAT_TS=Math.max(CHAT_TS,m.ts)});
   if(d.messages.length&&(atBottom||reset))L.scrollTop=L.scrollHeight}catch(e){}CHAT_BUSY=false}
+async function sendAdvert(flood,btn){
+ if(flood&&!confirm("Send a flood advert? It is relayed across the whole mesh."))return;
+ btn.disabled=true;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({flood})});
+ let m=r.ok?(flood?"Flood advert sent":"Advert sent (zero-hop)"):"Could not send";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}
+ if(r.status===401){m="Your admin session has expired: log in again.";session()}
+ $("advmsg").textContent=m+" · "+new Date().toLocaleTimeString();setTimeout(()=>btn.disabled=false,10000)}
 async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chaterr").textContent="";
  const r=await fetch("api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})});
  if(r.ok){$("chatmsg").value="";chatLeft();setTimeout(()=>loadChat(false),700)}
  else{let e="Could not send";try{e=(await r.json()).error||e}catch(x){}if(r.status===401){e="Your admin session has expired: log in again.";session()}$("chaterr").textContent=e}}
 async function session(){try{const r=await (await fetch("api/session")).json();ADMIN=r.admin;LOGIN_ON=r.login_enabled}catch(e){}
- const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);
+ const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
 function loginClick(){if(ADMIN){fetch("api/logout",{method:"POST"}).then(()=>session().then(load));return}
  $("loginerr").textContent="";$("pw").value="";$("loginbox").style.display="flex";setTimeout(()=>$("pw").focus(),50)}
@@ -3159,6 +3170,8 @@ BUILTIN_ICONS = {   # fallbacks when data_dir/icons/<name>.png doesn't exist
               'stroke-width="2.6" stroke-linecap="round" fill="none"/></svg>',
     "suggest": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text x="12" y="19" font-size="18" text-anchor="middle">&#128161;</text></svg>',
     "kick": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text x="12" y="19" font-size="18" text-anchor="middle">&#128098;</text></svg>',
+    "advert": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text x="12" y="19" font-size="18" text-anchor="middle">&#128227;</text></svg>',
+    "flood_advert": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text x="12" y="19" font-size="18" text-anchor="middle">&#127754;</text></svg>',
     "ban": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text x="12" y="19" font-size="18" text-anchor="middle">&#128165;</text></svg>',
 }
 
@@ -3177,6 +3190,7 @@ class WebUI:
         cache = {"state_obj": None, "state_bytes": b"{}"}
         clock_ = threading.Lock()
         slots = threading.BoundedSemaphore(16)
+        last_advert = [float("-inf")]
 
         def state_bytes():
             st = room.web_state                             # the main loop swaps in a new dict; never mutated
@@ -3260,7 +3274,7 @@ class WebUI:
                     return self._send(404, '{"error":"not found"}')
                 if path.startswith("/icons/"):
                     name = path[7:].split(".")[0]
-                    if name in ("resync", "suggest", "kick", "ban"):
+                    if name in ("resync", "suggest", "kick", "ban", "advert", "flood_advert"):
                         f = os.path.join(cfg.data_dir, "icons", name + ".png")
                         if os.path.exists(f):
                             with open(f, "rb") as fh:
@@ -3316,6 +3330,18 @@ class WebUI:
                     return self._send(200, '{"ok":true}', cookie="mr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 if not self._is_admin():                        # everything below changes things: admins only
                     return self._send(401, '{"error":"log in first"}')
+                if parts == ["api", "advert"]:
+                    try:
+                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                    except ValueError:
+                        body = {}
+                    with slock:
+                        if time.monotonic() - last_advert[0] < 10:
+                            return self._send(429, '{"error":"an advert was just sent: wait a few seconds"}')
+                        last_advert[0] = time.monotonic()
+                    flood = bool(body.get("flood"))
+                    events.put(("advert", flood))                   # sent by the main loop
+                    return self._send(200, json.dumps({"ok": True, "flood": flood}))
                 if parts == ["api", "chat"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
@@ -3445,6 +3471,9 @@ def main():
         elif kind in ("kick", "ban", "unban", "resync"):
             getattr(room, "force_resync" if kind == "resync" else kind)(ev[1])
             room.web_dirty = True                           # refresh the dashboard once the radio is idle
+        elif kind == "advert":
+            room.send_advert(ev[1])
+            log.info("%s sent from the dashboard", "flood advert" if ev[1] else "advert (zero-hop)")
         elif kind == "say":
             room.room_say(ev[1])
         elif kind == "suggest":
