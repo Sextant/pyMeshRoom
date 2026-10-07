@@ -1,17 +1,44 @@
 """Optional MQTT observer bridge for MeshRoom.
 
-The observer receives copies of KISS RX packets from MeshRoom.  It never opens
+The observer receives copies of KISS RX packets from MeshRoom. It never opens
 or owns the serial port, so observer/network failures cannot block radio I/O.
-
-Broker support and publishing are implemented separately from meshroom.py.
 """
 
+import base64
+import json
 import logging
 import queue
 import threading
 import time
 
 log = logging.getLogger("meshroom.observer")
+
+BROKERS = {
+    "gomesh": ("mqtt.gomesh.dev", 443, "mqtt.gomesh.dev"),
+    "meshmapper": ("mqtt.meshmapper.net", 443, "mqtt.meshmapper.net"),
+}
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def make_auth_token(identity, public_key, audience, ttl=3600):
+    """Create a MeshCore MQTT token; the modem-backed identity does the signing."""
+    now = int(time.time())
+    header = {"alg": "Ed25519", "typ": "JWT"}
+    payload = {
+        "publicKey": public_key.upper(),
+        "iat": now,
+        "exp": now + ttl,
+        "aud": audience,
+        "client": "meshroom-observer",
+    }
+    head = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    body = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    signed = (head + "." + body).encode()
+    signature = identity.sign(signed)
+    return head + "." + body + "." + signature.hex().upper()
 
 
 class ObserverBridge:
@@ -26,9 +53,10 @@ class ObserverBridge:
         self.dropped = 0
         self.started = time.time()
         self.running = True
-        self.thread = threading.Thread(
-            target=self._run, name="mqtt-observer", daemon=True
-        )
+        self.clients = {}
+        self.connected = {}
+        self.last_error = {}
+        self.thread = threading.Thread(target=self._run, name="mqtt-observer", daemon=True)
         self.thread.start()
 
     def submit_rx(self, raw, snr, rssi):
@@ -48,9 +76,72 @@ class ObserverBridge:
         except queue.Full:
             pass
         self.thread.join(timeout=5)
+        for client in self.clients.values():
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except Exception:
+                pass
+
+    def _enabled(self):
+        out = []
+        if getattr(self.cfg, "observer_gomesh", True):
+            out.append("gomesh")
+        if getattr(self.cfg, "observer_meshmapper", True):
+            out.append("meshmapper")
+        return out
+
+    def _connect(self, name, mqtt):
+        host, port, audience = BROKERS[name]
+        token = make_auth_token(self.identity, self.public_key, audience)
+        client_id = ("meshcore_" + self.public_key[:12] + "_" + name)[:60]
+        try:
+            client = mqtt.Client(
+                mqtt.CallbackAPIVersion.VERSION2,
+                client_id=client_id, clean_session=True, transport="websockets"
+            )
+        except (AttributeError, TypeError):
+            client = mqtt.Client(client_id=client_id, clean_session=True, transport="websockets")
+        client.username_pw_set("v1_" + self.public_key, token)
+        client.tls_set()
+        client.ws_set_options(path="/")
+
+        def on_connect(c, userdata, flags, reason_code, properties=None):
+            try:
+                ok = int(reason_code) == 0
+            except (TypeError, ValueError):
+                ok = reason_code == 0
+            self.connected[name] = ok
+            self.last_error[name] = "" if ok else "connect rc=%s" % reason_code
+            if ok:
+                log.info("observer %s connected to %s", name, host)
+
+        def on_disconnect(c, userdata, *args):
+            self.connected[name] = False
+            log.warning("observer %s disconnected", name)
+
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+        self.clients[name] = client
+        self.connected[name] = False
+        try:
+            client.connect_async(host, port, keepalive=60)
+            client.loop_start()
+        except Exception as e:
+            self.last_error[name] = str(e)
+            log.error("observer %s connection setup failed: %s", name, e)
 
     def _run(self):
-        """MQTT worker. Broker implementation is added in the next commit."""
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            self.last_error["observer"] = "paho-mqtt missing"
+            log.error("observer enabled but paho-mqtt is missing")
+            return
+
+        for name in self._enabled():
+            self._connect(name, mqtt)
+
         while self.running:
             try:
                 item = self.q.get(timeout=1.0)
@@ -58,3 +149,4 @@ class ObserverBridge:
                 continue
             if item is None:
                 break
+            # Packet publishing is added separately; keep broker lifecycle isolated here.
