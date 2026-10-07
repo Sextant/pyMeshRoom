@@ -51,7 +51,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 4.0"
+FIRMWARE_VERSION = "meshroom-py 4.1.1"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -592,7 +592,7 @@ class Store:
     TABLES = {
         "members": ("pubkey BLOB PRIMARY KEY", "perms INT", "last_timestamp INT", "last_activity INT", "sync_since INT",
                     "out_path BLOB", "out_path_len INT", "given_up INT DEFAULT 0", "secret BLOB", "attempts_avg REAL",
-                    "deliveries INT", "in_path BLOB", "in_path_len INT", "in_ts INT", "last_heard INT"),
+                    "deliveries INT", "in_path BLOB", "in_path_len INT", "in_ts INT", "last_heard INT", "suspended_at INT"),
         "posts": ("ts INT PRIMARY KEY", "author BLOB", "text TEXT", "to_key BLOB"),
         "routes": ("pubkey BLOB", "slot INT", "len INT", "path BLOB", "last_ok INT", "added_at INT", "s REAL", "n REAL",
                    "t INT", "lat REAL", "lat_n INT", "PRIMARY KEY (pubkey, slot)"),
@@ -682,7 +682,7 @@ class Store:
                         c = arg
                         db.executemany("INSERT OR REPLACE INTO members (pubkey, perms, last_timestamp, last_activity, sync_since, "
                                        "out_path, out_path_len, given_up, secret, attempts_avg, deliveries, in_path, in_path_len, in_ts, "
-                                       "last_heard) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", c["members"])
+                                       "last_heard, suspended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", c["members"])
                         db.executemany("DELETE FROM routes WHERE pubkey=?", [(k,) for k in c["members_gone"]])
                         db.executemany("DELETE FROM members WHERE pubkey=?", [(k,) for k in c["members_gone"]])
                         for pub, rows in c["routes"].items():
@@ -828,6 +828,7 @@ class Member:
         self.next_probe = 0.0
         self.fresh = None                 # (plen, path): route reversed from where we just heard them (tried first)
         self.last_heard = 0               # any packet from them: ACKs, keepalives, logins, posts, requests, adverts
+        self.suspended_at = 0             # when they were suspended (wall clock)
         self.push_healthy = False         # the push in flight counts toward the shared pace
         self.attempts_avg = None          # recency-weighted attempts per delivered post (1.0 = always first try)
         self.deliveries = 0
@@ -903,7 +904,7 @@ class RoomServer:
         self.edges = {}                   # (a_hash, b_hash) -> [w, t, snr]   b"" = the room
         self.repeaters = {}               # repeater pubkey -> dict(name, lat, lon, adv_ts, last_advert)
         self.heard = {}                   # repeater hash -> dict(last, w, t, last_direct, snr)
-        self.next_topo_flush = time.monotonic() + 300
+        self.next_topo_flush = time.monotonic() + 60
         self.last_rx_mono = 0.0
         self.rx_airtime_ms = 0
         # per-minute stats, dashboard
@@ -930,7 +931,7 @@ class RoomServer:
     def load(self):
         st = self.store
         for row in st.read("SELECT pubkey, perms, last_timestamp, last_activity, sync_since, out_path, out_path_len, given_up, secret, "
-                           "attempts_avg, deliveries, in_path, in_path_len, in_ts, last_heard FROM members"):
+                           "attempts_avg, deliveries, in_path, in_path_len, in_ts, last_heard, suspended_at FROM members"):
             m = Member(bytes(row[0]))
             m.perms, m.last_timestamp, m.last_activity, m.sync_since = row[1], row[2], row[3], row[4]
             m.out_path = bytes(row[5] or b"")
@@ -943,6 +944,7 @@ class RoomServer:
             m.deliveries = row[10] or 0
             m.in_path, m.in_path_len, m.in_ts = bytes(row[11] or b""), row[12], row[13] or 0
             m.last_heard = row[14] or row[3] or 0
+            m.suspended_at = (row[15] or m.last_heard) if m.given_up else 0
             self.members[m.pub] = m
         self.bans = {bytes(pub): dict(name=name, ts=ts) for pub, name, ts in st.read("SELECT pubkey, name, ts FROM bans")}
         for h, data in st.read("SELECT hash, data FROM probes"):
@@ -997,7 +999,8 @@ class RoomServer:
     @staticmethod
     def member_row(m):
         return (m.pub, m.perms, m.last_timestamp, m.last_activity, m.sync_since, m.out_path, m.out_path_len,
-                int(m.given_up), m.secret, m.attempts_avg, m.deliveries, m.in_path, m.in_path_len, m.in_ts, m.last_heard)
+                int(m.given_up), m.secret, m.attempts_avg, m.deliveries, m.in_path, m.in_path_len, m.in_ts, m.last_heard,
+                m.suspended_at)
 
     @staticmethod
     def route_rows(m):
@@ -2320,6 +2323,7 @@ class RoomServer:
         m.backoff, m.retry_at, m.stuck_since = 0, 0.0, 0.0
         if m.given_up:
             m.given_up = False
+            m.suspended_at = 0
             self.mark_dirty()
 
     def push_eligible(self, m):
@@ -2443,6 +2447,7 @@ class RoomServer:
                     m.retry_at = now + RETRY_BEFORE_SUSPEND_S
                 else:                                       # the retry failed too: suspend until we hear from them
                     m.given_up = True
+                    m.suspended_at = now_s()
                     m.next_probe = now + SUSPENDED_PROBE_S
                     log.info("suspending %s: no ACK on the plan or its retry; resuming when we hear from them", self.member_label(m))
             self.mark_dirty()
@@ -2732,7 +2737,7 @@ class RoomServer:
             self.next_aging = now + 3600
         if now >= self.next_topo_flush:
             self.flush_topology()
-            self.next_topo_flush = now + 300
+            self.next_topo_flush = now + 60
         if now >= self.next_sys:
             self.sample_system()
             self.next_sys = now + 5
@@ -2770,12 +2775,12 @@ class RoomServer:
         rp_rows = [(pub, r["name"], r["lat"], r["lon"], r["adv_ts"], r["last_advert"]) for pub, r in self.repeaters.items()]
         hd_rows = [(h, d["last"], d["w"], d["t"], d["last_direct"], d["snr"], d.get("disc", 0), d.get("out_snr")) for h, d in self.heard.items()]
         self.store.execmany([
-            ("DELETE FROM rpt_routes", None), ("INSERT INTO rpt_routes VALUES (?,?,?,?,?,?,?)", rr_rows),
-            ("DELETE FROM member_rpts", None), ("INSERT INTO member_rpts VALUES (?,?,?,?)", mr_rows),
-            ("DELETE FROM member_inroutes", None), ("INSERT INTO member_inroutes VALUES (?,?,?,?,?)", ir_rows),
-            ("DELETE FROM edges", None), ("INSERT INTO edges VALUES (?,?,?,?,?)", ed_rows),
-            ("DELETE FROM repeaters", None), ("INSERT INTO repeaters VALUES (?,?,?,?,?,?)", rp_rows),
-            ("DELETE FROM heard", None), ("INSERT INTO heard (hash, last, w, t, last_direct, snr, disc, out_snr) VALUES (?,?,?,?,?,?,?,?)", hd_rows),
+            ("DELETE FROM rpt_routes", None), ("INSERT OR REPLACE INTO rpt_routes VALUES (?,?,?,?,?,?,?)", rr_rows),
+            ("DELETE FROM member_rpts", None), ("INSERT OR REPLACE INTO member_rpts VALUES (?,?,?,?)", mr_rows),
+            ("DELETE FROM member_inroutes", None), ("INSERT OR REPLACE INTO member_inroutes VALUES (?,?,?,?,?)", ir_rows),
+            ("DELETE FROM edges", None), ("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?)", ed_rows),
+            ("DELETE FROM repeaters", None), ("INSERT OR REPLACE INTO repeaters VALUES (?,?,?,?,?,?)", rp_rows),
+            ("DELETE FROM heard", None), ("INSERT OR REPLACE INTO heard (hash, last, w, t, last_direct, snr, disc, out_snr) VALUES (?,?,?,?,?,?,?,?)", hd_rows),
         ])
 
     # ------------------------------------------------------------------ per-minute stats (dashboard header)
@@ -2901,13 +2906,15 @@ class RoomServer:
                 push="suspended" if m.given_up else "waiting" if m.pending_ack else "backoff" if in_backoff
                      else "retrying" if m.push_failures else "idle",
                 retry_in=int(m.retry_at - time.monotonic()) if in_backoff else 0,
-                route=self.path_names(m.out_path_len, m.out_path),
+                route=self.path_names(m.out_path_len, m.out_path), route_hex=self.path_hex(m.out_path_len, m.out_path),
+                in_route_hex=self.path_hex(m.in_path_len, m.in_path) if m.in_ts else None, suspended_at=m.suspended_at,
                 in_route=self.path_names(m.in_path_len, m.in_path) if m.in_ts else None, in_age=m.in_ts,
                 in_routes=self.member_inroutes(m),
-                routes=[dict(path=self.path_names(r.len, r.path), rate=round(r.rate(t, rh) * 100),
+                routes=[dict(path=self.path_names(r.len, r.path), hex=self.path_hex(r.len, r.path), rate=round(r.rate(t, rh) * 100),
                              evidence=round(r.evidence(t, rh)[1], 1), lat_ms=int(r.lat), current=self.is_current(m, r))
                         for r in sorted(m.routes, key=lambda r: -r.rate(t, rh))],
-                near=[dict(rpt=self.rpt_label(k) if k else "direct", share=round(sh * 100)) for k, sh in self.member_locations(m)]))
+                near=[dict(rpt=self.rpt_label(k) if k else "direct", hex=hexs(k) if k else "direct", share=round(sh * 100))
+                      for k, sh in self.member_locations(m)]))
         th = self.thalf()
         heard_by_x, x_heard_by = {}, {}                     # index the links once: O(links)
         for (a, b), e in self.edges.items():
@@ -2958,7 +2965,8 @@ class RoomServer:
         ws = {k: fade(e[0], e[1], t, self.rhalf()) for k, e in tab.items() if k != cur}
         tot = sum(fade(e[0], e[1], t, self.rhalf()) for e in tab.values()) or 1.0
         top = sorted(ws.items(), key=lambda kv: -kv[1])[:n]
-        return [dict(path=self.path_names(plen, path), share=round(100 * w / tot)) for (plen, path), w in top if w > 0.05]
+        return [dict(path=self.path_names(plen, path), hex=self.path_hex(plen, path), share=round(100 * w / tot))
+                for (plen, path), w in top if w > 0.05]
 
     def top_links(self, n=10):
         """Neighbours ranked by trace packet loss (lowest first, more traces first), untraced ones after."""
@@ -2982,6 +2990,13 @@ class RoomServer:
                 rtt=None if st["rtt"] is None else int(st["rtt"]), last_ok=st["last_ok"])))
         rows.sort(key=lambda r: r[0])
         return [r[1] for r in rows[:n]]
+
+    @staticmethod
+    def path_hex(plen, path):
+        if plen is None:
+            return None
+        sz = (plen >> 6) + 1
+        return [hexs(path[i * sz:(i + 1) * sz]) for i in range(plen & 63)]
 
     def path_names(self, plen, path):
         if plen is None:
@@ -3051,6 +3066,9 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .chatlog .who{font-weight:600;margin-right:6px}.chatlog .who.room{color:var(--acc)}
 .chatin{display:flex;gap:8px;align-items:center;margin-top:8px}.chatin input{flex:1;padding:7px 9px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
+.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}
+#members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
+.hexr{font-family:ui-monospace,monospace;white-space:nowrap}.caret{color:var(--dim);font-size:11px;margin-right:4px}
 .mbox.wide{width:520px}.ac{position:relative}.aclist{background:#0d1014;border:1px solid var(--line);border-top:none;
  border-radius:0 0 4px 4px;max-height:200px;overflow:auto;display:none}.aclist div{padding:5px 8px;cursor:pointer;font-size:13px}
 .aclist div.on,.aclist div:hover{background:#243447}.hint{color:var(--dim);font-size:12px;margin:6px 0}#sgprev{font-size:12px;margin-top:6px;min-height:16px}#members td{vertical-align:middle}
@@ -3081,8 +3099,9 @@ Separate with commas. Type a name or id for suggestions.</div>
 <span id="chatleft" class="dim small"></span><button id="chatsend" onclick="sendChat()">Send</button></div>
 <div id="chaterr" class="poor small"></div></div>
 <div class="card"><h2>Best neighbour repeaters <span class="dim small">(by trace packet loss)</span></h2><table id="toplinks"></table></div>
-<div class="card"><h2>Members</h2><table id="members"></table></div>
-<div class="card"><h2>Banned</h2><table id="bans"></table></div>
+<div class="card"><h2>Members <span class="hdesc">Room members &middot; tap a row for details</span></h2><table id="members"></table></div>
+<div class="card"><h2>Suspended <span class="hdesc">Inactive members, will be returned to member list when they are heard on the mesh</span></h2><table id="suspended"></table></div>
+<div class="card"><h2>Banned <span class="hdesc">Room members who FAFO'd</span></h2><table id="bans"></table></div>
 <div class="card"><h2>Repeater map</h2>
 <div class="mapwrap"><div><div id="map"></div><div id="mapnote" class="dim small"></div></div>
 <div id="rdetail" class="rdetail"><div class="dim pick">Select a repeater from the map</div></div></div></div>
@@ -3097,7 +3116,7 @@ async function resync(m,btn){btn.disabled=true;await fetch("api/members/"+m.pub+
 function score(m){if(m.delivery==null)return'<span class="dim">new</span>';const c=m.delivery>=80?"good":m.delivery>=50?"mid":"poor";
  return `<span class="${c}">${m.delivery}%</span> <span class="dim small">${m.avg_attempts} tries &middot; ${m.deliveries}</span>`}
 function route(r){return r==null?'<span class="dim">unknown (flood)</span>':r.length?r.map(esc).join(" &rsaquo; "):'direct'}
-let map=null,layer=null,RPTS=[],MEMBERS=[],LAST=null,ADMIN=false,LOGIN_ON=false;
+let EXP=new Set(),map=null,layer=null,RPTS=[],MEMBERS=[],LAST=null,ADMIN=false,LOGIN_ON=false;
 let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false;
 function bytesOf(t){return new TextEncoder().encode(t).length}
 function chatLeft(){const n=CHAT_MAX-bytesOf($("chatmsg").value);$("chatleft").textContent=n+" left";$("chatleft").className=n<0?"poor small":"dim small";$("chatsend").disabled=n<0}
@@ -3191,14 +3210,27 @@ async function load(){
  const k=[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks],["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
  $("kpis").innerHTML=k.map(x=>`<div class="kpi"><span class="dim small">${x[0]}</span><b>${esc(x[1])}</b></div>`).join("");
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
+ const ACTS=(m,i)=>ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff/suspension, retry now via best routes, then flood${m.outstanding?"":" (nothing outstanding)"}" onclick="event.stopPropagation();resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="event.stopPropagation();openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" onclick="event.stopPropagation();act('api/members/${m.pub}/kick','Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again.')">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" onclick="event.stopPropagation();act('api/members/${m.pub}/ban','Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely.')">${IC("ban")}</button></td>`:"";
+ const IDC=(m,caret)=>`<td class="idcell">${caret}<b>${esc(m.name)||'<span class="dim">unknown</span>'}</b><br><span class="dim mono4">${m.key.slice(0,4)}</span><br><span class="small">${m.role}</span></td>`;
+ const HX=h=>h==null?'<span class="dim">unknown</span>':h.length?h.join(" &rsaquo; "):"direct";
+ const NM=p=>p==null?'<span class="dim">unknown</span>':p.length?p.map(esc).join(" &rsaquo; "):"direct";
+ const row=(tag,cls,body)=>`<div><span class="dir ${cls}">${tag}</span><span>${body}</span></div>`;
+ const act_=st.members.map((m,i)=>[m,i]).filter(([m])=>m.push!=="suspended"), sus=st.members.map((m,i)=>[m,i]).filter(([m])=>m.push==="suspended").sort((x,y)=>(y[0].last_heard||0)-(x[0].last_heard||0));   // longest silence at the bottom
  $("members").innerHTML="<tr>"+(ADMIN?"<th></th>":"")+"<th>ID</th><th>Delivery</th><th>Last heard</th><th>Synced to</th><th>Behind</th><th>Push</th><th>Current route</th><th>Other routes</th><th>Usually near</th></tr>"+
-  st.members.map((m,i)=>`<tr>${ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff, retry now via best routes, then flood${m.outstanding?"":" (nothing outstanding)"}" onclick="resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" onclick="act('api/members/${m.pub}/kick','Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again.')">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" onclick="act('api/members/${m.pub}/ban','Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely.')">${IC("ban")}</button></td>`:""}
-  <td class="idcell"><b>${esc(m.name)||'<span class="dim">unknown</span>'}</b><br><span class="dim mono4">${m.key.slice(0,4)}</span><br><span class="small">${m.role}</span></td><td>${score(m)}</td><td>${ago(m.last_heard)}</td><td>${ago(m.sync_since)}</td><td>${m.outstanding}</td>
-  <td><span class="tag ${m.push}">${m.push}${m.retry_in?" "+Math.ceil(m.retry_in/60)+"m":""}</span></td>
-  <td class="small rcell"><div><span class="dir tx">TX</span><span>${route(m.route)}</span></div><div><span class="dir rx">RX</span><span>${m.in_route==null?'<span class="dim">unknown</span>':m.in_route.length?m.in_route.map(esc).join(" &rsaquo; "):"direct"}</span></div></td>
-  <td class="small rcell">${[...m.routes.filter(r=>!r.current).slice(0,5).map(r=>`<div><span class="dir tx">TX</span><span>${route(r.path)} <span class="dim">${r.rate}%</span></span></div>`),
-   ...(m.in_routes||[]).slice(0,5).map(r=>`<div><span class="dir rx">RX</span><span>${r.path.length?r.path.map(esc).join(" &rsaquo; "):"direct"} <span class="dim">${r.share}%</span></span></div>`)].join("")||'<span class="dim">-</span>'}</td>
-  <td class="small">${m.near.map(n=>esc(n.rpt)+` <span class="dim">${n.share}%</span>`).join("<br>")||'<span class="dim">-</span>'}</td></tr>`).join("");
+  (act_.length?act_.map(([m,i])=>{const ex=EXP.has(m.key), others=m.routes.filter(r=>!r.current);
+   const cur=ex?row("TX","tx",route(m.route))+row("RX","rx",NM(m.in_route)):row("TX","tx",`<span class="hexr">${HX(m.route_hex)}</span>`)+row("RX","rx",`<span class="hexr">${HX(m.in_route_hex)}</span>`);
+   const oth=ex?[...others.slice(0,5).map(r=>row("TX","tx",`${route(r.path)} <span class="dim">${r.rate}%</span>`)),...(m.in_routes||[]).slice(0,5).map(r=>row("RX","rx",`${NM(r.path)} <span class="dim">${r.share}%</span>`))].join("")
+              :[...others.slice(0,2).map(r=>row("TX","tx",`<span class="hexr">${HX(r.hex)}</span> <span class="dim">${r.rate}%</span>`)),...(m.in_routes||[]).slice(0,2).map(r=>row("RX","rx",`<span class="hexr">${HX(r.hex)}</span> <span class="dim">${r.share}%</span>`))].join("");
+   const near=ex?m.near.map(n=>esc(n.rpt)+` <span class="dim">${n.share}%</span>`).join("<br>"):m.near.slice(0,4).map(n=>`<span class="hexr">${n.hex}</span> <span class="dim">${n.share}%</span>`).join("<br>");
+   return `<tr class="mrow${ex?" exp":""}" data-k="${m.key}">${ACTS(m,i)}${IDC(m,`<span class="caret">${ex?"&#9662;":"&#9656;"}</span>`)}<td>${score(m)}</td><td>${ago(m.last_heard)}</td><td>${ago(m.sync_since)}</td><td>${m.outstanding}</td>
+   <td><span class="tag ${m.push}">${m.push}${m.retry_in?" "+Math.ceil(m.retry_in/60)+"m":""}</span></td>
+   <td class="small ${ex?"rcell":""}">${cur}</td><td class="small ${ex?"rcell":""}">${oth||'<span class="dim">-</span>'}</td><td class="small">${near||'<span class="dim">-</span>'}</td></tr>`}).join("")
+  :`<tr><td class="dim">no active members</td></tr>`);
+ document.querySelectorAll("#members tr.mrow").forEach(tr=>tr.onclick=()=>{const k=tr.dataset.k;EXP.has(k)?EXP.delete(k):EXP.add(k);load()});
+ $("suspended").innerHTML=sus.length?"<tr>"+(ADMIN?"<th></th>":"")+"<th>ID</th><th>Last heard</th><th>Suspended for</th><th>Posts waiting</th><th>Usually near</th></tr>"+
+  sus.map(([m,i])=>`<tr>${ACTS(m,i)}${IDC(m,"")}<td>${ago(m.last_heard)}</td><td>${m.suspended_at?ago(m.suspended_at):"-"}</td><td>${m.outstanding}</td>
+   <td class="small">${m.near.slice(0,4).map(n=>`<span class="hexr">${n.hex}</span> <span class="dim">${n.share}%</span>`).join("<br>")||'<span class="dim">-</span>'}</td></tr>`).join("")
+  :'<tr><td class="dim">nobody</td></tr>';
  const TL=st.top_links||[], sn2=(a,b)=>`${a==null?"-":(a>0?"+":"")+a}<span class="dim"> / ${b==null?"-":(b>0?"+":"")+b}</span>`;
  $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Packet loss</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
   TL.map(r=>{const c=r.loss==null?"dim":r.loss<=5?"good":r.loss<=20?"mid":"poor";
@@ -3227,15 +3259,21 @@ function drawMap(st){
   // Referrer-Policy from a proxy / load balancer can't strip it
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribution:"&copy; OpenStreetMap",
    referrerPolicy:"strict-origin-when-cross-origin"}).addTo(map);
+  map.on("click",()=>{if(SEL)select(null)});                 // empty map: show everything again
  }
  const sig=Object.keys(pos).sort().join(",");
  if(pts.length&&map._sig!==sig){map.fitBounds(pts.map(p=>p.slice(0,2)),{padding:[30,30],maxZoom:12});map._sig=sig}
  if(layer)layer.remove(); layer=L.layerGroup().addTo(map);
- st.edges.forEach(e=>{const a=pos[e.a],b=pos[e.b];if(a&&b)L.polyline([a.slice(0,2),b.slice(0,2)],{weight:Math.min(6,1+Math.log2(1+e.w)),color:e.b===""?"#5cb3ff":"#8a94a3",opacity:.7}).bindTooltip(`${esc(a[2])} &rarr; ${esc(b[2])}<br>seen ${e.w}${e.snr!=null?"<br>SNR "+e.snr:""}`).addTo(layer)});
- Object.entries(pos).forEach(([h,p])=>{const sel=h===SEL;
-  const mk=L.circleMarker(p.slice(0,2),{radius:h===""?8:sel?10:7,color:h===""?"#4caf7a":sel?"#ffd166":"#5cb3ff",weight:sel?3:2,fillOpacity:.9})
-   .bindTooltip(tip[h]||esc(p[2]),{direction:"top",offset:[0,-6]}).addTo(layer);
-  if(h!=="")mk.on("click",()=>select(h))});
+ // a repeater is selected: only its links, and its neighbours stay bright
+ const linked=new Set();
+ st.edges.forEach(e=>{if(SEL&&e.a!==SEL&&e.b!==SEL)return;const a=pos[e.a],b=pos[e.b];if(!a||!b)return;
+  if(SEL){linked.add(e.a);linked.add(e.b)}
+  L.polyline([a.slice(0,2),b.slice(0,2)],{weight:1.5,color:e.b===""||e.a===""?"#5cb3ff":"#8a94a3",opacity:SEL?.9:.55,interactive:true})
+   .bindTooltip(`${esc(a[2])} &rarr; ${esc(b[2])}<br>seen ${e.w}${e.snr!=null?"<br>SNR "+e.snr:""}`).addTo(layer)});
+ Object.entries(pos).forEach(([h,p])=>{const sel=h===SEL, dim=SEL&&!sel&&!linked.has(h);
+  const mk=L.circleMarker(p.slice(0,2),{radius:h===""?8:sel?10:7,color:h===""?"#4caf7a":sel?"#ffd166":"#5cb3ff",weight:sel?3:2,
+   opacity:dim?.25:1,fillOpacity:dim?.15:.9}).bindTooltip(tip[h]||esc(p[2]),{direction:"top",offset:[0,-6]}).addTo(layer);
+  if(h!=="")mk.on("click",ev=>{L.DomEvent.stopPropagation(ev);select(h===SEL?null:h)})});
  $("mapnote").textContent=pts.length?"":"No positions yet: repeaters appear once their adverts with GPS coordinates are heard.";
 }
 $("sgpath").addEventListener("input",()=>{ACI=-1;acShow()});
@@ -3374,7 +3412,11 @@ class WebUI:
                     fresh = time.monotonic() - room.web_last_request > 20
                     room.web_last_request = time.monotonic()        # wakes up the main loop's refreshes
                     if fresh:
-                        events.put(("web_wake",))                   # first view after idle: refresh right away
+                        before = room.web_state
+                        events.put(("web_wake",))                   # first view after idle: refresh right away...
+                        deadline = time.monotonic() + 1.5
+                        while room.web_state is before and time.monotonic() < deadline:
+                            time.sleep(0.02)                        # ...and answer with it, not the stale one
                     return self._send(200, state_bytes())
                 if path == "/api/chat":
                     if not self._is_admin():
@@ -3545,6 +3587,8 @@ def main():
         events.put(("quit",))
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, stop)                  # terminal / SSH session closed: save and exit cleanly
 
     def handle(ev):
         """One event. Returns False to stop."""
