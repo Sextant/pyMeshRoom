@@ -103,6 +103,16 @@ DEFAULT_CONFIG = {
     "kiss_persistence": 128,        # KISS CSMA persistence 0-255
     "kiss_slottime": 5,             # KISS slot time (x10 ms)
     "identity": "modem",            # "modem", or a key file path (testing without modem crypto)
+    # MQTT observer is opt-in.  Disabled keeps MeshRoom's normal runtime free
+    # of both the MQTT dependency and all observer activity.
+    "observer_enabled": False,
+    "observer_iata": "SJC",
+    "observer_status": True,
+    "observer_packets": True,
+    "observer_rx": True,
+    "observer_gomesh": True,
+    "observer_meshmapper": True,
+    "observer_queue_max": 1000,
     "log_level": "INFO",
 }
 
@@ -919,6 +929,7 @@ class RoomServer:
         self.last_hw_reply = time.monotonic()
         self.push_fail_since = 0.0
         self.web_state = {}
+        self.observer = None            # attached by main when explicitly enabled
         self.web_port_active = bool(cfg.web_port)
         self.web_last_request = 0.0
         self.web_dirty = False
@@ -2955,7 +2966,7 @@ class RoomServer:
             repeaters=rpts[:200], edges=edges,
             bans=[dict(pub=hexs(k), key=hexs(k[:6]), name=v["name"], ts=v["ts"]) for k, v in sorted(self.bans.items(), key=lambda x: -x[1]["ts"])],
             top_links=self.top_links(), discovery_min=self.cfg.discovery_interval_min, hour=self.hour_stats(),
-            sys=self.sys_stats())
+            sys=self.sys_stats(), observer=self.observer.status() if self.observer else None)
 
     def member_inroutes(self, m, n=5):
         """Other paths the member's floods took to reach us (member side first), most seen first, excluding the current."""
@@ -3571,6 +3582,19 @@ def main():
     room = RoomServer(cfg, modem, identity, store)
     room.events_put = events.put
     room.events_q = events
+    observer = None
+    if cfg.observer_enabled:
+        try:
+            # Kept optional: installations that do not opt in never import
+            # paho-mqtt and retain their existing MeshRoom behavior.
+            from meshroom_observer import ObserverBridge
+            observer = ObserverBridge(cfg, identity)
+            room.observer = observer
+            log.info("MQTT observer enabled for %s", observer.iata)
+        except Exception as e:
+            # An observer failure must never prevent the radio room from
+            # starting.  The error is visible in the normal MeshRoom log.
+            log.error("MQTT observer disabled: %s", e)
     if cfg.web_port:
         try:
             room.publish_web_state()
@@ -3595,6 +3619,10 @@ def main():
         kind = ev[0]
         if kind == "rx":
             room.on_rx(*ev[1:])
+            if observer:
+                # This is deliberately after normal packet handling and is
+                # strictly a bounded, non-blocking queue handoff.
+                observer.submit_rx(*ev[1:])
         elif kind == "txdone":
             room.on_txdone(ev[1])
         elif kind == "hw":
@@ -3647,6 +3675,8 @@ def main():
     log.info("shutting down: saving state")
     room.flush()
     room.flush_topology()
+    if observer:
+        observer.close()
     store.close()                                           # waits for the writer thread to finish
     modem.close()
 

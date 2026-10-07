@@ -78,6 +78,18 @@
     "web_password": "changeme"
   },
 
+  "observer": {
+    "_note": "Optional MQTT packet observer. Requires python3-paho-mqtt when enabled; it never opens the serial device.",
+    "observer_enabled": false,
+    "observer_iata": "SJC",
+    "observer_status": true,
+    "observer_packets": true,
+    "observer_rx": true,
+    "observer_gomesh": true,
+    "observer_meshmapper": true,
+    "observer_queue_max": 1000
+  },
+
   "system": {
     "data_dir": "/opt/meshroom/data",
     "log_level": "INFO"

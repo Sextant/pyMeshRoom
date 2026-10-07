@@ -59,6 +59,7 @@ Install
    * access: Set room join password and room admin password
    * radio: Set USB interface and params for your region
    * dashboard: Set web UI admin password
+   * observer: Leave `observer_enabled` false unless MQTT observation is wanted. To enable it, install `python3-paho-mqtt`, use IATA `SJC` for this deployment, and keep `identity` set to `modem`; the modem signs the MQTT token and the private key is never copied to the Pi.
 * Usage
    * Run ```python3 meshroom.py --config meshroom.json```
 * Updating:

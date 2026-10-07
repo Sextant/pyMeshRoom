@@ -18,6 +18,7 @@ BROKERS = {
     "gomesh": ("mqtt.gomesh.dev", 443, "mqtt.gomesh.dev"),
     "meshmapper": ("mqtt.meshmapper.net", 443, "mqtt.meshmapper.net"),
 }
+STATUS_INTERVAL = 60
 
 
 def _b64url(data):
@@ -57,18 +58,31 @@ class ObserverBridge:
         self.clients = {}
         self.connected = {}
         self.last_error = {}
+        self.last_publish = {}
+        self.last_rx = 0.0
+        self._lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, name="mqtt-observer", daemon=True)
         self.thread.start()
 
     def submit_rx(self, raw, snr, rssi):
         """Queue an RX observation without ever waiting on network I/O."""
-        item = (bytes(raw), float(snr), int(rssi), time.time())
+        received_at = time.time()
+        # Do not enqueue at all when packet reporting is disabled.  This is a
+        # receive-path-only operation: no network or serial work happens here.
+        if not (getattr(self.cfg, "observer_packets", True) and
+                getattr(self.cfg, "observer_rx", True)):
+            return
+        item = (bytes(raw), float(snr), int(rssi), received_at)
+        with self._lock:
+            self.last_rx = received_at
         try:
             self.q.put_nowait(item)
         except queue.Full:
-            self.dropped += 1
-            if self.dropped == 1 or self.dropped % 100 == 0:
-                log.warning("observer queue full; dropped %d packet(s)", self.dropped)
+            with self._lock:
+                self.dropped += 1
+                dropped = self.dropped
+            if dropped == 1 or dropped % 100 == 0:
+                log.warning("observer queue full; dropped %d packet(s)", dropped)
 
     def close(self):
         self.running = False
@@ -92,6 +106,52 @@ class ObserverBridge:
             out.append("meshmapper")
         return out
 
+    def status(self):
+        """A stable, lock-protected diagnostics snapshot for the dashboard."""
+        with self._lock:
+            brokers = {
+                name: {
+                    "enabled": name in self._enabled(),
+                    "connected": bool(self.connected.get(name)),
+                    "last_publish": self.last_publish.get(name, 0.0),
+                    "last_error": self.last_error.get(name, ""),
+                }
+                for name in BROKERS
+            }
+            return {
+                "enabled": bool(getattr(self.cfg, "observer_enabled", False)),
+                "iata": self.iata,
+                "public_key": self.public_key,
+                "queue_depth": self.q.qsize(),
+                "queue_max": self.q.maxsize,
+                "dropped": self.dropped,
+                "uptime": max(0, int(time.time() - self.started)),
+                "last_rx": self.last_rx,
+                "last_error": self.last_error.get("observer", ""),
+                "brokers": brokers,
+            }
+
+    def _status_message(self, online=True):
+        snapshot = self.status()
+        return json.dumps({
+            "origin": str(self.cfg.name),
+            "origin_id": self.public_key,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "online": bool(online),
+            "queue_depth": snapshot["queue_depth"],
+            "queue_max": snapshot["queue_max"],
+            "dropped": snapshot["dropped"],
+            "uptime": snapshot["uptime"],
+        }, separators=(",", ":"))
+
+    def _record_error(self, name, message):
+        with self._lock:
+            self.last_error[name] = str(message)
+
+    def _set_connected(self, name, value):
+        with self._lock:
+            self.connected[name] = bool(value)
+
     def _connect(self, name, mqtt):
         host, port, audience = BROKERS[name]
         token = make_auth_token(self.identity, self.public_key, audience)
@@ -106,30 +166,34 @@ class ObserverBridge:
         client.username_pw_set("v1_" + self.public_key, token)
         client.tls_set()
         client.ws_set_options(path="/")
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
+        if getattr(self.cfg, "observer_status", True):
+            client.will_set(self._topic("status"), self._status_message(False), qos=0, retain=True)
 
         def on_connect(c, userdata, flags, reason_code, properties=None):
             try:
                 ok = int(reason_code) == 0
             except (TypeError, ValueError):
                 ok = reason_code == 0
-            self.connected[name] = ok
-            self.last_error[name] = "" if ok else "connect rc=%s" % reason_code
+            self._set_connected(name, ok)
+            self._record_error(name, "" if ok else "connect rc=%s" % reason_code)
             if ok:
                 log.info("observer %s connected to %s", name, host)
+                self._publish_status(name)
 
         def on_disconnect(c, userdata, *args):
-            self.connected[name] = False
+            self._set_connected(name, False)
             log.warning("observer %s disconnected", name)
 
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
         self.clients[name] = client
-        self.connected[name] = False
+        self._set_connected(name, False)
         try:
             client.connect_async(host, port, keepalive=60)
             client.loop_start()
         except Exception as e:
-            self.last_error[name] = str(e)
+            self._record_error(name, e)
             log.error("observer %s connection setup failed: %s", name, e)
 
     def _topic(self, kind):
@@ -178,31 +242,57 @@ class ObserverBridge:
         try:
             result = client.publish(self._topic("packets"), json.dumps(message), qos=0, retain=True)
             if getattr(result, "rc", 0) == 0:
+                with self._lock:
+                    self.last_publish[name] = time.time()
                 return True
-            self.last_error[name] = "publish rc=%s" % result.rc
+            self._record_error(name, "publish rc=%s" % result.rc)
         except Exception as e:
-            self.last_error[name] = str(e)
+            self._record_error(name, e)
+        return False
+
+    def _publish_status(self, name):
+        if not getattr(self.cfg, "observer_status", True):
+            return False
+        client = self.clients.get(name)
+        if client is None or not self.connected.get(name):
+            return False
+        try:
+            result = client.publish(self._topic("status"), self._status_message(True), qos=0, retain=True)
+            if getattr(result, "rc", 0) == 0:
+                with self._lock:
+                    self.last_publish[name] = time.time()
+                return True
+            self._record_error(name, "status publish rc=%s" % result.rc)
+        except Exception as e:
+            self._record_error(name, e)
         return False
 
     def _run(self):
         try:
             import paho.mqtt.client as mqtt
         except ImportError:
-            self.last_error["observer"] = "paho-mqtt missing"
+            self._record_error("observer", "paho-mqtt missing")
             log.error("observer enabled but paho-mqtt is missing")
             return
 
         for name in self._enabled():
             self._connect(name, mqtt)
 
+        next_status = time.monotonic() + STATUS_INTERVAL
         while self.running:
             try:
                 item = self.q.get(timeout=1.0)
             except queue.Empty:
-                continue
+                item = None
             if item is None:
-                break
-            raw, snr, rssi, received_at = item
-            # Broker failures are independent: one destination cannot suppress the other.
-            for name in list(self.clients):
-                self._publish_packet(name, raw, snr, rssi, received_at)
+                if not self.running:
+                    break
+            else:
+                raw, snr, rssi, received_at = item
+                # Broker failures are independent: one destination cannot suppress the other.
+                for name in list(self.clients):
+                    self._publish_packet(name, raw, snr, rssi, received_at)
+            if time.monotonic() >= next_status:
+                for name in list(self.clients):
+                    self._publish_status(name)
+                next_status = time.monotonic() + STATUS_INTERVAL
