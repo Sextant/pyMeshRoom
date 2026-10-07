@@ -5,7 +5,7 @@ using a MeshCore KISS modem (examples/kiss_modem firmware) as the radio.
 
 Ported from the C++ simple_room_server firmware (branch room-server-improvements),
 including: persistent members/posts/routes (SQLite), multi-route table with scoring,
-adaptive push gaps, hop-sorted push rounds, late-ACK handling, backoff + give-up for
+a self-adjusting push pace, hop-sorted push rounds, late-ACK handling, suspension (resumed on activity) for
 stuck members, catch-up cap for new members, companion name cache, repeater
 neighbours (app neighbours screen), and a built-in web dashboard.
 
@@ -51,7 +51,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 3.9"
+FIRMWARE_VERSION = "meshroom-py 4.0"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -73,9 +73,10 @@ DEFAULT_CONFIG = {
     "path_hash_mode": 0,            # 0/1/2 = 1/2/3-byte path hashes for floods we originate
     "advert_interval_min": 60,      # zero-hop advert (0 = off)
     "flood_advert_interval_h": 12,  # flood advert (0 = off)
-    "push_gap_base_ms": 1000,       # quiet window after a push: base
-    "push_gap_hop_ms": 2000,        # ... plus per hop
-    "push_gap_flood_ms": 10000,     # ... or after a flood push
+    "push_pace_start_ms": 2000,     # gap between pushes: starts here, self-adjusts between min and max
+    "push_pace_min_ms": 1500,
+    "push_pace_max_ms": 8000,
+    "push_gap_flood_ms": 10000,     # after a flood push: at most this long (ends early once the rebroadcasts pass)
     "radio_freq_mhz": 910.525,      # radio settings pushed to the modem at startup (it doesn't save them):
     "radio_bw_khz": 62.5,           #   US/Canada preset 910.525 MHz / BW 62.5 / SF7 / CR4:5
     "radio_sf": 7,
@@ -208,9 +209,8 @@ ROUTE_DROP_FAILS = 2
 ROUTE_HALFLIFE_H = 24
 ROUTE_MAX_AGE_D = 7
 FLOOD_ACK_MIN = 25.0
-STUCK_RETRY_H = 6
-STUCK_GIVEUP_H = 72
-BACKOFF_SECS = [60, 300, 900, 1800, STUCK_RETRY_H * 3600]
+RETRY_BEFORE_SUSPEND_S = 60      # one retry (best route + flood) a minute after a plan fails, then suspension
+SUSPENDED_PROBE_S = 6 * 3600     # while suspended: a single flood this often, in case they listen but never transmit
 MAX_NEIGHBOURS = 50
 NAME_CACHE_MAX = 1000
 
@@ -592,7 +592,7 @@ class Store:
     TABLES = {
         "members": ("pubkey BLOB PRIMARY KEY", "perms INT", "last_timestamp INT", "last_activity INT", "sync_since INT",
                     "out_path BLOB", "out_path_len INT", "given_up INT DEFAULT 0", "secret BLOB", "attempts_avg REAL",
-                    "deliveries INT", "in_path BLOB", "in_path_len INT", "in_ts INT"),
+                    "deliveries INT", "in_path BLOB", "in_path_len INT", "in_ts INT", "last_heard INT"),
         "posts": ("ts INT PRIMARY KEY", "author BLOB", "text TEXT", "to_key BLOB"),
         "routes": ("pubkey BLOB", "slot INT", "len INT", "path BLOB", "last_ok INT", "added_at INT", "s REAL", "n REAL",
                    "t INT", "lat REAL", "lat_n INT", "PRIMARY KEY (pubkey, slot)"),
@@ -681,8 +681,8 @@ class Store:
                     elif kind == "changes":
                         c = arg
                         db.executemany("INSERT OR REPLACE INTO members (pubkey, perms, last_timestamp, last_activity, sync_since, "
-                                       "out_path, out_path_len, given_up, secret, attempts_avg, deliveries, in_path, in_path_len, in_ts) "
-                                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", c["members"])
+                                       "out_path, out_path_len, given_up, secret, attempts_avg, deliveries, in_path, in_path_len, in_ts, "
+                                       "last_heard) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", c["members"])
                         db.executemany("DELETE FROM routes WHERE pubkey=?", [(k,) for k in c["members_gone"]])
                         db.executemany("DELETE FROM members WHERE pubkey=?", [(k,) for k in c["members_gone"]])
                         for pub, rows in c["routes"].items():
@@ -823,8 +823,12 @@ class Member:
         self.backoff = 0
         self.retry_at = 0.0
         self.stuck_since = 0.0
-        self.given_up = False
+        self.given_up = False             # = suspended: no pushes until we hear from them (plus a rare probe)
         self.new_member = False
+        self.next_probe = 0.0
+        self.fresh = None                 # (plen, path): route reversed from where we just heard them (tried first)
+        self.last_heard = 0               # any packet from them: ACKs, keepalives, logins, posts, requests, adverts
+        self.push_healthy = False         # the push in flight counts toward the shared pace
         self.attempts_avg = None          # recency-weighted attempts per delivered post (1.0 = always first try)
         self.deliveries = 0
         self.attempts_cur = 0             # attempts on the post being delivered
@@ -848,6 +852,9 @@ class RoomServer:
         self.notices = []                 # kick/ban messages being retried until ACKed
         self.last_pushed = None           # member of the most recent push (its ACK ends the gap early)
         self.last_push_at, self.last_push_flood = 0.0, False
+        self.pace = cfg.push_pace_start_ms / 1000.0       # seconds between pushes (self-adjusting)
+        self.pace_hist = collections.deque(maxlen=20)      # outcomes of pushes to healthy members
+        self.pace_hold = 0
         self.inpaths = {}                 # member key8 -> {(plen, path): [w, t]}  paths their floods took to reach us
         self.flood_owner = {}             # flood packet hash -> (member pubkey, expiry): attribute duplicate copies
         self.disc_tag, self.disc_until, self.disc_replies = None, 0.0, 0
@@ -923,16 +930,19 @@ class RoomServer:
     def load(self):
         st = self.store
         for row in st.read("SELECT pubkey, perms, last_timestamp, last_activity, sync_since, out_path, out_path_len, given_up, secret, "
-                           "attempts_avg, deliveries, in_path, in_path_len, in_ts FROM members"):
+                           "attempts_avg, deliveries, in_path, in_path_len, in_ts, last_heard FROM members"):
             m = Member(bytes(row[0]))
             m.perms, m.last_timestamp, m.last_activity, m.sync_since = row[1], row[2], row[3], row[4]
             m.out_path = bytes(row[5] or b"")
             m.out_path_len = row[6]
             m.given_up = bool(row[7])
+            if m.given_up:                                  # suspended across a restart: probes spread over the next hour
+                m.next_probe = time.monotonic() + random.uniform(1800, 3600)
             m.secret = bytes(row[8]) if row[8] else None   # saved: no modem key exchange needed after restart
             m.attempts_avg = row[9]
             m.deliveries = row[10] or 0
             m.in_path, m.in_path_len, m.in_ts = bytes(row[11] or b""), row[12], row[13] or 0
+            m.last_heard = row[14] or row[3] or 0
             self.members[m.pub] = m
         self.bans = {bytes(pub): dict(name=name, ts=ts) for pub, name, ts in st.read("SELECT pubkey, name, ts FROM bans")}
         for h, data in st.read("SELECT hash, data FROM probes"):
@@ -987,7 +997,7 @@ class RoomServer:
     @staticmethod
     def member_row(m):
         return (m.pub, m.perms, m.last_timestamp, m.last_activity, m.sync_since, m.out_path, m.out_path_len,
-                int(m.given_up), m.secret, m.attempts_avg, m.deliveries, m.in_path, m.in_path_len, m.in_ts)
+                int(m.given_up), m.secret, m.attempts_avg, m.deliveries, m.in_path, m.in_path_len, m.in_ts, m.last_heard)
 
     @staticmethod
     def route_rows(m):
@@ -1270,6 +1280,7 @@ class RoomServer:
             data = mac_then_decrypt(self.secret_for(m), p[2:])
             if data is None:
                 continue
+            self.heard_from(m)
             if pkt.is_flood:
                 self.observe_member_at(m, pkt.path[:pkt.hash_size] if pkt.hop_count else b"")
                 self.member_flood(m, pkt)
@@ -1311,7 +1322,7 @@ class RoomServer:
             if m and sender_ts > m.last_timestamp:
                 m.last_timestamp = sender_ts
                 m.last_activity = now_s()
-                self.reset_push_state(m)
+                self.member_active(m, pkt)
                 self.mark_dirty()
         if m is None:
             if password == self.cfg.admin_password:
@@ -1328,7 +1339,7 @@ class RoomServer:
             m.last_timestamp = sender_ts
             m.sync_since = sync_since
             m.pending_ack = None
-            self.reset_push_state(m)
+            self.member_active(m, pkt)
             # brand-new member (has never received a post): only the newest catchup_max posts
             public = [p for p in self.posts if p[3] is None]
             if sync_since == 0 and 0 < self.cfg.catchup_max < len(public):
@@ -1491,7 +1502,7 @@ class RoomServer:
         is_retry = sender_ts == m.last_timestamp
         m.last_timestamp = sender_ts
         m.last_activity = now_s()
-        self.reset_push_state(m)
+        self.member_active(m, pkt)
         self.mark_dirty()
         text_b = data[5:].split(b"\0", 1)[0]
         ack = sha256(data[:5 + len(text_b)], m.pub)[:4]
@@ -1614,7 +1625,7 @@ class RoomServer:
             return
         m.last_timestamp = sender_ts
         m.last_activity = now_s()
-        self.reset_push_state(m)
+        self.member_active(m, pkt)
         self.mark_dirty()
         if data[4] == REQ_KEEP_ALIVE and pkt.is_direct:
             force_since = struct.unpack_from("<I", data, 5)[0] if len(data) >= 9 else 0
@@ -1712,6 +1723,7 @@ class RoomServer:
                         break
             if not match:
                 continue
+            self.heard_from(m)                              # their ACK: heard from them
             lat_ms = None
             if late is None and m.push_sent:
                 lat_ms = int((time.monotonic() - m.push_sent) * 1000)
@@ -1721,8 +1733,11 @@ class RoomServer:
             self.stats["late_acks" if late is not None else "acks"] += 1
             entry = m.prev_entries[late] if late is not None else m.inflight
             self.attempt_result(m, entry, True, lat_ms)
-            if late is None and m.pub == self.last_pushed:
-                self.next_push = min(self.next_push, time.monotonic() + 0.5)   # ACK back: no need to keep waiting
+            if late is None and m.push_healthy:
+                self.pace_outcome(True)
+            m.push_healthy = False
+            if late is None and m.pub == self.last_pushed and self.last_push_flood:
+                self.next_push = min(self.next_push, time.monotonic() + 0.5)   # flood ACK back: the wave is done
             if m.attempts_cur:
                 self.delivery_sample(m, m.attempts_cur)
                 m.deliveries += 1
@@ -2235,6 +2250,15 @@ class RoomServer:
         return None
 
     def build_plan(self, m, retry=False):
+        plan = self._build_plan(m, retry)
+        if m.fresh is not None:                             # just heard from them: go back the way they came, first
+            plen, path = m.fresh
+            m.fresh = None
+            first = dict(plen=plen, path=path, score=0.9, proven=self.find_route(m, plen, path), built="fresh")
+            plan = [first] + [e for e in plan if e["plen"] is None or (e["plen"], e["path"]) != (plen, path)]
+        return plan
+
+    def _build_plan(self, m, retry=False):
         """Attempts for one post: best route, best built route (if different), best again,
         next distinct route, flood. Straight to flood if nothing scores at least 35%."""
         flood = dict(plen=None, path=None, score=0.0, proven=None, built=None)
@@ -2256,6 +2280,40 @@ class RoomServer:
         plan.append(flood)
         return plan
 
+    def heard_from(self, m):
+        """Any packet we can attribute to m: the 'Last heard' time (saved with the member)."""
+        m.last_heard = now_s()
+        self.mark_dirty()
+
+    def member_active(self, m, pkt):
+        """We just heard from m. If they were struggling or suspended, resume at once: front of the queue, and the
+        first attempt goes back the way this packet came (they may have moved)."""
+        self.heard_from(m)
+        struggling = m.given_up or m.stuck_since or (m.plan is not None and m.push_failures > 0)
+        was_suspended = m.given_up
+        self.reset_push_state(m)
+        if not struggling:
+            return
+        m.fresh = self.fresh_route_from(m, pkt)
+        if self.unsynced_count(m):
+            self.round = [m.pub] + [k for k in self.round if k != m.pub]
+            self.next_push = min(self.next_push, time.monotonic() + 0.3)
+        log.info("%s %s: heard from them, first try %s", "resuming" if was_suspended else "retrying", self.member_label(m),
+                 "flood" if m.fresh is None else " > ".join(self.path_names(*m.fresh) or ["direct"]))
+
+    def fresh_route_from(self, m, pkt):
+        """Route back to m from the packet we just heard: a flood carries their path (reverse it); a direct packet
+        means their stored route to us works (reverse that); none if we know neither."""
+        if pkt is not None and pkt.is_flood:
+            sz, k = pkt.hash_size, pkt.hop_count
+            hops = [pkt.path[i * sz:(i + 1) * sz] for i in range(k)]
+            return (((sz - 1) << 6) | k, b"".join(reversed(hops)))
+        if m.in_ts and m.in_path_len is not None:
+            sz, k = (m.in_path_len >> 6) + 1, m.in_path_len & 63
+            hops = [m.in_path[i * sz:(i + 1) * sz] for i in range(k)]
+            return (m.in_path_len, b"".join(reversed(hops)))
+        return None
+
     def reset_push_state(self, m):
         m.push_failures = 0
         m.plan, m.plan_retry = None, False
@@ -2265,8 +2323,10 @@ class RoomServer:
             self.mark_dirty()
 
     def push_eligible(self, m):
-        if m.pending_ack is not None or m.last_activity == 0 or m.given_up:
+        if m.pending_ack is not None or m.last_activity == 0:
             return False
+        if m.given_up:                                      # suspended: only the rare probe
+            return time.monotonic() >= m.next_probe
         if m.plan is None or m.push_failures < len(m.plan):
             return True
         return time.monotonic() >= m.retry_at                    # backoff retry due
@@ -2291,6 +2351,32 @@ class RoomServer:
                 return c[0]["plen"] & 63
         return 0xFF
 
+    def pace_outcome(self, ok):
+        """Shared pace, TCP-style: back off fast when pushes to healthy members start timing out (a busy channel or
+        a saturated repeater), recover slowly while they're delivered. One member's trouble doesn't count."""
+        self.pace_hist.append(ok)
+        lo, hi = self.cfg.push_pace_min_ms / 1000.0, self.cfg.push_pace_max_ms / 1000.0
+        if self.pace_hold > 0:
+            self.pace_hold -= 1
+            return
+        if len(self.pace_hist) < 10:
+            return
+        loss = 1.0 - sum(self.pace_hist) / float(len(self.pace_hist))
+        if loss > 0.25:
+            old = self.pace
+            self.pace = min(self.pace * 1.5, hi)
+            self.pace_hold = 10
+            if self.pace != old:
+                log.info("push pace %.1f s -> %.1f s (%.0f%% of recent pushes to healthy members timed out)", old, self.pace, loss * 100)
+        elif loss < 0.10 and ok and not self.channel_busy():
+            self.pace = max(self.pace - 0.1, lo)
+
+    def channel_busy(self):
+        if not self.minutes:
+            return False
+        x = self.minutes[-1]
+        return (x["tx_ms"] + x["rx_ms"]) / 60000.0 > 0.40
+
     def flood_gap_done(self, now):
         """After a flooded push, stop waiting once the rebroadcast wave around us has passed: at least 2 s, and the
         channel quiet for push_quiet_ms (rebroadcasts we hear keep resetting that). push_gap_flood_ms stays the cap."""
@@ -2298,21 +2384,11 @@ class RoomServer:
         return (self.last_push_flood and q > 0 and now - self.last_push_at >= 2.0 and now - self.last_rx_mono >= q
                 and now - self.last_push_at >= q)
 
-    def gap_after_push(self, m):
-        """Wait before the next push, so we aren't transmitting while this push's ACK comes back. Routes with
-        measured ACK times use them (x1.25 + 0.5 s); others use the per-hop formula, which is also the ceiling."""
-        formula = self.gap_for(m.push_hops)
-        entry = m.inflight
-        r = entry.get("proven") if entry else None
-        if r is None or entry.get("plen") is None or r.lat_n < 3:
-            return formula
-        measured = r.lat * 1.25 / 1000.0 + 0.5
-        return max(self.cfg.push_gap_base_ms / 1000.0, min(measured, formula))
-
     def gap_for(self, hops):
+        """Wait after a push: the shared pace for direct routes; floods wait out their rebroadcast wave (capped)."""
         if hops == 0xFF:
             return self.cfg.push_gap_flood_ms / 1000.0
-        return (self.cfg.push_gap_base_ms + self.cfg.push_gap_hop_ms * hops) / 1000.0
+        return self.pace
 
     # ------------------------------------------------------------------ outcomes
 
@@ -2353,22 +2429,22 @@ class RoomServer:
             m.inflight = None
             self.stats["timeouts"] += 1
             self.attempt_result(m, entry, False)
+            if m.push_healthy:
+                self.pace_outcome(False)
+                m.push_healthy = False
             if m.plan is not None and m.push_failures >= len(m.plan):
                 if m.attempts_cur:                          # undelivered after all of them: a bad sample
                     self.delivery_sample(m, m.attempts_cur + 1)
                     m.attempts_cur = 0
-                # every attempt in the plan failed: retries at 1, 5, 15, 30 min, then every 6 h
-                # (each retry = best route, then flood); give up after 72 h until they make contact
-                if m.stuck_since == 0:
-                    m.stuck_since, m.backoff = now, 0
-                elif m.backoff < len(BACKOFF_SECS) - 1:
-                    m.backoff += 1
-                if now - m.stuck_since >= STUCK_GIVEUP_H * 3600 and not m.given_up:
+                if m.given_up:                              # a suspended probe went unanswered
+                    m.next_probe = now + SUSPENDED_PROBE_S
+                elif not m.plan_retry:                      # the plan failed: one retry a minute from now
+                    m.stuck_since = m.stuck_since or now
+                    m.retry_at = now + RETRY_BEFORE_SUSPEND_S
+                else:                                       # the retry failed too: suspend until we hear from them
                     m.given_up = True
-                    self.raise_alert("member", m.key6, "Gave up on %s after %d h of failed deliveries; waiting for them to make contact"
-                                     % (self.member_label(m), STUCK_GIVEUP_H))
-                    log.info("giving up on %s until they make contact", m.key6)
-                m.retry_at = now + BACKOFF_SECS[m.backoff]
+                    m.next_probe = now + SUSPENDED_PROBE_S
+                    log.info("suspending %s: no ACK on the plan or its retry; resuming when we hear from them", self.member_label(m))
             self.mark_dirty()
 
     # ------------------------------------------------------------------ push loop
@@ -2397,7 +2473,7 @@ class RoomServer:
                     self.push_post(m, ts, author, text)
                     did_push = True
                     break
-        self.next_push = now + (self.gap_after_push(m) if did_push else SYNC_SKIP_INTERVAL)
+        self.next_push = now + (self.gap_for(m.push_hops) if did_push else SYNC_SKIP_INTERVAL)
         if did_push:
             self.last_pushed = m.pub
             self.last_push_at = now
@@ -2408,11 +2484,16 @@ class RoomServer:
             m.prev_acks = [None, None]                      # different post: earlier attempts' ACKs no longer apply
             if not m.plan_retry or m.plan is None:
                 m.plan, m.push_failures = None, 0
-        if m.plan is None:
+        if m.given_up:                                      # suspended probe: a single flood
+            m.plan, m.plan_retry, m.push_failures = [dict(plen=None, path=None, score=0.0, proven=None, built=None)], True, 0
+        elif m.plan is None:
             m.plan, m.plan_retry, m.push_failures = self.build_plan(m), False, 0
-        elif m.push_failures >= len(m.plan):                # backoff retry: best route, then flood
+        elif m.push_failures >= len(m.plan):                # the one retry: best route, then flood
             m.plan, m.plan_retry, m.push_failures = self.build_plan(m, retry=True), True, 0
         entry = m.plan[m.push_failures]
+        r_ = entry.get("proven")
+        m.push_healthy = bool(not m.given_up and not m.stuck_since and entry["plen"] is not None and r_ is not None
+                              and r_.rate(now_s(), self.rhalf()) >= 0.7)          # counts toward the shared pace
         m.attempts_cur += 1
         data = struct.pack("<I", ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | random.randrange(4)]) \
             + author[:4] + text.encode()
@@ -2494,8 +2575,10 @@ class RoomServer:
             self.neighbours[pub] = dict(advert_ts=ts, heard=now_s(), snr4=int(pkt.snr * 4), name=name)
         if atype == ADV_TYPE_CHAT:
             m = self.members.get(pub)
-            if m and m.push_failures > 0 and m.pending_ack is None:
-                self.reset_push_state(m)                    # signed advert: they're on the air
+            if m:
+                self.heard_from(m)                          # flood or zero-hop advert: they're on the air
+            if m and (m.given_up or m.push_failures > 0 or m.stuck_since) and m.pending_ack is None:
+                self.member_active(m, pkt)                  # signed advert: they're on the air
                 if m.last_activity == 0:
                     m.last_activity = now_s()
                 self.mark_dirty()
@@ -2547,7 +2630,7 @@ class RoomServer:
                 k = cmd[4:].strip()
                 vals = {"name": c.name, "lat": c.lat, "lon": c.lon, "allow.read.only": "on" if c.allow_read_only else "off",
                         "path.hash.mode": c.path_hash_mode, "public.key": hexs(self.id.pub_key), "role": "room_server",
-                        "push.gap": "base %sms, +%sms/hop, flood %sms" % (c.push_gap_base_ms, c.push_gap_hop_ms, c.push_gap_flood_ms)}
+                        "push.pace": "now %.1fs (min %sms, max %sms), flood gap %sms" % (self.pace, c.push_pace_min_ms, c.push_pace_max_ms, c.push_gap_flood_ms)}
                 return "> %s" % vals[k] if k in vals else "??: " + k
             if cmd.startswith("set "):
                 k, _, v = cmd[4:].partition(" ")
@@ -2562,8 +2645,10 @@ class RoomServer:
                     c.set("allow_read_only", v == "on")
                 elif k == "path.hash.mode" and v in ("0", "1", "2"):
                     c.set("path_hash_mode", int(v))
-                elif k in ("push.gap.base", "push.gap.hop", "push.gap.flood"):
-                    c.set("push_gap_%s_ms" % k.split(".")[-1], max(0, min(120000, int(v))))
+                elif k in ("push.pace.min", "push.pace.max", "push.pace.start"):
+                    c.set("push_pace_%s_ms" % k.split(".")[-1], max(500, min(60000, int(v))))
+                elif k == "push.gap.flood":
+                    c.set("push_gap_flood_ms", max(0, min(120000, int(v))))
                 else:
                     return "unknown config: " + k
                 return "OK"
@@ -2754,7 +2839,8 @@ class RoomServer:
                     tx_pct=round(100.0 * sum(x["tx_ms"] for x in ms) / (n * 60000.0), 1),
                     rx_pct=round(100.0 * sum(x["rx_ms"] for x in ms) / (n * 60000.0), 1),
                     rx_pm=round(sum(x["rx"] for x in ms) / n, 1), tx_pm=round(sum(x["tx"] for x in ms) / n, 1),
-                    pushes_pm=round(pushes / n, 1), push_ok=round(100.0 * min(acks, pushes) / pushes) if pushes else None)
+                    pushes_pm=round(pushes / n, 1), push_ok=round(100.0 * min(acks, pushes) / pushes) if pushes else None,
+                    pace=round(self.pace, 1))
 
     # ------------------------------------------------------------------ labels
 
@@ -2811,8 +2897,8 @@ class RoomServer:
                 pub=hexs(m.pub), key=m.key6, name=nm[1] if nm else "",
                 delivery=self.delivery_score(m), avg_attempts=None if m.attempts_avg is None else round(m.attempts_avg, 2),
                 deliveries=m.deliveries, role={PERM_ADMIN: "admin", PERM_GUEST: "guest"}.get(m.role, "member"),
-                last_activity=m.last_activity, sync_since=m.sync_since, outstanding=self.unsynced_count(m),
-                push="gave_up" if m.given_up else "waiting" if m.pending_ack else "backoff" if in_backoff
+                last_activity=m.last_activity, last_heard=max(m.last_heard or 0, m.last_activity or 0), sync_since=m.sync_since, outstanding=self.unsynced_count(m),
+                push="suspended" if m.given_up else "waiting" if m.pending_ack else "backoff" if in_backoff
                      else "retrying" if m.push_failures else "idle",
                 retry_in=int(m.retry_at - time.monotonic()) if in_backoff else 0,
                 route=self.path_names(m.out_path_len, m.out_path),
@@ -2937,7 +3023,7 @@ header h1{font-size:18px;margin:0}.dim{color:var(--dim)}main{padding:14px 18px;d
 .card h2{font-size:14px;margin:0 0 8px;color:var(--acc);text-transform:uppercase;letter-spacing:.04em}
 table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:top}
 th{color:var(--dim);font-weight:500}.tag{padding:1px 6px;border-radius:4px;font-size:12px}
-.idle{background:#24382c;color:var(--ok)}.waiting,.retrying{background:#3a3220;color:var(--warn)}.backoff,.gave_up{background:#3d2424;color:var(--bad)}
+.idle{background:#24382c;color:var(--ok)}.waiting,.retrying{background:#3a3220;color:var(--warn)}.backoff,.gave_up,.suspended{background:#3d2424;color:var(--bad)}
 button{background:#2a313b;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:2px 10px;cursor:pointer}
 .mapwrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
 @media (max-width:900px){.mapwrap{grid-template-columns:1fr}}
@@ -3098,6 +3184,7 @@ async function load(){
   `<span><span class="dim">Noise floor</span><b>${Hs.nf_avg??"-"}</b> <span class="dim small">avg &middot; ${Hs.nf_min??"-"} / ${Hs.nf_max??"-"} min / max dBm</span></span>`,
   `<span><span class="dim">Channel use</span>TX <b>${Hs.tx_pct}%</b> &middot; RX <b>${Hs.rx_pct}%</b></span>`,
   `<span><span class="dim">Packets / min</span>RX <b>${Hs.rx_pm}</b> &middot; TX <b>${Hs.tx_pm}</b></span>`,
+  `<span><span class="dim">Push pace</span><b>${Hs.pace} s</b></span>`,
   `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_ok!=null?` &middot; <b class="${Hs.push_ok>=80?"good":Hs.push_ok>=50?"mid":"poor"}">${Hs.push_ok}%</b> delivered`:""}</span>`,
   `<span class="dim small">last ${Hs.minutes>=60?"hour":Hs.minutes+" min"}</span>`].join(""):'<span class="dim small">stats appear after the first minute</span>';
  $("rclock").textContent="up "+ago(Date.now()/1000-R.uptime).replace("s"," s")+(R.clock_ok?"":"  CLOCK NOT SYNCED");
@@ -3106,7 +3193,7 @@ async function load(){
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
  $("members").innerHTML="<tr>"+(ADMIN?"<th></th>":"")+"<th>ID</th><th>Delivery</th><th>Last heard</th><th>Synced to</th><th>Behind</th><th>Push</th><th>Current route</th><th>Other routes</th><th>Usually near</th></tr>"+
   st.members.map((m,i)=>`<tr>${ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff, retry now via best routes, then flood${m.outstanding?"":" (nothing outstanding)"}" onclick="resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" onclick="act('api/members/${m.pub}/kick','Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again.')">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" onclick="act('api/members/${m.pub}/ban','Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely.')">${IC("ban")}</button></td>`:""}
-  <td class="idcell"><b>${esc(m.name)||'<span class="dim">unknown</span>'}</b><br><span class="dim mono4">${m.key.slice(0,4)}</span><br><span class="small">${m.role}</span></td><td>${score(m)}</td><td>${ago(m.last_activity)}</td><td>${ago(m.sync_since)}</td><td>${m.outstanding}</td>
+  <td class="idcell"><b>${esc(m.name)||'<span class="dim">unknown</span>'}</b><br><span class="dim mono4">${m.key.slice(0,4)}</span><br><span class="small">${m.role}</span></td><td>${score(m)}</td><td>${ago(m.last_heard)}</td><td>${ago(m.sync_since)}</td><td>${m.outstanding}</td>
   <td><span class="tag ${m.push}">${m.push}${m.retry_in?" "+Math.ceil(m.retry_in/60)+"m":""}</span></td>
   <td class="small rcell"><div><span class="dir tx">TX</span><span>${route(m.route)}</span></div><div><span class="dir rx">RX</span><span>${m.in_route==null?'<span class="dim">unknown</span>':m.in_route.length?m.in_route.map(esc).join(" &rsaquo; "):"direct"}</span></div></td>
   <td class="small rcell">${[...m.routes.filter(r=>!r.current).slice(0,5).map(r=>`<div><span class="dir tx">TX</span><span>${route(r.path)} <span class="dim">${r.rate}%</span></span></div>`),
