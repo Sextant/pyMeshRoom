@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "meshroom"))
-from meshroom import DEFAULTS, Packet, PT_ADVERT, VirtualRepeater, repeater_changes
+from meshroom import DEFAULT_CONFIG, Packet, PT_ADVERT, VirtualRepeater, repeater_changes
 
 
 class VirtualRepeaterTests(unittest.TestCase):
@@ -21,8 +21,8 @@ class VirtualRepeaterTests(unittest.TestCase):
         relay._region_cache = (None, [])
         return relay
     def test_repeater_is_disabled_by_default(self):
-        self.assertFalse(DEFAULTS["repeater_enabled"])
-        self.assertEqual(DEFAULTS["repeater_key"], "")
+        self.assertFalse(DEFAULT_CONFIG["repeater_enabled"])
+        self.assertEqual(DEFAULT_CONFIG["repeater_key"], "")
 
     def test_identity_is_deterministic_and_not_the_room_identity(self):
         first = RepeaterIdentity(bytes(range(32)))
