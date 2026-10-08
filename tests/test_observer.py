@@ -30,6 +30,17 @@ def config(**overrides):
 
 
 class ObserverTests(unittest.TestCase):
+    def test_bundled_paho_is_used_when_none_is_installed(self):
+        import subprocess
+        meshroom_dir = str(pathlib.Path(__file__).resolve().parents[1] / "meshroom")
+        # -S: no site-packages, so an installed paho-mqtt is invisible and the vendor/ copy must be found
+        code = ("import sys; sys.path.insert(0, %r); import meshroom_observer as m; c = m.import_paho(); "
+                "import paho.mqtt; print(c.__file__); print(paho.mqtt.__version__); "
+                "print(hasattr(c, 'CallbackAPIVersion'))" % meshroom_dir)
+        out = subprocess.run([sys.executable, "-I", "-S", "-c", code], capture_output=True, text=True, check=True).stdout.split()
+        self.assertTrue(out[0].startswith(str(pathlib.Path(meshroom_dir) / "vendor" / "paho")), out[0])
+        self.assertEqual(out[1:], ["2.1.0", "True"])
+
     def test_custom_observer_server_replaces_legacy_destinations(self):
         cfg = config(observer_servers=[{"id": "regional", "name": "Regional", "enabled": True,
                                         "host": "mqtt.example.org", "port": 443, "audience": "mqtt.example.org",

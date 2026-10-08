@@ -158,7 +158,7 @@ Install
    * access: Set room join password and room admin password
    * radio: Set USB interface and params for your region
    * dashboard: Set web UI admin password
-   * observer: Leave `observer_enabled` false unless MQTT observation is wanted. To enable it, install `python3-paho-mqtt`, use IATA `SJC` for this deployment, and keep `identity` set to `modem`; the modem signs the MQTT token and the private key is never copied to the Pi. `observer_status` controls retained online/offline status messages on `meshcore/<IATA>/<public-key>/status`. Packet observations publish to `meshcore/<IATA>/<public-key>/packets` only when both `observer_packets` and `observer_rx` are true; they are compatibility gates for the same RX-only packet path, not independent packet types.
+   * observer: Leave `observer_enabled` false unless MQTT observation is wanted. To enable it, use IATA `SJC` for this deployment, and keep `identity` set to `modem`; the modem signs the MQTT token and the private key is never copied to the Pi. `observer_status` controls retained online/offline status messages on `meshcore/<IATA>/<public-key>/status`. Packet observations publish to `meshcore/<IATA>/<public-key>/packets` only when both `observer_packets` and `observer_rx` are true; they are compatibility gates for the same RX-only packet path, not independent packet types.
 * Usage
    * Run ```python3 meshroom.py --config meshroom.json```
 * Updating:
@@ -182,11 +182,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pyserial cryptography
 ```
 
-Add `paho-mqtt` only when enabling the outbound MQTT observer:
-
-```bash
-.venv/bin/python -m pip install --upgrade paho-mqtt
-```
+The outbound MQTT observer needs `paho-mqtt`, which is bundled in `meshroom/vendor/` (version 2.1.0, with its licence files), so there is nothing extra to install. An installed `paho-mqtt` (in `.venv`, or Debian's `python3-paho-mqtt`) is used instead when present.
 
 ## First configuration
 
@@ -276,11 +272,7 @@ Run all automated tests before upgrading a live instance:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Install `paho-mqtt` before enabling the optional outbound MQTT Observer:
-
-```bash
-.venv/bin/python -m pip install --upgrade paho-mqtt
-```
+The optional outbound MQTT Observer uses the `paho-mqtt` bundled in `meshroom/vendor/` unless one is installed; keep `meshroom/vendor/` next to `meshroom.py` when copying files to a live instance.
 
 ## Optional MQTT
 
@@ -377,6 +369,6 @@ The core room server requires:
 
 The optional outbound MQTT observer additionally requires:
 
-* `paho-mqtt` (tested here with version 2.1.0) for signed publishing to GoMesh and MeshMapper.
+* `paho-mqtt` for signed publishing to GoMesh and MeshMapper. Version 2.1.0 is bundled in `meshroom/vendor/paho/` (unmodified; EPL-2.0 or EDL-1.0, see `meshroom/vendor/paho-mqtt-license/`), so no separate install is needed. An installed paho-mqtt (1.x or 2.x, e.g. `python3-paho-mqtt` or in `.venv`) takes precedence.
 
 The optional inbound MQTT ingestion uses only Python's standard library for MQTT, TLS, and WebSockets; it does **not** require an additional MQTT package. It needs network access to the configured broker (the default is `mqtt.gomesh.dev:443` with TLS WebSockets). If the broker requires read-only subscriber authorization, configure it through the admin controls or the private `mqtt_username` and `mqtt_password` settings. The dashboard’s `SUBACK` status—not merely “connected”—confirms whether the broker accepted the topic filter.
