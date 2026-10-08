@@ -126,6 +126,7 @@
     "observer_rx": true,
     "observer_gomesh": true,
     "observer_meshmapper": true,
+    "observer_servers": null,
     "observer_queue_max": 1000
   },
 

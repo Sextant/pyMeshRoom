@@ -14,9 +14,13 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("meshroom.observer")
 
-BROKERS = {
-    "gomesh": ("mqtt.gomesh.dev", 443, "mqtt.gomesh.dev"),
-    "meshmapper": ("mqtt.meshmapper.net", 443, "mqtt.meshmapper.net"),
+LEGACY_BROKERS = {
+    "gomesh": {"id": "gomesh", "name": "GoMesh", "host": "mqtt.gomesh.dev", "port": 443,
+               "audience": "mqtt.gomesh.dev", "ws_path": "/", "tls": True, "tls_verify": True,
+               "topic_prefix": "meshcore"},
+    "meshmapper": {"id": "meshmapper", "name": "MeshMapper", "host": "mqtt.meshmapper.net", "port": 443,
+                   "audience": "mqtt.meshmapper.net", "ws_path": "/", "tls": True, "tls_verify": True,
+                   "topic_prefix": "meshcore"},
 }
 STATUS_INTERVAL = 60
 
@@ -65,7 +69,7 @@ class ObserverBridge:
         self.rf_buckets = {}                         # UTC epoch minute -> received RF packet count
         self.broker_stats = {name: {"attempts": 0, "accepted": 0, "failures": 0,
                                     "payload_bytes": 0, "last_success": 0.0}
-                             for name in BROKERS}
+                             for name in self._servers()}
         self._lock = threading.Lock()
         self._refresh = threading.Event()
         self.thread = None
@@ -124,11 +128,33 @@ class ObserverBridge:
     def _enabled(self):
         if not getattr(self.cfg, "observer_enabled", False):
             return []
-        out = []
-        if getattr(self.cfg, "observer_gomesh", True):
-            out.append("gomesh")
-        if getattr(self.cfg, "observer_meshmapper", True):
-            out.append("meshmapper")
+        return [name for name, spec in self._servers().items() if spec["enabled"]]
+
+    def _servers(self):
+        """Configured standard MeshCore observer destinations, keyed by stable id.
+
+        `None` means an older config: retain its two legacy switches. A saved
+        list, including an empty list, is authoritative and supports deletion.
+        """
+        raw = getattr(self.cfg, "observer_servers", None)
+        if raw is None:
+            raw = []
+            for name, spec in LEGACY_BROKERS.items():
+                item = dict(spec)
+                item["enabled"] = bool(getattr(self.cfg, "observer_" + name, True))
+                raw.append(item)
+        out = {}
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("id") or "").strip().lower()
+            if not name or name in out:
+                continue
+            spec = dict(item)
+            spec["id"] = name
+            spec["name"] = str(item.get("name") or name)
+            spec["enabled"] = bool(item.get("enabled", True))
+            out[name] = spec
         return out
 
     def status(self):
@@ -141,7 +167,7 @@ class ObserverBridge:
                     "last_publish": self.last_publish.get(name, 0.0),
                     "last_error": self.last_error.get(name, ""),
                 }
-                for name in BROKERS
+                for name in self._servers()
             }
             return {
                 "enabled": bool(getattr(self.cfg, "observer_enabled", False)),
@@ -157,6 +183,11 @@ class ObserverBridge:
                 "last_rx": self.last_rx,
                 "last_error": self.last_error.get("observer", ""),
                 "brokers": brokers,
+                "servers": [dict(id=s["id"], name=s["name"], enabled=s["enabled"], host=s["host"],
+                                  port=int(s["port"]), audience=s["audience"], ws_path=s.get("ws_path", "/"),
+                                  tls=bool(s.get("tls", True)), tls_verify=bool(s.get("tls_verify", True)),
+                                  topic_prefix=s.get("topic_prefix", "meshcore"))
+                            for s in self._servers().values()],
             }
 
     def statistics(self):
@@ -207,14 +238,16 @@ class ObserverBridge:
 
     def _record_attempt(self, name, payload):
         with self._lock:
-            stats = self.broker_stats[name]
+            stats = self.broker_stats.setdefault(name, {"attempts": 0, "accepted": 0, "failures": 0,
+                                                         "payload_bytes": 0, "last_success": 0.0})
             stats["attempts"] += 1
             stats["payload_bytes"] += len(payload.encode())
 
     def _record_publish_result(self, name, accepted):
         when = time.time()
         with self._lock:
-            stats = self.broker_stats[name]
+            stats = self.broker_stats.setdefault(name, {"attempts": 0, "accepted": 0, "failures": 0,
+                                                         "payload_bytes": 0, "last_success": 0.0})
             if accepted:
                 stats["accepted"] += 1
                 stats["last_success"] = when
@@ -243,7 +276,12 @@ class ObserverBridge:
         """Reconcile broker settings in the observer worker thread."""
         self.iata = str(getattr(self.cfg, "observer_iata", "SJC")).upper()
         self.q.maxsize = max(10, int(getattr(self.cfg, "observer_queue_max", 1000)))
+        specs = self._servers()
         enabled = set(self._enabled())
+        with self._lock:
+            for name in specs:
+                self.broker_stats.setdefault(name, {"attempts": 0, "accepted": 0, "failures": 0,
+                                                     "payload_bytes": 0, "last_success": 0.0})
         if rebuild:
             for name in list(self.clients):
                 self._disconnect(name)
@@ -253,10 +291,10 @@ class ObserverBridge:
                     self._disconnect(name)
         for name in enabled:
             if name not in self.clients:
-                self._connect(name, mqtt)
+                self._connect(name, specs[name], mqtt)
 
-    def _connect(self, name, mqtt):
-        host, port, audience = BROKERS[name]
+    def _connect(self, name, spec, mqtt):
+        host, port, audience = spec["host"], int(spec["port"]), spec["audience"]
         token = make_auth_token(self.identity, self.public_key, audience)
         client_id = ("meshcore_" + self.public_key[:12] + "_" + name)[:60]
         try:
@@ -267,11 +305,14 @@ class ObserverBridge:
         except (AttributeError, TypeError):
             client = mqtt.Client(client_id=client_id, clean_session=True, transport="websockets")
         client.username_pw_set("v1_" + self.public_key, token)
-        client.tls_set()
-        client.ws_set_options(path="/")
+        if spec.get("tls", True):
+            client.tls_set()
+            if not spec.get("tls_verify", True):
+                client.tls_insecure_set(True)
+        client.ws_set_options(path=spec.get("ws_path", "/"))
         client.reconnect_delay_set(min_delay=1, max_delay=60)
         if getattr(self.cfg, "observer_status", True):
-            client.will_set(self._topic("status"), self._status_message(False), qos=0, retain=True)
+            client.will_set(self._topic(name, "status"), self._status_message(False), qos=0, retain=True)
 
         def on_connect(c, userdata, flags, reason_code, properties=None):
             try:
@@ -299,8 +340,10 @@ class ObserverBridge:
             self._record_error(name, e)
             log.error("observer %s connection setup failed: %s", name, e)
 
-    def _topic(self, kind):
-        return "meshcore/%s/%s/%s" % (self.iata, self.public_key, kind)
+    def _topic(self, name, kind):
+        spec = self._servers().get(name, {})
+        prefix = str(spec.get("topic_prefix") or "meshcore").strip("/")
+        return "%s/%s/%s/%s" % (prefix, self.iata, self.public_key, kind)
 
     @staticmethod
     def _packet_metadata(raw):
@@ -345,7 +388,7 @@ class ObserverBridge:
         payload = json.dumps(message)
         try:
             self._record_attempt(name, payload)
-            result = client.publish(self._topic("packets"), payload, qos=0, retain=True)
+            result = client.publish(self._topic(name, "packets"), payload, qos=0, retain=True)
             if getattr(result, "rc", 0) == 0:
                 self._record_publish_result(name, True)
                 return True
@@ -365,7 +408,7 @@ class ObserverBridge:
         payload = self._status_message(online)
         try:
             self._record_attempt(name, payload)
-            result = client.publish(self._topic("status"), payload, qos=0, retain=True)
+            result = client.publish(self._topic(name, "status"), payload, qos=0, retain=True)
             if getattr(result, "rc", 0) == 0:
                 self._record_publish_result(name, True)
                 return True

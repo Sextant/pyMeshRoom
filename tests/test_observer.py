@@ -30,6 +30,14 @@ def config(**overrides):
 
 
 class ObserverTests(unittest.TestCase):
+    def test_custom_observer_server_replaces_legacy_destinations(self):
+        cfg = config(observer_servers=[{"id": "regional", "name": "Regional", "enabled": True,
+                                        "host": "mqtt.example.org", "port": 443, "audience": "mqtt.example.org",
+                                        "ws_path": "/mqtt", "tls": True, "tls_verify": True, "topic_prefix": "meshcore"}])
+        bridge = ObserverBridge(cfg, FakeIdentity(), start=False)
+        self.assertEqual(bridge._enabled(), ["regional"])
+        self.assertEqual(bridge._topic("regional", "packets"), "meshcore/SJC/" + bridge.public_key + "/packets")
+
     def test_token_uses_modem_signature_and_standard_encoding(self):
         identity = FakeIdentity()
         token = make_auth_token(identity, identity.pub_key.hex(), "mqtt.gomesh.dev", ttl=90)

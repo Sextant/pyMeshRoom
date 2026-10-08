@@ -133,6 +133,9 @@ DEFAULT_CONFIG = {
     "observer_rx": True,
     "observer_gomesh": True,
     "observer_meshmapper": True,
+    # None preserves the legacy GoMesh/MeshMapper pair; an admin-managed list
+    # replaces that pair when custom observer destinations are saved.
+    "observer_servers": None,
     "observer_queue_max": 1000,
     "log_level": "INFO",
     "repeater_enabled": False,      # virtual repeater: a second identity on the room's radio that relays like a repeater
@@ -890,6 +893,34 @@ def mqtt_changes(body):
                 raise ValueError("invalid MQTT topic filter: %s" % topic)
         ch["mqtt_topics"] = topics
     return ch
+
+
+def observer_servers_changes(servers):
+    """Validate admin-managed standard MeshCore JWT observer destinations."""
+    if not isinstance(servers, list) or len(servers) > 16:
+        raise ValueError("configure 0 to 16 observer servers")
+    out, ids = [], set()
+    for item in servers:
+        if not isinstance(item, dict):
+            raise ValueError("observer server must be an object")
+        name = str(item.get("name") or "").strip()
+        sid = str(item.get("id") or name.lower().replace(" ", "-")).strip().lower()
+        host = str(item.get("host") or "").strip()
+        audience = str(item.get("audience") or host).strip()
+        ws_path = str(item.get("ws_path") or "/").strip()
+        prefix = str(item.get("topic_prefix") or "meshcore").strip("/")
+        try: port = int(item.get("port"))
+        except (TypeError, ValueError): raise ValueError("observer server port is invalid")
+        if (not name or len(name) > 40 or not sid or sid in ids or len(sid) > 40 or
+            any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for c in sid) or not host or len(host) > 253 or
+            any(c.isspace() for c in host) or not 1 <= port <= 65535 or not audience or len(audience) > 253 or
+            not ws_path.startswith("/") or len(ws_path) > 256 or not prefix or len(prefix) > 128):
+            raise ValueError("observer server has invalid name, host, port, audience, path, or topic prefix")
+        ids.add(sid)
+        out.append(dict(id=sid, name=name, enabled=bool(item.get("enabled", True)), host=host, port=port,
+                        audience=audience, ws_path=ws_path, tls=bool(item.get("tls", True)),
+                        tls_verify=bool(item.get("tls_verify", True)), topic_prefix=prefix))
+    return out
 
 
 def repeater_changes(body):
@@ -4660,8 +4691,9 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <div class="card" id="observercard" style="display:none"><h2>MQTT observer <span class="hdesc">admin only</span></h2>
 <div class="advrow"><label><input id="obs_enabled" type="checkbox"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="4"></label>
 <label><input id="obs_status" type="checkbox"> Status</label><label><input id="obs_packets" type="checkbox"> Packets</label><label><input id="obs_rx" type="checkbox"> RX</label>
-<label><input id="obs_gomesh" type="checkbox"> GoMesh</label><label><input id="obs_meshmapper" type="checkbox"> MeshMapper</label>
 <label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
+<div class="rprow"><label>Name <input id="os_name" placeholder="Regional MQTT"></label><label>Host <input id="os_host" placeholder="mqtt.example.org"></label><label>Port <input id="os_port" type="number" value="443"></label><label>Audience <input id="os_aud" placeholder="mqtt.example.org"></label><label>Path <input id="os_path" value="/"></label><label>Prefix <input id="os_prefix" value="meshcore"></label><label><input id="os_enabled" type="checkbox" checked> Enabled</label><label><input id="os_tls" type="checkbox" checked> TLS</label><label><input id="os_verify" type="checkbox" checked> Verify TLS</label><button onclick="addObserverServer()">Add server</button></div>
+<table id="observerservers" style="margin-top:8px"></table>
 <table id="observerstatus" style="margin-top:10px"></table></div>
 <div class="card" id="trafficcard" style="display:none"><div id="observertraffic"></div></div>
 <div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members</span></h2>
@@ -4721,16 +4753,21 @@ async function session(){try{const r=await (await fetch("api/session")).json();A
  $("mqcard").style.display=ADMIN?"":"none";
  $("rpcard").style.display=ADMIN?"":"none";
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
+let OBS_SERVERS=[];
+function renderObserverServers(){const t=$("observerservers");t.innerHTML="<tr><th>Name</th><th>Endpoint</th><th>Audience</th><th>Prefix</th><th>State</th><th></th></tr>"+OBS_SERVERS.map((s,i)=>`<tr><td>${esc(s.name)}</td><td>${esc(s.host)}:${s.port}${esc(s.ws_path)}</td><td>${esc(s.audience)}</td><td>${esc(s.topic_prefix)}</td><td>${s.enabled?"enabled":"off"}</td><td><button onclick="removeObserverServer(${i})">Delete</button></td></tr>`).join("")}
+function saveObserverServers(){fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({observer_servers:OBS_SERVERS})}).then(r=>r.json().then(d=>({ok:r.ok,d}))).then(x=>{$("obsmsg").textContent=x.ok?"Observer servers saved; refreshing.":(x.d.error||"Could not save");setTimeout(load,500)}).catch(()=>{$("obsmsg").textContent="Could not save"})}
+function addObserverServer(){const n=$("os_name").value.trim(),h=$("os_host").value.trim();if(!n||!h){$("obsmsg").textContent="Server name and host are required";return}OBS_SERVERS.push({name:n,host:h,port:+$("os_port").value,audience:$("os_aud").value.trim()||h,ws_path:$("os_path").value.trim()||"/",topic_prefix:$("os_prefix").value.trim()||"meshcore",enabled:$("os_enabled").checked,tls:$("os_tls").checked,tls_verify:$("os_verify").checked});saveObserverServers()}
+function removeObserverServer(i){if(confirm("Delete this observer server?")){OBS_SERVERS.splice(i,1);saveObserverServers()}}
 function observerState(o,key){
  const d=o||{enabled:false,iata:"SJC",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
  if(ADMIN){$("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"SJC";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
-  $("obs_gomesh").checked=!(d.brokers&&d.brokers.gomesh)&&true||!!(d.brokers&&d.brokers.gomesh.enabled);$("obs_meshmapper").checked=!(d.brokers&&d.brokers.meshmapper)&&true||!!(d.brokers&&d.brokers.meshmapper.enabled);$("obs_queue").value=d.queue_max||1000;}
+  $("obs_queue").value=d.queue_max||1000;OBS_SERVERS=d.servers||[];renderObserverServers();}
  const bs=d.brokers||{}, row=n=>{const b=bs[n]||{},s=b.connected?'<span class="good">connected</span>':'<span class="poor">disconnected</span>';return `<tr><td>${n}</td><td>${s}</td><td>${b.last_publish?ago(b.last_publish)+" ago":"never"}</td><td class="small">${esc(b.last_error||"-")}</td></tr>`};
  $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||key)}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
-  `<tr><th>Broker</th><th>State</th><th>Last publish</th><th colspan="3">Last error</th></tr>`+row("gomesh")+row("meshmapper")+(d.last_error?`<tr><th>Observer</th><td colspan="5" class="poor">${esc(d.last_error)}</td></tr>`:"");
+  `<tr><th>Broker</th><th>State</th><th>Last publish</th><th colspan="3">Last error</th></tr>`+Object.keys(bs).map(row).join("")+(d.last_error?`<tr><th>Observer</th><td colspan="5" class="poor">${esc(d.last_error)}</td></tr>`:"");
 }
 async function saveObserver(){
- const body={observer_enabled:$("obs_enabled").checked,observer_iata:$("obs_iata").value.trim().toUpperCase(),observer_status:$("obs_status").checked,observer_packets:$("obs_packets").checked,observer_rx:$("obs_rx").checked,observer_gomesh:$("obs_gomesh").checked,observer_meshmapper:$("obs_meshmapper").checked,observer_queue_max:Number($("obs_queue").value)};
+ const body={observer_enabled:$("obs_enabled").checked,observer_iata:$("obs_iata").value.trim().toUpperCase(),observer_status:$("obs_status").checked,observer_packets:$("obs_packets").checked,observer_rx:$("obs_rx").checked,observer_queue_max:Number($("obs_queue").value)};
  const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Saved; broker settings are being refreshed.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
 }
 function fmtBytes(n){return n<1024?n+" B":n<1048576?(n/1024).toFixed(1)+" KiB":(n/1048576).toFixed(1)+" MiB"}
@@ -5219,6 +5256,11 @@ class WebUI:
                         if isinstance(qmax, bool) or not isinstance(qmax, int) or not 10 <= qmax <= 10000:
                             return self._send(400, '{"error":"queue maximum must be an integer from 10 to 10000"}')
                         updates["observer_queue_max"] = qmax
+                    if "observer_servers" in body:
+                        try:
+                            updates["observer_servers"] = observer_servers_changes(body["observer_servers"])
+                        except ValueError as e:
+                            return self._send(400, json.dumps({"error": str(e)}))
                     if not updates:
                         return self._send(400, '{"error":"no observer settings supplied"}')
                     events.put(("observer_config", updates))     # persisted and applied by the main loop
