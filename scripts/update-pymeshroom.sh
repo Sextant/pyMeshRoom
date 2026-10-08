@@ -60,10 +60,11 @@ cd "$ROOT"
 echo "Updating pyMeshRoom in $ROOT"
 BEFORE="$(git rev-parse --short HEAD)"
 git fetch origin main
-git merge-base --is-ancestor HEAD origin/main || {
+REMOTE_MAIN="$(git rev-parse FETCH_HEAD)"
+git merge-base --is-ancestor HEAD "$REMOTE_MAIN" || {
   echo "Refusing to update: local main has commits not contained in origin/main." >&2; exit 1;
 }
-git pull --ff-only origin main
+git merge --ff-only "$REMOTE_MAIN"
 AFTER="$(git rev-parse --short HEAD)"
 echo "Code: $BEFORE -> $AFTER"
 
