@@ -4299,7 +4299,9 @@ class ObserverFeed:
         self.bad = 0                                         # malformed messages skipped
         self.connects = 0
         self.recent = collections.deque()                    # (time, relevant) for the rate shown in the header
-        self.diag = collections.Counter()                    # received and intentionally ignored MQTT observations
+        self.diag = collections.Counter({                    # received and intentionally ignored MQTT observations
+            "received": 0, "accepted": 0, "retained": 0, "non_packet_topic": 0,
+            "malformed": 0, "self_origin": 0, "duplicate": 0})
         self.ingress = queue.Queue(maxsize=max(10, int(room.cfg.mqtt_queue_max)))
         self.dropped = 0
         self.thread = threading.Thread(target=self.worker, name="mqtt", daemon=True)
