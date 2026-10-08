@@ -91,6 +91,7 @@
     "mqtt_tls_verify": true,
     "mqtt_username": "CHANGE-ME",
     "mqtt_password": "CHANGE-ME-token",
+    "mqtt_queue_max": 1000,
     "mqtt_topics": [
       "meshcore/#"
     ]
