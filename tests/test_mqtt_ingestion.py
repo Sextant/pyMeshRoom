@@ -21,7 +21,7 @@ class IngestionTests(unittest.TestCase):
             channel_hashes=lambda: set())
         feed = ObserverFeed.__new__(ObserverFeed)
         feed.room, feed.lock = room, threading.Lock()
-        feed.seen, feed.recent = collections.OrderedDict(), collections.deque()
+        feed.seen, feed.recent, feed.diag = collections.OrderedDict(), collections.deque(), collections.Counter()
         feed.ingress, feed.dropped, feed.bad = queue.Queue(queue_max), 0, 0
         return feed
 
