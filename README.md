@@ -38,10 +38,13 @@ Core functionality fixed:
    * Rounds ordered by delivery score: reliable members aren't held up behind struggling ones
    * Radio is never blocked: dedicated reader, database, and web threads
    * Duplicate re-sends caught: a member re-sending the same text is sent an ACK, but the message not reposted.
-   * Fair catch-up: new members get the last few posts, returning members get everything they missed
+   * Fair catch-up: new members get the last few posts, returning members get recently missed messages
    * Takes part in traces that name the room as a hop.
    * Radio settings enforced: re-applied automatically if the modem reboots and reverts.
-Additional useful features:
+* Optional MQTT integration
+   *Passively listen to gomesh.dev to capture topology, ack, and incoming room messages to speed up message distribution, with RF fallback   
+
+# Additional useful features:
 * Web dashboard, public to view with an admin login, and isolated so it can't slow the radio.
    * Members table: delivery score, current TX/RX routes, and up to 5 alternates each way.
    * Repeater map with links, and a detail pane for every repeater (key, position, routes, neighbors with SNR).
@@ -51,10 +54,11 @@ Additional useful features:
    * Messages: configurable welcome (with an advert reminder), plus kick/ban notices.
    * Passively collects SNR and Route data from traces as they pass by.
 
-#Installation/usage
+# Installation/usage
 Install
 * Clone repo to a linux machine that has a KISS meshcore modem connected via USB.
 * Make a copy of meshroom.json.example to meshroom.json and edit:
+   * system: Update data dir to reflect the data subpath from your git clone
    * room: Set name and coordinates
    * access: Set room join password and room admin password
    * radio: Set USB interface and params for your region
