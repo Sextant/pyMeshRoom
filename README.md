@@ -66,7 +66,7 @@ Usability:
 * No insight into what the room is doing
 * No admin tools
 
-# Why meshroom (Linux + KISS modem) is better
+# Why pyMeshRoom (Linux + KISS modem) is better
 Core functionality fixed:
 * Radio is a dedicated KISS modem, and can focus on sending and receiving packets
 * Much better persistence using storage instead of memory
