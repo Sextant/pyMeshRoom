@@ -208,6 +208,22 @@ After saving broker/topic fields or credentials, the inbound client reconnects a
 
 `observer_enabled` copies locally received RF packets to GoMesh and/or MeshMapper. It uses the modem-backed Room identity for signing; the Room private key never leaves the modem. Its `observer_queue_max` limits asynchronous outgoing observations. MQTT ingestion has its own `mqtt_queue_max` ingress limit, default 1000. If it is full, the newest remote event is ignored rather than evicting an already accepted older ACK or direct packet; FIFO delivery-state ordering is safer than keeping a fresher topology update.
 
+### Outbound observer servers
+
+The **MQTT Observer** admin card manages the destinations for copies of locally received RF packets. Existing installations begin with GoMesh and MeshMapper as compatible defaults. The first server-list save makes the displayed list authoritative, so a server can be deleted when it is no longer wanted. Adding a regional destination requires that it implement the standard MeshCore observer protocol: modem-signed JWT authentication and packet/status topics shaped as `<topic prefix>/<IATA>/<room public key>/packets` and `.../status`.
+
+| Server field | Purpose |
+| --- | --- |
+| Name | A local dashboard label. |
+| Host / Port | The regional MQTT-over-WebSocket endpoint. |
+| Audience | The JWT `aud` value expected by that broker; normally its host name. |
+| Path | MQTT WebSocket path, often `/` or `/mqtt`; obtain it from the regional operator. |
+| Prefix | Topic root, normally `meshcore`. |
+| Enabled | Stops this destination only; other observer servers continue. |
+| TLS / Verify TLS | Use TLS for public deployments and leave verification enabled unless the regional operator has supplied a trusted private/self-signed setup. |
+
+Add a server only after obtaining its endpoint and protocol details from the regional operator. The observer status and Traffic Statistics cards report each destination independently. A disconnected or failed server never blocks KISS receive processing, RF Room operation, or publishing to another enabled observer server.
+
 ## Optional Virtual Repeater
 
 `repeater_enabled` creates a second logical MeshCore identity using the existing RoomServer KISS reader/writer and TX scheduler. It does not open a second serial connection. On first enable, a random repeater key is generated and saved only to the private local configuration; use `chmod 600` on that file.
