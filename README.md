@@ -190,6 +190,24 @@ Add `paho-mqtt` only when enabling the outbound MQTT observer:
 
 ## First configuration
 
+### One-command bootstrap (recommended)
+
+After cloning this branch, use the installer script to create a virtual environment, install the complete Python dependency set, create a protected private configuration if it does not yet exist, make a local data directory, validate JSON, and run the automated tests:
+
+```bash
+./scripts/install-full-monty.sh
+```
+
+It **never overwrites** an existing `meshroom/meshroom.json`. The new configuration starts RF-first: MQTT Observer, MQTT Augmentation, Virtual Repeater, and repeater relaying are disabled. Edit its room name, serial device, coordinates, passwords, and dashboard settings before starting a live modem.
+
+For a systemd installation after reviewing the generated configuration, use:
+
+```bash
+./scripts/install-full-monty.sh --service
+```
+
+If a `meshroom.service` already exists, the installer deliberately refuses to replace it. Review the existing deployment and use `--service --replace-service` only when you explicitly want this checkout to become the systemd service. Run `./scripts/install-full-monty.sh --help` for data-directory, config-path, service-user, and test options.
+
 Clone the selected branch, create the private configuration, and verify it before touching the modem:
 
 ```bash

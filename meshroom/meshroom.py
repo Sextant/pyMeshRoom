@@ -139,7 +139,7 @@ DEFAULT_CONFIG = {
     "observer_queue_max": 1000,
     "log_level": "INFO",
     "repeater_enabled": False,      # virtual repeater: a second identity on the room's radio that relays like a repeater
-    "repeater_relay": True,         #   relay packets (False = kill switch: still advertises, relays nothing)
+    "repeater_relay": False,        #   relay packets (False = kill switch: still advertises, relays nothing)
     "repeater_name": "meshroom rpt",
     "repeater_key": "",             #   private key, hex: 32-byte seed or 64-byte MeshCore key ("" = make one, saved here)
     "repeater_lat": 0.0,            #   its advertised position (0, 0 = the room's), e.g. a little apart so map icons
