@@ -77,6 +77,12 @@
     "mqtt_enabled": false,
     "mqtt_ack_ingest": true,
     "mqtt_msg_ingest": true,
+    "mqtt_topo_ingest": true,
+    "mqtt_advert_ingest": true,
+    "mqtt_activity": true,
+    "mqtt_channels": [
+      "Public"
+    ],
     "mqtt_host": "mqtt.gomesh.dev",
     "mqtt_port": 443,
     "mqtt_transport": "websockets",
