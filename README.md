@@ -257,6 +257,21 @@ cd meshroom/meshroom
 ../.venv/bin/python meshroom.py --config meshroom.json
 ```
 
+For a short manual test without installing systemd, use the paired helpers from
+the checkout root:
+
+```bash
+./scripts/start-pymeshroom.sh --config meshroom.json
+./scripts/stop-pymeshroom.sh
+```
+
+The start helper uses the checkout virtual environment, validates the selected
+configuration, writes a PID file and `meshroom/meshroom.log`, and refuses to
+run while `meshroom.service` is active. The stop helper manages only that
+recorded manual process; it never stops a systemd-managed room. Use a custom
+configuration name when appropriate, for example
+`./scripts/start-pymeshroom.sh --config meshroom.production.json`.
+
 For a persistent Raspberry Pi deployment, create `/etc/systemd/system/meshroom.service` (adjust both paths and the serial device/configuration before enabling it):
 
 ```ini
