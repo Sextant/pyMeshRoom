@@ -62,7 +62,7 @@ chmod 700 "$DATA_DIR"
 
 echo "Creating or updating virtual environment in $ROOT/.venv"
 python3 -m venv "$ROOT/.venv"
-"$ROOT/.venv/bin/python" -m pip install --upgrade pip pyserial cryptography paho-mqtt
+"$ROOT/.venv/bin/python" -m pip install --upgrade pip pyserial cryptography
 
 if [[ ! -e "$CONFIG" ]]; then
   echo "Creating private configuration: $CONFIG"

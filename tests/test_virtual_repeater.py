@@ -23,6 +23,7 @@ class VirtualRepeaterTests(unittest.TestCase):
     def test_repeater_is_disabled_by_default(self):
         self.assertFalse(DEFAULT_CONFIG["repeater_enabled"])
         self.assertEqual(DEFAULT_CONFIG["repeater_key"], "")
+        self.assertEqual(DEFAULT_CONFIG["repeater_name"], "pyMeshRoom Virtual Repeater")
 
     def test_identity_is_deterministic_and_not_the_room_identity(self):
         first = RepeaterIdentity(bytes(range(32)))

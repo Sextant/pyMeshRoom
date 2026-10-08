@@ -275,11 +275,7 @@ Run all automated tests before upgrading a live instance:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Install `paho-mqtt` before enabling the optional outbound MQTT Observer:
-
-```bash
-.venv/bin/python -m pip install --upgrade paho-mqtt
-```
+The optional outbound MQTT Observer includes a bundled `paho-mqtt` 2.1.0 fallback, so it does not add a separate installation step. Keep `meshroom/vendor/` alongside `meshroom.py` when copying a checkout to a live system. An installed Paho package, such as one already present in a virtual environment or supplied by the OS, is used when available.
 
 ## Optional MQTT
 
@@ -374,8 +370,6 @@ The core room server requires:
 * `pyserial` for the USB/KISS connection; and
 * `cryptography` for MeshCore packet cryptography and identity operations.
 
-The optional outbound MQTT observer additionally requires:
-
-* `paho-mqtt` (tested here with version 2.1.0) for signed publishing to GoMesh and MeshMapper.
+The optional outbound MQTT observer uses `paho-mqtt` for signed publishing to GoMesh and MeshMapper. Version 2.1.0 is bundled under `meshroom/vendor/paho/`, including its EPL-2.0 / EDL-1.0 license material, so no separate Paho installation is required. See [the bundled-dependency record](meshroom/vendor/README.md) for its upstream source URL and SHA-256.
 
 The optional inbound MQTT ingestion uses only Python's standard library for MQTT, TLS, and WebSockets; it does **not** require an additional MQTT package. It needs network access to the configured broker (the default is `mqtt.gomesh.dev:443` with TLS WebSockets). If the broker requires read-only subscriber authorization, configure it through the admin controls or the private `mqtt_username` and `mqtt_password` settings. The dashboard’s `SUBACK` status—not merely “connected”—confirms whether the broker accepted the topic filter.

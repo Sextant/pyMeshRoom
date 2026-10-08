@@ -7,12 +7,33 @@ or owns the serial port, so observer/network failures cannot block radio I/O.
 import base64
 import json
 import logging
+import os
 import queue
+import sys
 import threading
 import time
 from datetime import datetime, timezone
 
 log = logging.getLogger("meshroom.observer")
+
+VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+
+
+def import_paho():
+    """Load installed paho-mqtt, or the bundled 2.1.0 fallback when absent."""
+    try:
+        import paho.mqtt.client as mqtt
+        where = "installed"
+    except ImportError:
+        if not os.path.isdir(os.path.join(VENDOR_DIR, "paho")):
+            raise
+        if VENDOR_DIR not in sys.path:
+            sys.path.append(VENDOR_DIR)  # do not shadow an installed package
+        import paho.mqtt.client as mqtt
+        where = "bundled"
+    import paho.mqtt
+    log.info("paho-mqtt %s (%s)", getattr(paho.mqtt, "__version__", "?"), where)
+    return mqtt
 
 LEGACY_BROKERS = {
     "gomesh": {"id": "gomesh", "name": "GoMesh", "host": "mqtt.gomesh.dev", "port": 443,
@@ -421,10 +442,10 @@ class ObserverBridge:
 
     def _run(self):
         try:
-            import paho.mqtt.client as mqtt
+            mqtt = import_paho()
         except ImportError:
             self._record_error("observer", "paho-mqtt missing")
-            log.error("observer enabled but paho-mqtt is missing")
+            log.error("observer enabled but paho-mqtt is missing (not installed, and meshroom/vendor/paho not found)")
             return
 
         self._sync_clients(mqtt)

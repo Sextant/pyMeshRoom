@@ -140,7 +140,7 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
     "repeater_enabled": False,      # virtual repeater: a second identity on the room's radio that relays like a repeater
     "repeater_relay": False,        #   relay packets (False = kill switch: still advertises, relays nothing)
-    "repeater_name": "meshroom rpt",
+    "repeater_name": "pyMeshRoom Virtual Repeater",
     "repeater_key": "",             #   private key, hex: 32-byte seed or 64-byte MeshCore key ("" = make one, saved here)
     "repeater_lat": 0.0,            #   its advertised position (0, 0 = the room's), e.g. a little apart so map icons
     "repeater_lon": 0.0,            #   don't sit on top of each other
