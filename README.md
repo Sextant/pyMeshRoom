@@ -71,6 +71,49 @@ Core functionality fixed:
    * Messages: configurable welcome (with an advert reminder), plus kick/ban notices.
    * Passively collects SNR and Route data from traces as they pass by.
 
+# `feature/mqtt-unified`: additions compared with `main`
+
+This branch keeps the normal MeshRoom RF/KISS room server as the authority for room state, routing, acknowledgements, and transmission.  It adds optional MQTT features around that RF path; it does not add a second owner for the serial modem.
+
+## Outbound MQTT observer
+
+When `observer_enabled` is true, the observer makes a non-blocking copy of locally received RF packets and publishes them independently to GoMesh and/or MeshMapper over TLS WebSockets.  It provides:
+
+* modem-backed identity signing; the MeshCore private key stays in the modem;
+* independent GoMesh and MeshMapper connections, diagnostics, retained online/offline status, and reconnect handling;
+* admin-only controls for observer enablement, IATA, packet/status reporting, RX reporting, brokers, and queue size;
+* a bounded outbound queue, dropped-observation count, and local-RF traffic statistics; and
+* a dashboard section below the repeater map for observer settings and broker health.
+
+Only packets physically received through the KISS modem count as local RF traffic.  MQTT data never changes the RF RX counters or borrows local RSSI/SNR values.
+
+## Inbound MQTT ingestion
+
+When `mqtt_enabled` is true, a separate native Python MQTT/WebSocket subscriber listens to the configured GoMesh topics.  It can supplement, but never replace, RF operation by ingesting:
+
+* matching ACKs for delivery confirmation;
+* direct room packets addressed to this room;
+* repeater/companion adverts and map enrichment;
+* observed topology links between already-known repeaters; and
+* selected channel activity to wake an otherwise suspended member.
+
+Remote ACKs can mark a matching delivery complete, but route scoring and pacing credit remain reserved for a subsequent local RF ACK.  Remote topology is not used as a transmission route.  Retained MQTT packets, malformed data, duplicates, and observations whose `origin_id` is this room's own public key are ignored.  That last rule prevents the room from consuming its own outbound observer publications as new inbound traffic.
+
+## Why the newest ingress event is ignored when the queue is full
+
+Inbound MQTT events first enter a FIFO queue controlled by `mqtt_queue_max`, which defaults to **1000**.  The queue protects the radio and the main RoomServer event loop from an MQTT burst.  Radio and dashboard events are processed before a bounded slice of queued MQTT events.
+
+If all 1000 positions are occupied, the **newly arriving** MQTT event is ignored and the `dropped` counter is incremented.  The oldest queued event is deliberately retained: it was already accepted in order and may be an ACK or direct room packet.  Discarding the oldest event could preserve later observations while losing an earlier event they logically follow.  This chooses delivery-state correctness and FIFO ordering over retaining the most recent map/activity update.  The queue depth, configured limit, and ignored-event count are exposed through the MQTT dashboard/API state.
+
+## Dashboard and configuration
+
+Observer publishing and MQTT ingestion use distinct settings and state:
+
+* `observer_*` controls outbound local-RF reporting to GoMesh/MeshMapper.
+* `mqtt_*` controls inbound remote-MQTT ingestion, including `mqtt_queue_max`.
+
+Both are disabled by default and are controlled from separate admin-only dashboard sections.  Welcome-DM controls and observer controls remain below the repeater map.
+
 # Installation/usage
 Install
 * Clone repo to a linux machine that has a KISS meshcore modem connected via USB.
@@ -87,3 +130,17 @@ Install
    * Stop meshroom
    * Clone again
    * Start meshroom
+
+# Dependencies
+
+The core room server requires:
+
+* Linux with Python 3, a KISS-capable MeshCore modem, and serial-device permission (normally membership in `dialout`);
+* `pyserial` for the USB/KISS connection; and
+* `cryptography` for MeshCore packet cryptography and identity operations.
+
+The optional outbound MQTT observer additionally requires:
+
+* `paho-mqtt` (tested here with version 2.1.0) for signed publishing to GoMesh and MeshMapper.
+
+The optional inbound MQTT ingestion uses only Python's standard library for MQTT, TLS, and WebSockets; it does **not** require an additional MQTT package.  It needs network access to the configured broker (the default is `mqtt.gomesh.dev:443` with TLS WebSockets).  Credentials, if the broker requires them, are configured with `mqtt_username` and `mqtt_password`.
