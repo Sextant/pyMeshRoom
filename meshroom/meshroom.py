@@ -4689,7 +4689,7 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <div class="mapwrap"><div><div id="map"></div><div id="mapnote" class="dim small"></div></div>
 <div id="rdetail" class="rdetail"><div class="dim pick">Select a repeater from the map</div></div></div></div>
 <div class="card" id="observercard" style="display:none"><h2>MQTT observer <span class="hdesc">admin only</span></h2>
-<div class="advrow"><label><input id="obs_enabled" type="checkbox"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="4"></label>
+<div class="advrow" id="obsform" oninput="obsEdited()" onchange="obsEdited()"><label><input id="obs_enabled" type="checkbox"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="4"></label>
 <label><input id="obs_status" type="checkbox"> Status</label><label><input id="obs_packets" type="checkbox"> Packets</label><label><input id="obs_rx" type="checkbox"> RX</label>
 <label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
 <div class="rprow"><label>Name <input id="os_name" placeholder="Regional MQTT"></label><label>Host <input id="os_host" placeholder="mqtt.example.org"></label><label>Port <input id="os_port" type="number" value="443"></label><label>Audience <input id="os_aud" placeholder="mqtt.example.org"></label><label>Path <input id="os_path" value="/"></label><label>Prefix <input id="os_prefix" value="meshcore"></label><label><input id="os_enabled" type="checkbox" checked> Enabled</label><label><input id="os_tls" type="checkbox" checked> TLS</label><label><input id="os_verify" type="checkbox" checked> Verify TLS</label><button onclick="addObserverServer()">Add server</button></div>
@@ -4758,17 +4758,20 @@ function renderObserverServers(){const t=$("observerservers");t.innerHTML="<tr><
 function saveObserverServers(){fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({observer_servers:OBS_SERVERS})}).then(r=>r.json().then(d=>({ok:r.ok,d}))).then(x=>{$("obsmsg").textContent=x.ok?"Observer servers saved; refreshing.":(x.d.error||"Could not save");setTimeout(load,500)}).catch(()=>{$("obsmsg").textContent="Could not save"})}
 function addObserverServer(){const n=$("os_name").value.trim(),h=$("os_host").value.trim();if(!n||!h){$("obsmsg").textContent="Server name and host are required";return}OBS_SERVERS.push({name:n,host:h,port:+$("os_port").value,audience:$("os_aud").value.trim()||h,ws_path:$("os_path").value.trim()||"/",topic_prefix:$("os_prefix").value.trim()||"meshcore",enabled:$("os_enabled").checked,tls:$("os_tls").checked,tls_verify:$("os_verify").checked});saveObserverServers()}
 function removeObserverServer(i){if(confirm("Delete this observer server?")){OBS_SERVERS.splice(i,1);saveObserverServers()}}
+let OBS_EDIT=false;                                         // the settings row has unsaved edits: the 1 s refresh leaves it alone
+function obsEdited(){OBS_EDIT=true;$("obsmsg").textContent="Unsaved changes: click Save observer settings"}
 function observerState(o,key){
  const d=o||{enabled:false,iata:"SJC",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
- if(ADMIN){$("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"SJC";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
-  $("obs_queue").value=d.queue_max||1000;OBS_SERVERS=d.servers||[];renderObserverServers();}
+ if(ADMIN){if(!OBS_EDIT){$("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"SJC";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
+  $("obs_queue").value=d.queue_max||1000}
+  OBS_SERVERS=d.servers||[];renderObserverServers();}
  const bs=d.brokers||{}, row=n=>{const b=bs[n]||{},s=b.connected?'<span class="good">connected</span>':'<span class="poor">disconnected</span>';return `<tr><td>${n}</td><td>${s}</td><td>${b.last_publish?ago(b.last_publish)+" ago":"never"}</td><td class="small">${esc(b.last_error||"-")}</td></tr>`};
  $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||key)}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
   `<tr><th>Broker</th><th>State</th><th>Last publish</th><th colspan="3">Last error</th></tr>`+Object.keys(bs).map(row).join("")+(d.last_error?`<tr><th>Observer</th><td colspan="5" class="poor">${esc(d.last_error)}</td></tr>`:"");
 }
 async function saveObserver(){
  const body={observer_enabled:$("obs_enabled").checked,observer_iata:$("obs_iata").value.trim().toUpperCase(),observer_status:$("obs_status").checked,observer_packets:$("obs_packets").checked,observer_rx:$("obs_rx").checked,observer_queue_max:Number($("obs_queue").value)};
- const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Saved; broker settings are being refreshed.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
+ const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Saved; broker settings are being refreshed.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}if(r.ok)OBS_EDIT=false;$("obsmsg").textContent=m;setTimeout(load,500);
 }
 function fmtBytes(n){return n<1024?n+" B":n<1048576?(n/1024).toFixed(1)+" KiB":(n/1048576).toFixed(1)+" MiB"}
 function fmtDuration(n){n=Math.max(0,Math.floor(n||0));const h=Math.floor(n/3600),m=Math.floor(n%3600/60),s=n%60;return h?`${h}h ${m}m`:m?`${m}m ${s}s`:`${s}s`}
