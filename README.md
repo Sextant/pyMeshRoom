@@ -159,24 +159,7 @@ Observer publishing and MQTT ingestion use distinct settings and state:
 
 Both are disabled by default and are controlled from separate admin-only dashboard sections.  Welcome-DM controls and observer controls remain below the repeater map.
 
-# Installation/usage
-Install
-* Clone repo to a linux machine that has a KISS meshcore modem connected via USB.
-* Make a copy of meshroom.json.example to meshroom.json and edit:
-   * system: Update data dir to reflect the data subpath from your git clone
-   * room: Set name and coordinates
-   * access: Set room join password and room admin password
-   * radio: Set USB interface and params for your region
-   * dashboard: Set web UI admin password
-   * observer: Leave `observer_enabled` false unless MQTT observation is wanted. To enable it, install `python3-paho-mqtt`, use IATA `SJC` for this deployment, and keep `identity` set to `modem`; the modem signs the MQTT token and the private key is never copied to the Pi. `observer_status` controls retained online/offline status messages on `meshcore/<IATA>/<public-key>/status`. Packet observations publish to `meshcore/<IATA>/<public-key>/packets` only when both `observer_packets` and `observer_rx` are true; they are compatibility gates for the same RX-only packet path, not independent packet types.
-* Usage
-   * Run ```python3 meshroom.py --config meshroom.json```
-* Updating:
-   * Stop meshroom
-   * Clone again
-   * Start meshroom
-
-# pyMeshRoom: build your own instance
+# Install pyMeshRoom
 
 ## What you need
 
@@ -185,7 +168,7 @@ Install
 * A stable storage directory for the SQLite room database.
 * Optional internet access only if you enable MQTT features or host the dashboard remotely. RF Room Server and Virtual Repeater functions do not require internet.
 
-## Installation
+## Choose an installation path
 
 You can install pyMeshRoom in either of two ways:
 
