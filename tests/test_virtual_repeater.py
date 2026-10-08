@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "meshroom"))
-from meshroom import DEFAULT_CONFIG, Packet, PT_ADVERT, VirtualRepeater, repeater_changes
+from meshroom import DEFAULT_CONFIG, Packet, PT_ADVERT, RepeaterIdentity, VirtualRepeater, repeater_changes
 
 
 class VirtualRepeaterTests(unittest.TestCase):
@@ -52,7 +52,7 @@ class VirtualRepeaterTests(unittest.TestCase):
         self.assertEqual(relay.stats["drop_off"], 1)
 
     def test_loop_detection_rejects_own_path(self):
-        relay = self.relay()
+        relay = self.relay(repeater_loop_detect="strict")
         packet = Packet(PT_ADVERT, b"x" * 100)
         packet.path_len = 1
         packet.path = b"R"
