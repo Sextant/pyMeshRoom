@@ -98,6 +98,12 @@ Core functionality fixed:
 * Optional MQTT integration
    *Passively listen to gomesh.dev to capture topology, ack, and incoming room messages to speed up message distribution, with RF fallback   
 
+### Welcome DMs
+
+![Welcome DM settings](docs/images/welcome-dms-current.png)
+
+The admin-only **Welcome DMs** card lets an operator enable or disable the first-login message, customize the welcome text, and provide an optional prompt for members whose names are not yet known. Use `{room}` in either field to insert the room name.
+
 # Additional useful features:
 * Web dashboard, public to view with an admin login, and isolated so it can't slow the radio.
    * Members table: delivery score, current TX/RX routes, and up to 5 alternates each way.
@@ -114,7 +120,7 @@ This branch keeps the normal MeshRoom RF/KISS room server as the authority for r
 
 ## Outbound MQTT observer
 
-![MQTT Observer admin-card reference](docs/images/mqtt-observer-admin-card.svg)
+![MQTT Observer configuration and traffic statistics](docs/images/mqtt-observer-current.png)
 
 The Observer card is an admin-only, outbound control surface. It is intentionally separate from MQTT Augmentation: it publishes copies of RF traffic and never needs inbound subscription access.
 
@@ -130,7 +136,7 @@ Only packets physically received through the KISS modem count as local RF traffi
 
 ## Inbound MQTT ingestion
 
-![MQTT Augmentation admin-card reference](docs/images/mqtt-augmentation-admin-card.svg)
+![MQTT Augmentation configuration](docs/images/mqtt-augmentation-current.png)
 
 The Augmentation card is an admin-only, inbound control surface. It controls what the room may read from a regional MQTT service; it does not alter RF routing, own the modem, or make internet connectivity a requirement.
 
@@ -334,7 +340,7 @@ Add a server only after obtaining its endpoint and protocol details from the reg
 
 `repeater_enabled` creates a second logical MeshCore identity using the existing RoomServer KISS reader/writer and TX scheduler. It does not open a second serial connection. On first enable, a random repeater key is generated and saved only to the private local configuration; use `chmod 600` on that file.
 
-![Virtual repeater key lifecycle](docs/images/virtual-repeater-key-lifecycle.svg)
+![Virtual Repeater configuration](docs/images/virtual-repeater-current.png)
 
 ### Default key or imported vanity key
 
