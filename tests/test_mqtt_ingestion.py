@@ -68,3 +68,12 @@ class IngestionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mqtt_changes({"username": "viewer"})
 
+    def test_broker_and_packet_filter_are_configurable(self):
+        changes = mqtt_changes({"host": "mqtt.example.org", "port": 8883, "transport": "websockets",
+                                "ws_path": "/mqtt", "tls": True, "tls_verify": True,
+                                "topics": "meshcore/SJC/+/packets, meshcore/SFO/+/packets"})
+        self.assertEqual(changes["mqtt_topics"], ["meshcore/SJC/+/packets", "meshcore/SFO/+/packets"])
+        self.assertEqual(changes["mqtt_port"], 8883)
+        with self.assertRaises(ValueError):
+            mqtt_changes({"topics": "meshcore/#/packets"})
+

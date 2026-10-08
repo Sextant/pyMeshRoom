@@ -179,11 +179,11 @@ Inbound MQTT is separate from outbound observer publishing. An observer can publ
 
 ![GoMesh inbound authorization flow](docs/images/gomesh-inbound-authorization.svg)
 
-Some GoMesh installations may permit a public topic filter; others require a broker operator to issue a read-only subscriber username and password or to name an approved topic filter. The MQTT Augmentation admin card has **Subscriber username**, **Subscriber password**, and **Save subscriber credentials** controls for this purpose.
+Some GoMesh installations may permit a public topic filter; others require a broker operator to issue a read-only subscriber username and password or to name an approved topic filter. The MQTT Augmentation admin card makes the **broker host**, **port**, **transport**, **WebSocket path**, **TLS settings**, and one or more comma-separated **topic filters** configurable. Its **Subscriber username**, **Subscriber password**, and **Save subscriber credentials** controls handle read-only access without putting secrets in the browser-visible status.
 
-1. Obtain the read-only credentials and/or approved topic filter from the broker operator.
-2. Log into the dashboard as an administrator and open **MQTT Augmentation**.
-3. Enter both subscriber fields and select **Save subscriber credentials**. The inbound client reconnects immediately; RF service and outbound observer publishing continue independently.
+1. Obtain the broker endpoint, transport/TLS requirements, read-only credentials if required, and approved topic filter(s) from the broker operator.
+2. Log into the dashboard as an administrator and open **MQTT Augmentation**. Set and save the broker/topic controls first.
+3. If required, enter both subscriber fields and select **Save subscriber credentials**. Each save reconnects the inbound client immediately; RF service and outbound observer publishing continue independently.
 4. Check the card status. It reports **subscription granted**, **subscription awaiting broker acknowledgement**, or **subscription denied**. The received and accepted MQTT counts provide the next confirmation that inbound data is flowing.
 
 The password is write-only: it is saved in the owner-protected local configuration and is never returned by the dashboard/API or shown after it is saved. Keep the configuration file mode at `0600`. The project does not ship GoMesh credentials.

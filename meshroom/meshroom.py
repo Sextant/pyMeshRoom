@@ -848,6 +848,47 @@ def mqtt_changes(body):
         # deliberately never included in dashboard state or a response body.
         ch["mqtt_username"] = username
         ch["mqtt_password"] = password
+    if "host" in body:
+        host = str(body["host"] or "").strip()
+        if not host or len(host) > 253 or any(c.isspace() for c in host) or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:" for c in host):
+            raise ValueError("broker host is invalid")
+        ch["mqtt_host"] = host
+    if "port" in body:
+        try:
+            port = int(body["port"])
+        except (TypeError, ValueError):
+            raise ValueError("broker port is invalid")
+        if not 1 <= port <= 65535:
+            raise ValueError("broker port must be 1 to 65535")
+        ch["mqtt_port"] = port
+    if "transport" in body:
+        transport = str(body["transport"])
+        if transport not in ("websockets", "tcp"):
+            raise ValueError("transport must be websockets or tcp")
+        ch["mqtt_transport"] = transport
+    if "ws_path" in body:
+        ws_path = str(body["ws_path"] or "").strip()
+        if not ws_path.startswith("/") or len(ws_path) > 256 or any(c.isspace() for c in ws_path):
+            raise ValueError("WebSocket path must start with / and contain no spaces")
+        ch["mqtt_ws_path"] = ws_path
+    for j, k in (("tls", "mqtt_tls"), ("tls_verify", "mqtt_tls_verify")):
+        if j in body:
+            ch[k] = bool(body[j])
+    if "topics" in body:
+        raw_topics = body["topics"]
+        if isinstance(raw_topics, str):
+            topics = [t.strip() for t in raw_topics.replace("\n", ",").split(",") if t.strip()]
+        elif isinstance(raw_topics, list):
+            topics = [str(t).strip() for t in raw_topics if str(t).strip()]
+        else:
+            raise ValueError("topic filters must be text or a list")
+        if not topics or len(topics) > 16:
+            raise ValueError("configure 1 to 16 MQTT topic filters")
+        for topic in topics:
+            levels = topic.split("/")
+            if len(topic) > 256 or any(not level and len(levels) == 1 for level in levels) or any("+" in level and level != "+" for level in levels) or any("#" in level and (level != "#" or i != len(levels) - 1) for i, level in enumerate(levels)):
+                raise ValueError("invalid MQTT topic filter: %s" % topic)
+        ch["mqtt_topics"] = topics
     return ch
 
 
@@ -2843,6 +2884,8 @@ class RoomServer:
         f = self.feed
         pps, rel = f.rates() if f else (0.0, 0.0)
         return dict(enabled=bool(self.cfg.mqtt_enabled), connected=bool(f and f.connected), host=self.cfg.mqtt_host,
+                    port=int(self.cfg.mqtt_port), transport=self.cfg.mqtt_transport, ws_path=self.cfg.mqtt_ws_path,
+                    tls=bool(self.cfg.mqtt_tls), tls_verify=bool(self.cfg.mqtt_tls_verify), topics=list(self.cfg.mqtt_topics or []),
                     error=(f.error if f else ""), pps=pps, rel_pps=rel, ack_ingest=bool(self.cfg.mqtt_ack_ingest),
                     msg_ingest=bool(self.cfg.mqtt_msg_ingest), topo_ingest=bool(self.cfg.mqtt_topo_ingest),
                     advert_ingest=bool(self.cfg.mqtt_advert_ingest), activity=bool(self.cfg.mqtt_activity),
@@ -4540,7 +4583,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .rprow{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:8px 0 6px 26px}
 .rprow label{display:flex;gap:6px;align-items:center}
 .rprow input,.rprow select{width:auto;flex:none;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.sw{cursor:pointer}
-.mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password]{width:auto;min-width:150px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
+.mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password],.mqrow input[type=number],.mqrow select{width:auto;min-width:110px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
 .hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}
 #members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
@@ -4576,6 +4619,8 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_adv" onchange="mqSet({advert_ingest:this.checked})"> Advert ingestion <span class="dim">&mdash; discover users and their locations</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_act" onchange="mqSet({activity:this.checked})"> Activity monitor <span class="dim">&mdash; packets from an inactive member resume sync (at most every 15 min)</span><span id="mqch" class="dim small"></span></label></div>
 <div class="mqrow sub"><label>Subscriber username <input id="mq_user" type="text" autocomplete="username" placeholder="GoMesh username"></label><label>Subscriber password <input id="mq_pass" type="password" autocomplete="current-password" placeholder="GoMesh password"></label><button onclick="mqCredentials()">Save subscriber credentials</button><span id="mqcred" class="dim small"></span></div>
+<div class="mqrow sub"><label>Broker host <input id="mq_host" type="text" autocomplete="off" placeholder="mqtt.example.org"></label><label>Port <input id="mq_port" type="number" min="1" max="65535"></label><label>Transport <select id="mq_transport"><option value="websockets">WebSockets</option><option value="tcp">TCP</option></select></label><label>WebSocket path <input id="mq_path" type="text" autocomplete="off" placeholder="/mqtt"></label></div>
+<div class="mqrow sub"><label class="sw"><input id="mq_tls" type="checkbox"> TLS</label><label class="sw"><input id="mq_verify" type="checkbox"> Verify TLS certificate</label><label>Topic filter(s) <input id="mq_topics" type="text" autocomplete="off" placeholder="meshcore/REGION/+/packets"></label><button onclick="mqConnection()">Save broker and topics</button><span id="mqconn" class="dim small"></span></div>
 <div class="mqnote">RF will always be used for fallback and route calculations: what the observers report never changes routes,
 delivery scores or the push pace, and if the broker is unreachable the room carries on exactly as before.</div></div>
 <div class="card" id="rpcard" style="display:none"><h2>Virtual repeater <span class="hdesc">a second identity on the room's radio that relays for the mesh</span></h2>
@@ -4660,6 +4705,7 @@ async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"
  if(r.status===401){alert("Your admin session has expired: log in again.");session()}setTimeout(load,400)}
 async function mqCredentials(){const u=$("mq_user").value.trim(),p=$("mq_pass").value;if(!u||!p){$("mqcred").textContent="username and password are both required";$("mqcred").className="poor small";return}
  const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u,password:p})});let m="credentials were not saved";if(r.ok){$("mq_user").value="";$("mq_pass").value="";m="subscriber credentials saved; reconnecting"}else{try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("mqcred").className=r.ok?"good small":"poor small";$("mqcred").textContent=m;setTimeout(load,700)}
+async function mqConnection(){const o={host:$("mq_host").value.trim(),port:+$("mq_port").value,transport:$("mq_transport").value,ws_path:$("mq_path").value.trim(),tls:$("mq_tls").checked,tls_verify:$("mq_verify").checked,topics:$("mq_topics").value};const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});let m="broker settings were not saved";if(r.ok)m="broker settings saved; reconnecting";else{try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("mqconn").className=r.ok?"good small":"poor small";$("mqconn").textContent=m;delete SIG.mqconn;setTimeout(load,700)}
 async function sendAdvert(flood,btn){
  if(flood&&!confirm("Send a flood advert? It is relayed across the whole mesh."))return;
  btn.disabled=true;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({flood})});
@@ -4788,6 +4834,8 @@ async function load(){
   $("mq_ack").disabled=$("mq_msg").disabled=$("mq_topo").disabled=$("mq_adv").disabled=$("mq_act").disabled=!Mq.enabled;
   $("mqch").textContent=(Mq.channels||[]).length?" · channels watched: "+Mq.channels.join(", "):"";
   $("mqcred").innerHTML=Mq.credentials_configured?'<span class="good">subscriber credentials configured</span>':'<span class="mid">subscriber credentials not configured</span>';
+  const mf=document.activeElement,mqTyping=mf&&mf.closest&&mf.closest("#mqcard")&&["text","password","number"].includes(mf.type);
+  if(!mqTyping&&changed("mqconn",[Mq.host,Mq.port,Mq.transport,Mq.ws_path,Mq.tls,Mq.tls_verify,Mq.topics])){$("mq_host").value=Mq.host||"";$("mq_port").value=Mq.port||"";$("mq_transport").value=Mq.transport||"websockets";$("mq_path").value=Mq.ws_path||"/mqtt";$("mq_tls").checked=!!Mq.tls;$("mq_verify").checked=!!Mq.tls_verify;$("mq_topics").value=(Mq.topics||[]).join(", ")}
   $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; ${subStatus} &middot; MQTT packets received: ${Md.received||0}; accepted: ${Md.accepted||0} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
    :`<span class="poor">not connected</span> ${esc(Mq.error||"(connecting...)")}`):"off"}
  const Rp=st.repeater||{};
@@ -5405,7 +5453,7 @@ def main():
         elif kind == "obs":
             room.observer_event(ev)
         elif kind == "mqtt_cfg":
-            reconnect = any(k in ("mqtt_username", "mqtt_password") for k in ev[1])
+            reconnect = any(k in ("mqtt_username", "mqtt_password", "mqtt_host", "mqtt_port", "mqtt_transport", "mqtt_ws_path", "mqtt_tls", "mqtt_tls_verify", "mqtt_topics") for k in ev[1])
             for k, v in ev[1].items():
                 room.cfg.set(k, v)                          # saved to the config file, in place
             room.mqtt_apply(restart=reconnect)
