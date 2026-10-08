@@ -26,6 +26,8 @@ MeshCore Room firmware running on basic nodes is too limiting for active high tr
 
 Read the installation guide below to build an instance, then enable only the optional components you actually need.
 
+**Jump to:** [install and first configuration](#first-configuration) · [MQTT Observer](#outbound-mqtt-observer) · [MQTT Augmentation](#inbound-mqtt-ingestion) · [Virtual Repeater](#optional-virtual-repeater) · [dependencies](#dependencies)
+
 See stats and what repeaters the room is well connected to
 <img width="1553" height="597" alt="image" src="https://github.com/user-attachments/assets/b9add1ee-5f80-4d57-b767-3be9e5889e07" />
 See a member list, with click-to-expand to get more details
@@ -96,11 +98,15 @@ Core functionality fixed:
    * Messages: configurable welcome (with an advert reminder), plus kick/ban notices.
    * Passively collects SNR and Route data from traces as they pass by.
 
-# `feature/mqtt-unified`: additions compared with `main`
+# Core capability detail
 
 This branch keeps the normal MeshRoom RF/KISS room server as the authority for room state, routing, acknowledgements, and transmission.  It adds optional MQTT features around that RF path; it does not add a second owner for the serial modem.
 
 ## Outbound MQTT observer
+
+![MQTT Observer admin-card reference](docs/images/mqtt-observer-admin-card.svg)
+
+The Observer card is an admin-only, outbound control surface. It is intentionally separate from MQTT Augmentation: it publishes copies of RF traffic and never needs inbound subscription access.
 
 When `observer_enabled` is true, the observer makes a non-blocking copy of locally received RF packets and publishes them independently to GoMesh and/or MeshMapper over TLS WebSockets.  It provides:
 
@@ -113,6 +119,10 @@ When `observer_enabled` is true, the observer makes a non-blocking copy of local
 Only packets physically received through the KISS modem count as local RF traffic.  MQTT data never changes the RF RX counters or borrows local RSSI/SNR values.
 
 ## Inbound MQTT ingestion
+
+![MQTT Augmentation admin-card reference](docs/images/mqtt-augmentation-admin-card.svg)
+
+The Augmentation card is an admin-only, inbound control surface. It controls what the room may read from a regional MQTT service; it does not alter RF routing, own the modem, or make internet connectivity a requirement.
 
 When `mqtt_enabled` is true, a separate native Python MQTT/WebSocket subscriber listens to the configured GoMesh topics.  It can supplement, but never replace, RF operation by ingesting:
 
