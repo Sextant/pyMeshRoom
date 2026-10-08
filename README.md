@@ -1,5 +1,7 @@
 # pyMeshRoom
 
+*Also known as the **Platinum Most Excellent MeshCore Py Room**—because a serious RF room deserves a slightly unserious name.*
+
 MeshCore Room firmware running on basic nodes is too limiting for active, high-traffic rooms. **pyMeshRoom** is an RF-first persistent MeshCore Room Server with optional MQTT augmentation, MQTT observation, and Virtual Repeater capabilities.
 
 > **Runs beyond the Raspberry Pi.** pyMeshRoom can run on any Linux computer that runs Python 3 and provides USB or serial access to a KISS-capable MeshCore modem. A Raspberry Pi is a convenient deployment target, not a requirement. The modem is the RF component; the Linux computer runs the room server.
