@@ -157,7 +157,19 @@ Add `paho-mqtt` only when enabling the outbound MQTT observer:
 
 ## First configuration
 
-Copy `meshroom/meshroom.json.example` to a private `meshroom/meshroom.json`, set permissions to owner-only, and set the room name, coordinates, serial device, radio parameters, data directory, passwords, and dashboard bind address. Never commit that file: it can contain passwords and a locally generated Virtual Repeater key.
+Clone the selected branch, create the private configuration, and verify it before touching the modem:
+
+```bash
+git clone --branch feature/the-full-monty --single-branch https://github.com/Sextant/The-Platinum-Most-Excellent-MeshCore-Pi-Room-.git meshroom
+cd meshroom
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pyserial cryptography
+cp meshroom/meshroom.json.example meshroom/meshroom.json
+chmod 600 meshroom/meshroom.json
+.venv/bin/python -m json.tool meshroom/meshroom.json >/dev/null
+```
+
+Edit the private `meshroom/meshroom.json` and set the room name, coordinates, serial device, radio parameters, data directory, passwords, and dashboard bind address. Never commit that file: it can contain passwords, MQTT credentials, and a locally generated Virtual Repeater key.
 
 Start with every optional feature disabled:
 
@@ -168,6 +180,56 @@ Start with every optional feature disabled:
 ```
 
 This is the recommended initial installation. Confirm normal RF room operation before enabling any optional feature.
+
+Run it manually for the first hardware test:
+
+```bash
+cd meshroom/meshroom
+../.venv/bin/python meshroom.py --config meshroom.json
+```
+
+For a persistent Raspberry Pi deployment, create `/etc/systemd/system/meshroom.service` (adjust both paths and the serial device/configuration before enabling it):
+
+```ini
+[Unit]
+Description=MeshRoom RF-first Room Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+SupplementaryGroups=dialout
+WorkingDirectory=/home/YOUR_USER/meshroom/meshroom
+ExecStart=/home/YOUR_USER/meshroom/.venv/bin/python meshroom.py --config meshroom.json
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now meshroom.service
+systemctl --no-pager --full status meshroom.service
+```
+
+Run all automated tests before upgrading a live instance:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Install `paho-mqtt` before enabling the optional outbound MQTT Observer:
+
+```bash
+.venv/bin/python -m pip install --upgrade paho-mqtt
+```
 
 ## Optional MQTT
 
