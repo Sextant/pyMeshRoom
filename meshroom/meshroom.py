@@ -27,6 +27,9 @@ import hmac
 import collections
 import gzip
 import json
+import socket
+import ssl
+import base64
 import logging
 import math
 import os
@@ -52,7 +55,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 4.5"
+FIRMWARE_VERSION = "meshroom-py 4.7"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -94,6 +97,23 @@ DEFAULT_CONFIG = {
     "trace_neighbours": True,       # trace one neighbour at a time, at the end of a member round, when the room is idle
     "trace_min_interval_s": 120,    # ... but never more often than this
     "extra_acks": 1,                # ACKs for posts: 1 = send a second ACK (on a 2nd confident route if there is one), 0 = single
+    "mqtt_enabled": False,          # MQTT augmentation: also listen to the observer network (RF stays the fallback)
+    "mqtt_ack_ingest": True,        #   ACK ingestion: observers' ACKs confirm deliveries (no route credit)
+    "mqtt_msg_ingest": True,        #   message ingestion: posts to the room captured by observers
+    "mqtt_topo_ingest": True,       #   topology ingestion: links + SNR between repeaters we already know (never routes)
+    "mqtt_advert_ingest": True,     #   advert ingestion: names, positions, where companions are (half weight)
+    "mqtt_activity": True,          #   activity monitor: a suspended member seen anywhere resumes sync (max every 15 min)
+    "mqtt_channels": ["Public"],    #   channels watched for members' activity: "Public" and/or "#hashtag" names
+    "mqtt_host": "mqtt.gomesh.dev",
+    "mqtt_port": 443,
+    "mqtt_transport": "websockets", # or "tcp"
+    "mqtt_ws_path": "/mqtt",
+    "mqtt_tls": True,
+    "mqtt_tls_verify": True,
+    "mqtt_username": "",
+    "mqtt_password": "",
+    "mqtt_topics": ["meshcore/#"],
+    "mqtt_queue_max": 1000,         # bounded ingress; newest observation is dropped under overload
     "dedupe_window_s": 300,         # identical text re-sent by the same member within this window = a retry (0 = off)
     "kick_message": "You have been removed from {room}.",    # sent once when kicked ("" = no message)
     "ban_message": "You have been banned from {room}.",      # sent once when banned ("" = no message)
@@ -382,6 +402,8 @@ class Packet:
 
     @classmethod
     def parse(cls, raw):
+        if not raw or len(raw) < 2:
+            return None                                     # empty / truncated (e.g. a bad observer message)
         p = cls()
         i = 0
         p.header = raw[i]; i += 1
@@ -617,6 +639,7 @@ class Store:
         "heard": ("hash BLOB PRIMARY KEY", "last INT", "w REAL", "t INT", "last_direct INT", "snr REAL", "disc INT", "out_snr REAL"),
         "bans": ("pubkey BLOB PRIMARY KEY", "name TEXT", "ts INT"),
         "probes": ("hash BLOB PRIMARY KEY", "data TEXT"),
+        "obs_edges": ("a BLOB", "b BLOB", "w REAL", "t INT", "snr REAL", "PRIMARY KEY (a, b)"),
     }
 
     def __init__(self, path):
@@ -839,6 +862,8 @@ class Member:
         self.next_probe = 0.0
         self.fresh = None                 # (plen, path): route reversed from where we just heard them (tried first)
         self.last_heard = 0               # any packet from them: ACKs, keepalives, logins, posts, requests, adverts
+        self.obs_wake_at = -1e9           # last wake from suspension triggered by an observer sighting
+        self.obs_confirmed = None         # a push an observer confirmed first: its RF ACK is still credited (2 min)
         self.suspended_at = 0             # when they were suspended (wall clock)
         self.pace_sample = None           # the push in flight counts toward the shared pace: {"p": expected, "ok": ...}
         self.timed_sample = None          # its sample if it timed out (a late ACK turns it back into a success)
@@ -870,6 +895,7 @@ class RoomServer:
         self.pace_last_slow = time.monotonic()
         self.pace_last_ease = time.monotonic()
         self.inpaths = {}                 # member key8 -> {(plen, path): [w, t]}  paths their floods took to reach us
+        self.obs_edges = {}               # (a, b) -> [w, t, snr]: links between known repeaters, as observers heard them
         self.flood_owner = {}             # flood packet hash -> (member pubkey, expiry): attribute duplicate copies
         self.disc_tag, self.disc_until, self.disc_replies = None, 0.0, 0
         self.disc_responders = set()
@@ -899,7 +925,9 @@ class RoomServer:
         self.last_snr = 0.0
         self.stats = dict(recv=0, sent=0, recv_flood=0, recv_direct=0, sent_flood=0, sent_direct=0,
                           flood_dups=0, direct_dups=0, errors=0, airtime_ms=0, posted=0, pushes=0,
-                          acks=0, late_acks=0, timeouts=0, flood_fallbacks=0, deduped=0, traces=0)
+                          acks=0, late_acks=0, timeouts=0, flood_fallbacks=0, deduped=0, traces=0,
+                          obs_acks=0, obs_posts=0, obs_wakes=0, delivered=0, rf_after_obs=0, obs_links=0, obs_adverts=0,
+                          obs_channel=0)
         self.lat_sum = [0] * 6
         self.lat_cnt = [0] * 6
         self.next_zero_advert = time.monotonic() + 5
@@ -937,6 +965,7 @@ class RoomServer:
         self.map_shape, self.map_version = None, 0
         self.web_clients = (0, 0)         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.observer = None            # attached by main when explicitly enabled
+        self.feed = None                  # ObserverFeed while MQTT augmentation is on         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.web_port_active = bool(cfg.web_port)
         self.web_last_request = 0.0
         self.web_dirty = False
@@ -989,6 +1018,8 @@ class RoomServer:
             self.rroutes.setdefault(bytes(target), {})[(plen, bytes(path))] = rr
         for k8, rpt, w, t in st.read("SELECT pubkey, rpt, w, t FROM member_rpts"):
             self.mrpts.setdefault(bytes(k8), {})[bytes(rpt)] = [w, t]
+        for a, b, w, t, snr in st.read("SELECT a, b, w, t, snr FROM obs_edges"):
+            self.obs_edges[(bytes(a), bytes(b))] = [w, t, snr]
         for k8, plen, path, w, t in st.read("SELECT key8, plen, path, w, t FROM member_inroutes"):
             self.inpaths.setdefault(bytes(k8), {})[(plen, bytes(path))] = [w, t]
         for a, b, w, t, snr in st.read("SELECT a, b, w, t, snr FROM edges"):
@@ -1743,6 +1774,10 @@ class RoomServer:
                         match, late = True, j
                         break
             if not match:
+                oc = m.obs_confirmed
+                if oc and time.monotonic() < oc["until"] and ack in oc["acks"]:
+                    self.rf_after_observer(m, ack)
+                    return True
                 continue
             self.heard_from(m)                              # their ACK: heard from them
             lat_ms = None
@@ -1766,6 +1801,8 @@ class RoomServer:
                 self.delivery_sample(m, m.attempts_cur)
                 m.deliveries += 1
                 m.attempts_cur = 0
+            self.stats["delivered"] += 1
+            m.obs_confirmed = None
             m.pending_ack = None
             m.inflight = None
             m.prev_acks = [None, None]
@@ -2106,6 +2143,9 @@ class RoomServer:
         th = self.thalf()
         for key in [k for k, e in self.edges.items() if fade(e[0], e[1], now, th) < 0.05]:
             del self.edges[key]
+        for key in [k for k, e in self.obs_edges.items() if fade(e[0], e[1], now, th) < 0.05 or k[0] not in self.heard
+                    or k[1] not in self.heard]:
+            del self.obs_edges[key]                         # faded, or a repeater we no longer know
         for target in list(self.rroutes):
             tab = self.rroutes[target]
             for key in list(tab):
@@ -2303,6 +2343,270 @@ class RoomServer:
             plan.append(nxt)
         plan.append(flood)
         return plan
+
+    # ------------------------------------------------------------------ observer feed (MQTT augmentation)
+
+    def observer_event(self, ev):
+        """One relevant packet from the observer feed (already filtered and de-duplicated by its thread)."""
+        k = ev[1]
+        if k == "ack" and self.cfg.mqtt_ack_ingest:
+            self.observer_ack(ev[2])
+        elif k == "pkt":
+            self.observer_packet(ev[2])
+        elif k == "advert":
+            self.observer_advert(ev[2], ev[3])
+        elif k == "grp":
+            self.observer_group(ev[2])
+        elif k == "topo" and self.cfg.mqtt_topo_ingest:
+            self.observer_topology(ev[2], ev[3], ev[4])
+
+    def observer_ack(self, ack):
+        """An ACK some observer heard. If it confirms one of our pushes: delivered. No route credit, no pace or
+        delivery-score effect (we can't know which way it travelled); RF stays the source of all routing."""
+        for n in self.notices:
+            if ack == n["ack"]:
+                self.notices.remove(n)
+                self.stats["obs_acks"] += 1
+                return True
+        for m in self.members.values():
+            cur = m.pending_ack is not None and ack == m.pending_ack
+            late = any(a is not None and ack == a for a in m.prev_acks)
+            if not (cur or late):
+                continue
+            # keep every attempt of this post: its RF ACK may still arrive, and RF stays the source of route credit
+            acks = {}
+            if m.pending_ack is not None:
+                acks[m.pending_ack] = (m.inflight, True)
+            for j in (0, 1):
+                if m.prev_acks[j] is not None:
+                    acks[m.prev_acks[j]] = (m.prev_entries[j], False)
+            m.obs_confirmed = dict(acks=acks, sent=m.push_sent, hops=m.push_hops, pace=m.pace_sample, timed=m.timed_sample,
+                                   attempts=m.attempts_cur, until=time.monotonic() + 120)
+            m.sync_since = max(m.sync_since, m.push_post_ts)
+            self.drop_private(m.pub, m.push_post_ts)
+            m.pending_ack, m.inflight, m.prev_acks, m.prev_entries = None, None, [None, None], [None, None]
+            m.pace_sample = m.timed_sample = None
+            m.push_failures, m.plan, m.plan_retry = 0, None, False
+            m.backoff, m.retry_at, m.stuck_since, m.attempts_cur = 0, 0.0, 0.0, 0
+            self.stats["obs_acks"] += 1
+            self.stats["delivered"] += 1                    # counted once per push, whichever confirmation came first
+            log.info("delivery to %s confirmed by an observer's ACK", self.member_label(m))
+            self.observer_wake(m)
+            self.mark_dirty()
+            return True
+        return False
+
+    def rf_after_observer(self, m, ack):
+        """The RF ACK of a push an observer already confirmed: credit it exactly like any RF ACK (route, latency,
+        delivery score, pace, last heard). The delivery itself was already counted."""
+        oc = m.obs_confirmed
+        entry, latest = oc["acks"][ack]
+        self.heard_from(m)
+        lat_ms = int((time.monotonic() - oc["sent"]) * 1000) if latest and oc["sent"] else None
+        self.stats["acks" if latest else "late_acks"] += 1
+        self.stats["rf_after_obs"] += 1
+        self.attempt_result(m, entry, True, lat_ms)
+        if latest and oc["pace"] is not None:
+            oc["pace"]["ok"] = True
+            self.pace_outcome(oc["pace"])
+        elif not latest and oc["timed"] is not None:
+            oc["timed"]["ok"] = True
+        if oc["attempts"]:
+            self.delivery_sample(m, oc["attempts"])
+            m.deliveries += 1
+        m.obs_confirmed = None
+        self.mark_dirty()
+
+    def observer_packet(self, raw):
+        """A packet addressed to the room (by its first byte) that some observer heard: verified by decrypting with
+        a member's secret. Posts are stored and ACKed; path returns may carry an ACK. Its path is never used."""
+        pkt = Packet.parse(raw)
+        if pkt is None:
+            return
+        p = pkt.payload
+        for m in [m for m in self.members.values() if m.pub[0] == p[1]]:
+            data = mac_then_decrypt(self.secret_for(m), p[2:])
+            if data is None:
+                continue                                    # not theirs (or addressed to another node with our first byte)
+            if pkt.ptype == PT_PATH and self.cfg.mqtt_ack_ingest and path_valid(data[0]):
+                k = 1 + path_bytes(data[0])
+                if k < len(data) and (data[k] & 0x0F) == PT_ACK and len(data) >= k + 5:
+                    self.observer_ack(data[k + 1:k + 5])
+            elif pkt.ptype == PT_TXT_MSG and self.cfg.mqtt_msg_ingest:
+                self.observer_txt(m, data)
+            self.observer_wake(m)
+            return
+
+    def observer_txt(self, m, data):
+        if len(data) <= 5 or (data[4] >> 2) != TXT_TYPE_PLAIN or m.role == PERM_GUEST:
+            return                                          # posts only (CLI commands need a reply path: RF only)
+        sender_ts = struct.unpack_from("<I", data, 0)[0]
+        if sender_ts < m.last_timestamp:
+            return                                          # old / replayed
+        is_retry = sender_ts == m.last_timestamp
+        text_b = data[5:].split(b"\0", 1)[0]
+        text = text_b.decode(errors="replace")
+        if not is_retry and self.is_manual_resend(m, text):
+            is_retry = True
+        m.last_timestamp = sender_ts
+        if not is_retry:
+            self.store_post(m.pub, text)
+            self.stats["obs_posts"] += 1
+            log.info("post from %s captured by an observer: %s", self.member_label(m), text)
+        ack = sha256(data[:5 + len(text_b)], m.pub)[:4]
+
+        class _Req:                                         # (flood ACKs use the room's own path id size)
+            hash_size = (int(self.cfg.path_hash_mode) or 0) + 1
+        self.send_post_ack(m, ack, _Req)                    # direct if we know where they are, flood otherwise
+        self.mark_dirty()
+
+    def channel_hashes(self):
+        return {h for h, _k in self.channel_keys()}
+
+    def channel_keys(self):
+        """(1-byte channel id, secret) for the channels in mqtt_channels: "Public" (the well-known key) or "#name"
+        (key = first 16 bytes of SHA-256 of the name). Messages only count if they verify with the key."""
+        names = tuple(self.cfg.mqtt_channels or [])
+        if getattr(self, "_chan_cache", (None,))[0] != names:
+            keys = []
+            for n in names:
+                n = (n or "").strip()
+                if n.lower() == "public":
+                    k = base64.b64decode("izOH6cXN6mrJ5e26oRXNcg==")
+                elif n.startswith("#"):
+                    k = hashlib.sha256(n.encode()).digest()[:16]
+                else:
+                    continue
+                keys.append((hashlib.sha256(k).digest()[0], k + bytes(16)))
+            self._chan_cache = (names, keys)
+        return self._chan_cache[1]
+
+    def observer_topology(self, raw, origin, snr):
+        """Links between repeaters we ALREADY know, from what observers heard: flood paths (each consecutive pair),
+        the observer's own reading of the last hop, and per-hop SNR in traces. Kept apart from RF data (obs_edges)
+        and never used for routes; no new repeaters are added."""
+        pkt = Packet.parse(raw)
+        if pkt is None:
+            return
+        known = self.heard
+        obs = origin[:2] if len(origin) >= 2 and origin[:2] in known else None
+        if pkt.ptype == PT_TRACE and pkt.is_direct:
+            p = pkt.payload
+            if len(p) < 9:
+                return
+            sz = 1 << (p[8] & 3)
+            hops = [p[9 + k * sz:9 + (k + 1) * sz][:2] for k in range((len(p) - 9) // sz)] if sz >= 2 else []
+            for k in range(1, min(len(hops), len(pkt.path))):
+                a, b = hops[k - 1], hops[k]
+                if a in known and b in known and a != b:
+                    self.obs_link(a, b, ((pkt.path[k] ^ 0x80) - 0x80) / 4.0)
+            return
+        sz = pkt.hash_size
+        hops = [pkt.path[k * sz:(k + 1) * sz][:2] for k in range(pkt.hop_count)]
+        for a, b in zip(hops, hops[1:]):
+            if a in known and b in known and a != b:
+                self.obs_link(a, b, None)
+        if obs is not None and hops and hops[-1] in known and hops[-1] != obs:
+            self.obs_link(hops[-1], obs, snr)               # the observer measured this one itself
+
+    def obs_link(self, a, b, snr):
+        now = now_s()
+        e = self.obs_edges.get((a, b))
+        if e is None:
+            if len(self.obs_edges) >= 5000:
+                del self.obs_edges[min(self.obs_edges, key=lambda k: self.obs_edges[k][1])]
+            e = self.obs_edges[(a, b)] = [0.0, now, None]
+        e[0] = fade(e[0], e[1], now, self.thalf()) + 1.0
+        e[1] = now
+        if snr is not None:
+            e[2] = snr if e[2] is None else e[2] * 0.7 + snr * 0.3
+        self.stats["obs_links"] += 1
+
+    def observer_advert(self, raw, origin):
+        """A signed advert some observer heard: names and positions (advert ingestion), where a companion is
+        (half weight: first relaying repeater, or the observer itself for a zero-hop advert), and activity."""
+        pkt = Packet.parse(raw)
+        if pkt is None:
+            return
+        a = self.parse_advert(pkt)
+        if a is None or a["pub"] == self.id.pub_key:
+            return
+        pub, atype = a["pub"], a["type"]
+        if self.cfg.mqtt_advert_ingest:
+            if atype == ADV_TYPE_REPEATER:
+                old = self.repeaters.get(pub, {})
+                if a["lat"] is not None and (old.get("lat"), old.get("lon")) != (a["lat"], a["lon"]):
+                    self.next_map = 0.0
+                self.repeaters[pub] = dict(name=a["name"] or old.get("name", ""),
+                                           lat=a["lat"] if a["lat"] is not None else old.get("lat"),
+                                           lon=a["lon"] if a["lon"] is not None else old.get("lon"),
+                                           adv_ts=a["ts"], last_advert=old.get("last_advert") or now_s())
+                self._rpt_idx = None
+            if atype == ADV_TYPE_CHAT:
+                if pkt.hop_count and pkt.hash_size >= 2:
+                    self.observe_near(pub, pkt.path[:pkt.hash_size], weight=0.5)
+                elif not pkt.hop_count and len(origin) >= 2 and origin[:2] in self.heard:
+                    self.observe_near(pub, origin[:2], weight=0.5)      # right next to that observer
+                if a["name"]:
+                    self.learn_name(pub, a["ts"], a["name"])
+            self.stats["obs_adverts"] += 1
+        m = self.members.get(pub)
+        if m is not None:
+            self.observer_wake(m)
+
+    def observer_group(self, raw):
+        """A message on a watched channel: the sender is named in the text ("name: message"), not keyed, so it's
+        only used to wake a suspended member with that name (harmless if spoofed: one extra delivery attempt)."""
+        pkt = Packet.parse(raw)
+        if pkt is None or len(pkt.payload) < 4:
+            return
+        for h, key in self.channel_keys():
+            if pkt.payload[0] != h:
+                continue
+            data = mac_then_decrypt(key, pkt.payload[1:])
+            if data is None or len(data) < 6:
+                continue
+            sender = data[5:].split(b"\0", 1)[0].decode(errors="replace").split(": ", 1)[0]
+            for m in self.members.values():
+                nm = self.names.get(m.pub[:8])
+                if nm and nm[1] == sender:
+                    self.stats["obs_channel"] += 1
+                    self.observer_wake(m)
+            return
+
+    def observer_wake(self, m):
+        """Activity monitor: a suspended member seen anywhere on the mesh resumes sync, at most once every 15
+        minutes (if the room still can't reach them, the normal plan + retry suspends them again)."""
+        if not self.cfg.mqtt_activity:
+            return
+        if m.given_up and time.monotonic() - m.obs_wake_at >= 900:
+            m.obs_wake_at = time.monotonic()
+            self.reset_push_state(m)
+            self.round = [m.pub] + [k for k in self.round if k != m.pub]
+            self.next_push = min(self.next_push, time.monotonic() + 0.1)
+            self.stats["obs_wakes"] += 1
+            log.info("%s seen by an observer: resuming sync", self.member_label(m))
+
+    def mqtt_apply(self):
+        """Start or stop the observer feed to match the settings."""
+        want = bool(self.cfg.mqtt_enabled and self.cfg.mqtt_host)
+        if want and self.feed is None and self.events_q is not None:
+            self.feed = ObserverFeed(self, self.events_q)
+        elif not want and self.feed is not None:
+            self.feed.stop()
+            self.feed = None
+
+    def mqtt_state(self):
+        f = self.feed
+        pps, rel = f.rates() if f else (0.0, 0.0)
+        return dict(enabled=bool(self.cfg.mqtt_enabled), connected=bool(f and f.connected), host=self.cfg.mqtt_host,
+                    error=(f.error if f else ""), pps=pps, rel_pps=rel, ack_ingest=bool(self.cfg.mqtt_ack_ingest),
+                    msg_ingest=bool(self.cfg.mqtt_msg_ingest), topo_ingest=bool(self.cfg.mqtt_topo_ingest),
+                    advert_ingest=bool(self.cfg.mqtt_advert_ingest), activity=bool(self.cfg.mqtt_activity),
+                    channels=list(self.cfg.mqtt_channels or []), acks=self.stats["obs_acks"], posts=self.stats["obs_posts"],
+                    wakes=self.stats["obs_wakes"], links=len(self.obs_edges), adverts=self.stats["obs_adverts"],
+                    channel_msgs=self.stats["obs_channel"], queue_depth=(f.depth() if f else 0),
+                    queue_max=int(self.cfg.mqtt_queue_max), dropped=(f.dropped if f else 0))
 
     def heard_from(self, m):
         """Any packet we can attribute to m: the 'Last heard' time (saved with the member)."""
@@ -2629,18 +2933,51 @@ class RoomServer:
                     m.last_activity = now_s()
                 self.mark_dirty()
             if name:
-                k8 = pub[:8]
-                old = self.names.get(k8)
-                if old and ts <= old[0]:
-                    return                                  # older advert can't overwrite
-                if not old and len(self.names) >= NAME_CACHE_MAX:
-                    members8 = {mm.pub[:8] for mm in self.members.values()}
-                    cands = [k for k in self.names if k not in members8]
-                    if not cands:
-                        return
-                    del self.names[min(cands, key=lambda k: self.names[k][0])]
-                self.names[k8] = (ts, name)
-                self.mark_dirty()
+                self.learn_name(pub, ts, name)
+
+    @staticmethod
+    def parse_advert(pkt):
+        """Signed advert -> dict(pub, ts, type, name, lat, lon), or None if malformed or the signature fails."""
+        p = pkt.payload
+        if len(p) < PUB_KEY_SIZE + 4 + SIGNATURE_SIZE:
+            return None
+        pub, ts, sig = p[:32], struct.unpack_from("<I", p, 32)[0], p[36:100]
+        app = p[100:100 + MAX_ADVERT_DATA_SIZE]
+        if not app or not ed25519_verify(pub, sig, pub + p[32:36] + app):
+            return None
+        flags, i = app[0], 1
+        lat = lon = None
+        if flags & ADV_LATLON_MASK:
+            if len(app) < 9:
+                return None
+            la, lo = struct.unpack_from("<ii", app, 1)
+            if la or lo:
+                lat, lon = la / 1e6, lo / 1e6
+            i += 8
+        if flags & ADV_FEAT1_MASK:
+            i += 2
+        if flags & ADV_FEAT2_MASK:
+            i += 2
+        if len(app) < i:
+            return None
+        name = app[i:].split(b"\0", 1)[0].decode(errors="replace") if flags & ADV_NAME_MASK else ""
+        name = "".join(c if ord(c) >= 0x20 else " " for c in name)
+        return dict(pub=pub, ts=ts, type=flags & 0x0F, name=name, lat=lat, lon=lon)
+
+    def learn_name(self, pub, ts, name):
+        """Companion name cache: newer adverts win; members are never evicted."""
+        k8 = pub[:8]
+        old = self.names.get(k8)
+        if old and ts <= old[0]:
+            return
+        if not old and len(self.names) >= NAME_CACHE_MAX:
+            members8 = {mm.pub[:8] for mm in self.members.values()}
+            cands = [k for k in self.names if k not in members8]
+            if not cands:
+                return
+            del self.names[min(cands, key=lambda k: self.names[k][0])]
+        self.names[k8] = (ts, name)
+        self.mark_dirty()
 
     def send_advert(self, flood):
         try:
@@ -2816,6 +3153,7 @@ class RoomServer:
         rr_rows = [(t, rr.plen, rr.path, rr.w, rr.ok, rr.fail, rr.t) for t, tab in self.rroutes.items() for rr in tab.values()]
         mr_rows = [(k8, rpt, e[0], e[1]) for k8, tab in self.mrpts.items() for rpt, e in tab.items()]
         ir_rows = [(k8, plen, path, e[0], e[1]) for k8, tab in self.inpaths.items() for (plen, path), e in tab.items()]
+        oe_rows = [(a, b, e[0], e[1], e[2]) for (a, b), e in self.obs_edges.items()]
         ed_rows = [(a, b, e[0], e[1], e[2]) for (a, b), e in self.edges.items()]
         rp_rows = [(pub, r["name"], r["lat"], r["lon"], r["adv_ts"], r["last_advert"]) for pub, r in self.repeaters.items()]
         hd_rows = [(h, d["last"], d["w"], d["t"], d["last_direct"], d["snr"], d.get("disc", 0), d.get("out_snr")) for h, d in self.heard.items()]
@@ -2823,6 +3161,7 @@ class RoomServer:
             ("DELETE FROM rpt_routes", None), ("INSERT OR REPLACE INTO rpt_routes VALUES (?,?,?,?,?,?,?)", rr_rows),
             ("DELETE FROM member_rpts", None), ("INSERT OR REPLACE INTO member_rpts VALUES (?,?,?,?)", mr_rows),
             ("DELETE FROM member_inroutes", None), ("INSERT OR REPLACE INTO member_inroutes VALUES (?,?,?,?,?)", ir_rows),
+            ("DELETE FROM obs_edges", None), ("INSERT OR REPLACE INTO obs_edges VALUES (?,?,?,?,?)", oe_rows),
             ("DELETE FROM edges", None), ("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?)", ed_rows),
             ("DELETE FROM repeaters", None), ("INSERT OR REPLACE INTO repeaters VALUES (?,?,?,?,?,?)", rp_rows),
             ("DELETE FROM heard", None), ("INSERT OR REPLACE INTO heard (hash, last, w, t, last_direct, snr, disc, out_snr) VALUES (?,?,?,?,?,?,?,?)", hd_rows),
@@ -2833,12 +3172,14 @@ class RoomServer:
     def record_metric(self):
         """Once a minute: deltas of the counters + noise-floor range, kept in memory for the dashboard header."""
         s = self.stats
-        cur = (s["recv"], s["sent"], s["airtime_ms"], self.rx_airtime_ms, s["pushes"], s["acks"] + s["late_acks"])
+        cur = (s["recv"], s["sent"], s["airtime_ms"], self.rx_airtime_ms, s["pushes"], s["acks"] + s["late_acks"], s["delivered"])
         prev = self.metric_prev or cur
         self.metric_prev = cur
-        rx, tx, tx_ms, rx_ms, pushes, acks = [c - p for c, p in zip(cur, prev)]
+        if len(prev) != len(cur):
+            prev = cur
+        rx, tx, tx_ms, rx_ms, pushes, acks, delivered = [c - p for c, p in zip(cur, prev)]
         self.minutes.append(dict(nf=self.noise_floor, nf_min=self.m_nf_min or self.noise_floor, nf_max=self.m_nf_max or self.noise_floor,
-                                 rx=rx, tx=tx, tx_ms=tx_ms, rx_ms=rx_ms, pushes=pushes, acks=acks))
+                                 rx=rx, tx=tx, tx_ms=tx_ms, rx_ms=rx_ms, pushes=pushes, acks=acks, delivered=delivered))
         self.m_nf_min = self.m_nf_max = 0
 
     def sample_system(self):
@@ -2882,6 +3223,7 @@ class RoomServer:
         n = len(ms)
         nfs = [x["nf"] for x in ms if x["nf"]]
         pushes, acks = sum(x["pushes"] for x in ms), sum(x["acks"] for x in ms)
+        delivered = sum(x.get("delivered", x["acks"]) for x in ms)
         return dict(minutes=n,
                     nf_avg=round(sum(nfs) / len(nfs)) if nfs else None,
                     nf_min=min((x["nf_min"] for x in ms if x["nf_min"]), default=None),
@@ -2889,7 +3231,8 @@ class RoomServer:
                     tx_pct=round(100.0 * sum(x["tx_ms"] for x in ms) / (n * 60000.0), 1),
                     rx_pct=round(100.0 * sum(x["rx_ms"] for x in ms) / (n * 60000.0), 1),
                     rx_pm=round(sum(x["rx"] for x in ms) / n, 1), tx_pm=round(sum(x["tx"] for x in ms) / n, 1),
-                    pushes_pm=round(pushes / n, 1), push_ok=round(100.0 * min(acks, pushes) / pushes) if pushes else None,
+                    pushes_pm=round(pushes / n, 1), push_ok=round(100.0 * min(delivered, pushes) / pushes) if pushes else None,
+                    push_rf=round(100.0 * min(acks, pushes) / pushes) if pushes else None,
                     pace=round(self.pace, 1))
 
     # ------------------------------------------------------------------ labels
@@ -2945,14 +3288,23 @@ class RoomServer:
             w = fade(e[0], e[1], t, th)
             if w < 0.2:
                 continue
-            item = (w, e[2])
+            item = (w, e[2], False)
+            heard_by_x.setdefault(b, []).append((a,) + item)
+            x_heard_by.setdefault(a, []).append((b,) + item)
+        for (a, b), e in self.obs_edges.items():            # links only observers have heard (marked "via observers")
+            if (a, b) in self.edges:
+                continue
+            w = fade(e[0], e[1], t, th)
+            if w < 0.2:
+                continue
+            item = (w, e[2], True)
             heard_by_x.setdefault(b, []).append((a,) + item)
             x_heard_by.setdefault(a, []).append((b,) + item)
 
         def nlist(items):
             items = sorted(items, key=lambda x: -x[1])[:8]
-            return [dict(name=self.rpt_label(n) if n else "room", seen=round(w, 1), snr=None if snr is None else round(snr, 1))
-                    for n, w, snr in items]
+            return [dict(name=self.rpt_label(n) if n else "room", seen=round(w, 1), snr=None if snr is None else round(snr, 1), obs=o)
+                    for n, w, snr, o in items]
 
         def has_pos(h):
             hit = self.rpt_lookup(h)
@@ -2979,6 +3331,9 @@ class RoomServer:
         edges = [dict(a=hexs(a), b=hexs(b) if b else "", w=round(fade(e[0], e[1], t, th), 1),
                       snr=None if e[2] is None else round(e[2], 1)) for (a, b), e in self.edges.items()
                  if a in positioned and b in positioned and fade(e[0], e[1], t, th) >= 0.5]
+        edges += [dict(a=hexs(a), b=hexs(b), w=round(fade(e[0], e[1], t, th), 1), snr=None if e[2] is None else round(e[2], 1), obs=True)
+                  for (a, b), e in self.obs_edges.items()
+                  if (a, b) not in self.edges and a in positioned and b in positioned and fade(e[0], e[1], t, th) >= 0.5]
         # the map's *shape* (positions + drawable links): its version only changes when the drawing would
         shape = repr((sorted((r["hash"], r["lat"], r["lon"]) for r in rpts if r["lat"] is not None),
                       sorted((e["a"], e["b"]) for e in edges), self.cfg.lat, self.cfg.lon))
@@ -3031,7 +3386,8 @@ class RoomServer:
                 public_key=hexs(self.id.pub_key), queue_depth=0, queue_max=int(self.cfg.observer_queue_max), dropped=0,
                 uptime=0, last_rx=0, last_error="", brokers={
                     "gomesh": dict(enabled=bool(self.cfg.observer_gomesh), connected=False, last_publish=0, last_error=""),
-                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}))
+                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}),
+            mqtt=self.mqtt_state())
 
     def member_inroutes(self, m, n=5):
         """Other paths the member's floods took to reach us (member side first), most seen first, excluding the current."""
@@ -3097,6 +3453,362 @@ class RoomServer:
 # ============================================================================
 
 # ============================================================================
+# Observer feed (MQTT augmentation): read-only, its own thread, filters before anything reaches the main loop
+# ============================================================================
+
+class MQTTError(Exception):
+    pass
+
+
+class MiniMQTT:
+    """MQTT 3.1.1 subscriber over TCP or WebSockets, optional TLS. Read-only by design: CONNECT, SUBSCRIBE,
+    receive PUBLISH, keepalive pings. No publishing. Uses only the Python standard library."""
+
+    CONNACK = {1: "unacceptable protocol version", 2: "client id rejected", 3: "server unavailable",
+               4: "bad username or password", 5: "not authorized"}
+
+    def __init__(self, host, port, client_id, username=None, password=None, websockets=True, ws_path="/mqtt",
+                 tls=True, verify=True, keepalive=60, timeout=15):
+        self.host, self.port, self.client_id = host, port, client_id
+        self.username, self.password = username, password
+        self.websockets, self.ws_path, self.tls, self.verify = websockets, ws_path, tls, verify
+        self.keepalive, self.timeout = keepalive, timeout
+        self.sock = None
+        self.buf = b""                                      # decoded MQTT byte stream (after WebSocket framing)
+        self.wsbuf = b""
+        self.pid = 0
+        self.wlock = threading.Lock()
+        self.last_tx = 0.0
+
+    # --- transport ---
+    def _open(self):
+        raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        if self.tls:
+            ctx = ssl.create_default_context()
+            if not self.verify:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            raw = ctx.wrap_socket(raw, server_hostname=self.host)
+        self.sock = raw
+        if self.websockets:
+            key = base64.b64encode(os.urandom(16)).decode()
+            req = ("GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                   "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n"
+                   % (self.ws_path, self.host, self.port, key))
+            self.sock.sendall(req.encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise MQTTError("connection closed during the WebSocket handshake")
+                resp += chunk
+            head, _, rest = resp.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            if " 101 " not in lines[0] + " ":
+                raise MQTTError("WebSocket upgrade refused: %s (wrong --ws-path?)" % lines[0])
+            want = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            hdrs = {l.split(":", 1)[0].strip().lower(): l.split(":", 1)[1].strip() for l in lines[1:] if ":" in l}
+            if hdrs.get("sec-websocket-accept") != want:
+                raise MQTTError("bad WebSocket handshake response")
+            self.wsbuf = rest
+
+    def _send(self, data):
+        with self.wlock:
+            if self.websockets:                             # one masked binary frame per MQTT packet (client frames must be masked)
+                n = len(data)
+                hdr = bytearray([0x82])
+                if n < 126:
+                    hdr.append(0x80 | n)
+                elif n < 65536:
+                    hdr += bytes([0x80 | 126]) + struct.pack(">H", n)
+                else:
+                    hdr += bytes([0x80 | 127]) + struct.pack(">Q", n)
+                mask = os.urandom(4)
+                data = bytes(hdr) + mask + bytes(b ^ mask[i & 3] for i, b in enumerate(data))
+            self.sock.sendall(data)
+            self.last_tx = time.monotonic()
+
+    def _recv_raw(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise MQTTError("connection closed by the broker")
+        return chunk
+
+    def _fill(self):
+        """Read more bytes into the MQTT stream (unwrapping WebSocket frames: fragmented, ping, close)."""
+        if not self.websockets:
+            self.buf += self._recv_raw()
+            return
+        while True:
+            b = self.wsbuf
+            if len(b) >= 2:
+                op, ln, i = b[0] & 0x0F, b[1] & 0x7F, 2
+                masked = b[1] & 0x80
+                if ln == 126 and len(b) >= 4:
+                    ln, i = struct.unpack(">H", b[2:4])[0], 4
+                elif ln == 127 and len(b) >= 10:
+                    ln, i = struct.unpack(">Q", b[2:10])[0], 10
+                elif ln >= 126:
+                    ln = None
+                if ln is not None:
+                    if masked:
+                        i += 4
+                    if len(b) >= i + ln:
+                        payload = b[i:i + ln]
+                        if masked:
+                            m = b[i - 4:i]
+                            payload = bytes(x ^ m[k & 3] for k, x in enumerate(payload))
+                        self.wsbuf = b[i + ln:]
+                        if op in (0x0, 0x2):                # binary data (or a continuation of it)
+                            self.buf += payload
+                            return
+                        if op == 0x8:
+                            raise MQTTError("WebSocket closed by the broker")
+                        if op == 0x9:                       # ping -> pong
+                            with self.wlock:
+                                mask = os.urandom(4)
+                                self.sock.sendall(bytes([0x8A, 0x80 | len(payload)]) + mask +
+                                                  bytes(x ^ mask[k & 3] for k, x in enumerate(payload)))
+                        continue                            # pong / text / other control frames: ignore
+            self.wsbuf += self._recv_raw()
+
+    def _packet(self):
+        """Next MQTT packet -> (type, flags, body)."""
+        while True:
+            b = self.buf
+            if len(b) >= 2:
+                mult, rl, i = 1, 0, 1
+                ok = False
+                while i < len(b) and i <= 4:
+                    rl += (b[i] & 0x7F) * mult
+                    mult *= 128
+                    i += 1
+                    if not b[i - 1] & 0x80:
+                        ok = True
+                        break
+                if ok and len(b) >= i + rl:
+                    self.buf = b[i + rl:]
+                    return b[0] >> 4, b[0] & 0x0F, b[i:i + rl]
+            self._fill()
+
+    @staticmethod
+    def _str(s):
+        e = s.encode()
+        return struct.pack(">H", len(e)) + e
+
+    @staticmethod
+    def _rl(n):
+        out = bytearray()
+        while True:
+            d, n = n % 128, n // 128
+            out.append(d | (0x80 if n else 0))
+            if not n:
+                return bytes(out)
+
+    # --- MQTT ---
+    def connect(self):
+        self._open()
+        flags = 0x02                                        # clean session
+        payload = self._str(self.client_id)
+        if self.username is not None:
+            flags |= 0x80
+            payload += self._str(self.username)
+            if self.password is not None:
+                flags |= 0x40
+                payload += self._str(self.password)
+        var = self._str("MQTT") + bytes([4, flags]) + struct.pack(">H", self.keepalive)
+        body = var + payload
+        self._send(bytes([0x10]) + self._rl(len(body)) + body)
+        t, _, b = self._packet()
+        if t != 2 or len(b) < 2:
+            raise MQTTError("unexpected reply to CONNECT")
+        if b[1] != 0:
+            raise MQTTError("CONNECT REFUSED: %s" % self.CONNACK.get(b[1], "code %d" % b[1]))
+
+    def subscribe(self, topic):
+        self.pid = (self.pid % 65535) + 1
+        body = struct.pack(">H", self.pid) + self._str(topic) + bytes([0])
+        self._send(bytes([0x82]) + self._rl(len(body)) + body)
+        return self.pid
+
+    def loop(self, on_message, on_suback, stop):
+        """Receive until stop is set or the connection drops. Sends keepalive pings on its own."""
+        self.sock.settimeout(1.0)
+        while not stop.is_set():
+            if time.monotonic() - self.last_tx > self.keepalive * 0.5:
+                self._send(bytes([0xC0, 0x00]))             # PINGREQ
+            try:
+                t, fl, b = self._packet()
+            except socket.timeout:
+                continue
+            if t == 3:                                      # PUBLISH
+                tl = struct.unpack(">H", b[:2])[0]
+                topic = b[2:2 + tl].decode("utf-8", "replace")
+                i = 2 + tl
+                qos = (fl >> 1) & 3
+                if qos:
+                    pid = b[i:i + 2]; i += 2
+                    self._send(bytes([0x40, 0x02]) + pid)   # PUBACK (we subscribe at QoS 0, but be polite)
+                on_message(topic, b[i:], bool(fl & 1))
+            elif t == 9:                                    # SUBACK
+                on_suback(struct.unpack(">H", b[:2])[0], list(b[2:]))
+            # PINGRESP (13) and anything else: nothing to do
+
+    def close(self):
+        try:
+            self._send(bytes([0xE0, 0x00]))                 # DISCONNECT
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+
+class ObserverFeed:
+    """Listens to the observer network over MQTT (LetsMesh format: meshcore/<region>/<observer>/packets, JSON with
+    the raw packet in hex). Keeps only ACKs and packets addressed to the room (destination byte), drops duplicates
+    (the same packet from many observers), and hands those to the main loop. Never publishes; never required."""
+
+    def __init__(self, room, events):
+        self.room, self.events = room, events
+        self.stop_ev = threading.Event()
+        self.connected = False
+        self.error = ""
+        self.lock = threading.Lock()
+        self.seen = collections.OrderedDict()                # packet hash -> time (dedupe across observers)
+        self.bad = 0                                         # malformed messages skipped
+        self.connects = 0
+        self.recent = collections.deque()                    # (time, relevant) for the rate shown in the header
+        self.ingress = queue.Queue(maxsize=max(10, int(room.cfg.mqtt_queue_max)))
+        self.dropped = 0
+        self.thread = threading.Thread(target=self.worker, name="mqtt", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_ev.set()
+
+    def depth(self):
+        return self.ingress.qsize()
+
+    def pop(self):
+        try:
+            return self.ingress.get_nowait()
+        except queue.Empty:
+            return None
+
+    def rates(self):
+        now = time.monotonic()
+        with self.lock:
+            while self.recent and now - self.recent[0][0] > 60:
+                self.recent.popleft()
+            n = len(self.recent)
+            rel = sum(1 for _, r in self.recent if r)
+        span = 60.0
+        return round(n / span, 1), round(rel / span, 2)
+
+    def worker(self):
+        cfg = self.room.cfg
+        delay = 2
+        cid = "meshroom-" + os.urandom(4).hex()
+        while not self.stop_ev.is_set():
+            c = MiniMQTT(cfg.mqtt_host, int(cfg.mqtt_port), cid, cfg.mqtt_username or None, cfg.mqtt_password or None,
+                         websockets=(cfg.mqtt_transport == "websockets"), ws_path=cfg.mqtt_ws_path,
+                         tls=bool(cfg.mqtt_tls), verify=bool(cfg.mqtt_tls_verify))
+            try:
+                c.connect()
+                for tp in (cfg.mqtt_topics or ["meshcore/#"]):
+                    c.subscribe(tp)
+                self.connected, self.error, delay = True, "", 2
+                self.connects += 1
+                log.info("MQTT: connected to %s", cfg.mqtt_host)
+                c.loop(self.on_message, lambda pid, codes: None, self.stop_ev)
+            except MQTTError as e:
+                self.error = str(e)
+                if "REFUSED" in str(e):
+                    self.error += " (token may have expired)"
+                    delay = max(delay, 300)                 # bad credentials: don't hammer the broker
+                log.warning("MQTT: %s", self.error)
+            except (OSError, ssl.SSLError) as e:
+                self.error = "connection failed: %s" % e
+                log.warning("MQTT: %s", self.error)
+            except Exception as e:                          # never let the feed die quietly: log, then retry
+                self.error = "unexpected error: %r" % e
+                log.exception("MQTT: unexpected error (will retry)")
+            finally:
+                self.connected = False
+                c.close() if c.sock else None
+            if self.stop_ev.wait(delay):
+                break
+            delay = min(delay * 2, 300)
+
+    def on_message(self, topic, payload, retain):
+        try:
+            self._on_message(topic, payload, retain)
+        except Exception as e:                              # a malformed message from some observer: skip it, keep the connection
+            self.bad += 1
+            if self.bad <= 5 or self.bad % 100 == 0:
+                log.warning("MQTT: skipped a malformed message on %s (%r) [%d so far]", topic, e, self.bad)
+
+    def _on_message(self, topic, payload, retain):
+        if retain or not topic.endswith("/packets"):
+            return                                          # retained = an old packet replayed; status messages: not needed
+        try:
+            obj = json.loads(payload)
+            raw = bytes.fromhex(obj["raw"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return
+        if len(raw) < 2:
+            return                                          # empty / truncated packet
+        now = time.monotonic()
+        cfg = self.room.cfg
+        pkt = Packet.parse(raw)
+        try:
+            origin = bytes.fromhex(obj.get("origin_id") or "")[:32]
+        except (ValueError, TypeError):
+            origin = b""
+        if origin == self.room.id.pub_key:
+            return                                          # never ingest this room's own published observation
+        try:
+            snr = float(obj.get("SNR"))
+        except (ValueError, TypeError):
+            snr = None
+        pkey = obj.get("hash") or hashlib.sha256(raw).hexdigest()[:16]
+        out = []                                            # (dedupe key, event)
+        if pkt is not None:
+            t, pl = pkt.ptype, pkt.payload
+            if t == PT_ACK and len(pl) >= 4:
+                out.append((pkey, ("ack", pl[:4])))
+            elif t == PT_MULTIPART and len(pl) >= 5 and (pl[0] & 0x0F) == PT_ACK:
+                out.append((pkey, ("ack", pl[1:5])))
+            elif t in (PT_TXT_MSG, PT_PATH) and len(pl) >= 2 and pl[0] == self.room.self_hash:
+                out.append((pkey, ("pkt", raw)))
+            elif t == PT_ADVERT and (cfg.mqtt_advert_ingest or cfg.mqtt_activity):
+                first = pkt.path[:pkt.hash_size] if pkt.hop_count else origin[:2]
+                out.append(((pkey, first), ("advert", raw, origin)))    # each first hop = another "near" sighting
+            elif t == PT_GRP_TXT and cfg.mqtt_activity and pl and pl[0] in self.room.channel_hashes():
+                out.append((pkey, ("grp", raw)))
+            if cfg.mqtt_topo_ingest and ((pkt.is_flood and pkt.hash_size >= 2 and pkt.hop_count) or (t == PT_TRACE and pkt.is_direct)):
+                out.append(((pkey, origin[:4]), ("topo", raw, origin, snr)))   # every observer's copy adds its own last link
+        with self.lock:
+            self.recent.append((now, bool(out)))
+            keep = []
+            for key, ev in out:
+                if key in self.seen:
+                    continue                                # another observer's copy of the same thing
+                self.seen[key] = now
+                keep.append(ev)
+            while len(self.seen) > 4000:
+                self.seen.popitem(last=False)
+        for ev in keep:
+            try:
+                self.ingress.put_nowait(("obs",) + ev)    # preserve FIFO; drop only the arriving event under load
+            except queue.Full:
+                self.dropped += 1
+
+
+# ============================================================================
 # Dashboard (own thread; reads only the snapshot the main loop publishes)
 # ============================================================================
 
@@ -3124,6 +3836,7 @@ button{background:#2a313b;color:var(--fg);border:1px solid var(--line);border-ra
 .rdetail h3{margin:0 0 2px;font-size:16px}.rdetail .sec{margin:12px 0 4px;color:var(--acc);text-transform:uppercase;font-size:11px;letter-spacing:.05em}
 .rdetail table td,.rdetail table th{padding:3px 6px;font-size:12px}.kv td:first-child{color:var(--dim);width:110px}.mono{font-family:ui-monospace,monospace;word-break:break-all;white-space:normal}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
 .volt{font-weight:600}.volt .dim{font-weight:400}
+.mqdot{display:inline-block;width:9px;height:9px;border-radius:50%;vertical-align:0}.mqdot.on{background:#4caf7a}.mqdot.off{background:#e05a5a}
 .hstats{flex-basis:100%;display:flex;flex-wrap:wrap;gap:6px 22px;font-size:13px}.hstats b{font-weight:600}.hstats .dim{margin-right:4px}
 .modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:3000}
 .mbox{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px 18px;width:300px}.mbox h3{margin:0 0 10px;font-size:15px}
@@ -3141,6 +3854,8 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .chatlog .msg{padding:3px 0;border-bottom:1px solid #1f262e}.chatlog .when{color:var(--dim);font-size:11px;margin-right:6px}
 .chatlog .who{font-weight:600;margin-right:6px}.chatlog .who.room{color:var(--acc)}
 .chatin{display:flex;gap:8px;align-items:center;margin-top:8px}.chatin input{flex:1;padding:7px 9px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}
+.mqrow{display:flex;gap:14px;align-items:center;margin:6px 0}.mqrow.sub{margin-left:26px}.sw{cursor:pointer}
+.mqrow input{transform:scale(1.2);margin-right:6px}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
 .hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}
 #members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
@@ -3153,7 +3868,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
 </style></head><body>
-<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
+<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
 <div id="hstats" class="hstats"></div></header>
 <div id="suggestbox" class="modal"><div class="mbox wide"><h3 id="sgtitle">Suggest a route</h3>
@@ -3166,6 +3881,16 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div id="loginerr" class="poor small"></div><div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end"><button onclick="closeLogin()">Cancel</button><button onclick="doLogin()">Log in</button></div></div></div>
 <main>
 <div class="card"><div class="kpis" id="kpis"></div></div>
+<div class="card" id="mqcard" style="display:none"><h2>MQTT augmentation <span class="hdesc">listen to the observer network as well as the radio</span></h2>
+<div class="mqrow"><label class="sw"><input type="checkbox" id="mq_en" onchange="mqSet({enabled:this.checked})"> <b>MQTT augmentation</b></label>
+<span id="mqstat" class="dim small"></span></div>
+<div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_ack" onchange="mqSet({ack_ingest:this.checked})"> ACK ingestion <span class="dim">&mdash; determine delivery via observers</span></label></div>
+<div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_msg" onchange="mqSet({msg_ingest:this.checked})"> Message ingestion <span class="dim">&mdash; capture room posts via observers</span></label></div>
+<div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_topo" onchange="mqSet({topo_ingest:this.checked})"> Topology ingestion <span class="dim">&mdash; collect route, SNR, and path reliability data for known infrastructure</span></label></div>
+<div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_adv" onchange="mqSet({advert_ingest:this.checked})"> Advert ingestion <span class="dim">&mdash; discover users and their locations</span></label></div>
+<div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_act" onchange="mqSet({activity:this.checked})"> Activity monitor <span class="dim">&mdash; packets from an inactive member resume sync (at most every 15 min)</span><span id="mqch" class="dim small"></span></label></div>
+<div class="mqnote">RF will always be used for fallback and route calculations: what the observers report never changes routes,
+delivery scores or the push pace, and if the broker is unreachable the room carries on exactly as before.</div></div>
 <div class="card" id="advcard" style="display:none"><h2>Room adverts</h2><div class="advrow">
 <div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
 <div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
@@ -3218,6 +3943,8 @@ async function loadChat(reset){if(!ADMIN||CHAT_BUSY)return;CHAT_BUSY=true;
    div.innerHTML=`<span class="when">${new Date(m.ts*1000).toLocaleString()}</span><span class="who ${m.room?"room":""}">${esc(m.who)}</span>${esc(m.text)}`;
    L.appendChild(div);CHAT_TS=Math.max(CHAT_TS,m.ts)});
   if(d.messages.length&&(atBottom||reset))L.scrollTop=L.scrollHeight}catch(e){}CHAT_BUSY=false}
+async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
+ if(r.status===401){alert("Your admin session has expired: log in again.");session()}setTimeout(load,400)}
 async function sendAdvert(flood,btn){
  if(flood&&!confirm("Send a flood advert? It is relayed across the whole mesh."))return;
  btn.disabled=true;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({flood})});
@@ -3230,6 +3957,7 @@ async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chat
  else{let e="Could not send";try{e=(await r.json()).error||e}catch(x){}if(r.status===401){e="Your admin session has expired: log in again.";session()}$("chaterr").textContent=e}}
 async function session(){try{const r=await (await fetch("api/session")).json();ADMIN=r.admin;LOGIN_ON=r.login_enabled}catch(e){}
  const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=ADMIN?"":"none";$("welcomecard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);if(ADMIN&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
+ $("mqcard").style.display=ADMIN?"":"none";
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
 function observerState(o,key){
  const d=o||{enabled:false,iata:"SJC",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
@@ -3286,7 +4014,7 @@ function hops(r){return r.routes.length?r.routes[0].path.length:null}
 function hopsTxt(n){return n==null?"no route yet":n===1?"1 hop":n+" hops"}
 function detail(r){
  const sn=x=>x==null?'<span class="dim">-</span>':(x>0?"+":"")+x+" dB";
- const nb=l=>l.length?"<table><tr><th>Repeater</th><th>Avg SNR</th><th>Seen</th></tr>"+l.map(x=>`<tr><td>${esc(x.name)}</td><td>${sn(x.snr)}</td><td>${x.seen}</td></tr>`).join("")+"</table>":'<span class="dim">none yet</span>';
+ const nb=l=>l.length?"<table><tr><th>Repeater</th><th>Avg SNR</th><th>Seen</th></tr>"+l.map(x=>`<tr><td>${esc(x.name)}${x.obs?' <span class="dim small" title="only heard by observers (MQTT)">via observers</span>':""}</td><td>${sn(x.snr)}</td><td>${x.seen}</td></tr>`).join("")+"</table>":'<span class="dim">none yet</span>';
  return `<h3>${esc(r.name||"Unknown repeater")}</h3><div class="dim small">${hopsTxt(hops(r))} from the room</div>`+
   `<div class="sec">Identity</div><table class="kv"><tr><td>ID</td><td class="mono">${r.hash}</td></tr>`+
   `<tr><td>Public key</td><td class="mono">${r.key?r.key:'<span class="dim">unknown (no advert heard)</span>'}</td></tr>`+
@@ -3331,6 +4059,15 @@ async function load(){
  if(!st.room)return; const R=st.room,S=st.stats;
  $("rname").textContent=R.name; document.title=R.name+" - meshroom";
  $("rinfo").textContent=(R.radio?(R.radio[0]/1e6).toFixed(3)+" MHz BW"+R.radio[1]/1e3+" SF"+R.radio[2]+" CR4/"+R.radio[3]:"")+"  key "+R.key.slice(0,12)+"  "+R.fw;
+ const Mq=st.mqtt||{};
+ $("rmqtt").innerHTML=Mq.enabled?`<span class="dim">MQTT ingestion</span> <span class="mqdot ${Mq.connected?"on":"off"}" title="${esc(Mq.connected?"connected":(Mq.error||"connecting..."))}"></span> ${esc(Mq.host||"")} <span class="dim small">pps: ${Mq.pps} (${Mq.rel_pps} relevant)</span>`
+   :'<span class="dim">MQTT ingestion off</span>';
+ if(ADMIN){$("mq_en").checked=!!Mq.enabled;$("mq_ack").checked=!!Mq.ack_ingest;$("mq_msg").checked=!!Mq.msg_ingest;
+  $("mq_topo").checked=!!Mq.topo_ingest;$("mq_adv").checked=!!Mq.advert_ingest;$("mq_act").checked=!!Mq.activity;
+  $("mq_ack").disabled=$("mq_msg").disabled=$("mq_topo").disabled=$("mq_adv").disabled=$("mq_act").disabled=!Mq.enabled;
+  $("mqch").textContent=(Mq.channels||[]).length?" · channels watched: "+Mq.channels.join(", "):"";
+  $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
+   :`<span class="poor">not connected</span> ${esc(Mq.error||"(connecting...)")}`):"off"}
  const Wb=st.web||{};
  $("rweb").innerHTML=`<span class="dim">Web</span> ${Wb.viewers||0} viewer${Wb.viewers==1?"":"s"}${Wb.admins?` <span class="dim small">(${Wb.admins} admin)</span>`:""}`;
  if(st.map_version!==MAPVER)loadMap();                       // the map's shape changed (e.g. a new repeater): fetch now
@@ -3344,7 +4081,7 @@ async function load(){
   `<span><span class="dim">Channel use</span>TX <b>${Hs.tx_pct}%</b> &middot; RX <b>${Hs.rx_pct}%</b></span>`,
   `<span><span class="dim">Packets / min</span>RX <b>${Hs.rx_pm}</b> &middot; TX <b>${Hs.tx_pm}</b></span>`,
   `<span><span class="dim">Push pace</span><b>${Hs.pace} s</b></span>`,
-  `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_ok!=null?` &middot; <b class="${Hs.push_ok>=80?"good":Hs.push_ok>=50?"mid":"poor"}">${Hs.push_ok}%</b> delivered`:""}</span>`,
+  `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_rf!=null?` &middot; <b class="${Hs.push_rf>=80?"good":Hs.push_rf>=50?"mid":"poor"}">${Hs.push_rf}%</b> delivered${(st.mqtt||{}).enabled?` <span class="dim small">(${Hs.push_ok}% per MQTT)</span>`:""}`:""}</span>`,
   `<span class="dim small">last ${Hs.minutes>=60?"hour":Hs.minutes+" min"}</span>`].join(""):'<span class="dim small">stats appear after the first minute</span>';
  $("rclock").textContent="up "+ago(Date.now()/1000-R.uptime).replace("s"," s")+(R.clock_ok?"":"  CLOCK NOT SYNCED");
  observerState(st.observer,R.key);if(ADMIN)loadObserverTraffic();
@@ -3406,12 +4143,12 @@ function drawMap(st){
  const sig=Object.keys(pos).sort().join(",");
  if(pts.length&&map._sig!==sig){map.fitBounds(pts.map(p=>p.slice(0,2)),{padding:[30,30],maxZoom:12});map._sig=sig}
  if(layer)layer.remove(); layer=L.layerGroup().addTo(map);
- // a repeater is selected: only its links, and its neighbours stay bright
+ // lines only for the selected repeater (none when nothing is selected); its neighbours stay bright
  const linked=new Set();
- st.edges.forEach(e=>{if(SEL&&e.a!==SEL&&e.b!==SEL)return;const a=pos[e.a],b=pos[e.b];if(!a||!b)return;
+ st.edges.forEach(e=>{if(!SEL||(e.a!==SEL&&e.b!==SEL))return;const a=pos[e.a],b=pos[e.b];if(!a||!b)return;
   if(SEL){linked.add(e.a);linked.add(e.b)}
-  L.polyline([a.slice(0,2),b.slice(0,2)],{weight:1.5,color:e.b===""||e.a===""?"#5cb3ff":"#8a94a3",opacity:SEL?.9:.55,interactive:true})
-   .bindTooltip(`${esc(a[2])} &rarr; ${esc(b[2])}<br>seen ${e.w}${e.snr!=null?"<br>SNR "+e.snr:""}`).addTo(layer)});
+  L.polyline([a.slice(0,2),b.slice(0,2)],{weight:1.5,color:e.b===""||e.a===""?"#5cb3ff":"#8a94a3",opacity:SEL?.9:.55,interactive:true,dashArray:e.obs?"4 4":null})
+   .bindTooltip(`${esc(a[2])} &rarr; ${esc(b[2])}<br>seen ${e.w}${e.snr!=null?"<br>SNR "+e.snr:""}${e.obs?"<br><i>via observers</i>":""}`).addTo(layer)});
  Object.entries(pos).forEach(([h,p])=>{const sel=h===SEL, dim=SEL&&!sel&&!linked.has(h);
   const mk=L.circleMarker(p.slice(0,2),{radius:h===""?8:sel?10:7,color:h===""?"#4caf7a":sel?"#ffd166":"#5cb3ff",weight:sel?3:2,
    opacity:dim?.25:1,fillOpacity:dim?.15:.9}).bindTooltip(tip[h]||esc(p[2]),{direction:"top",offset:[0,-6]}).addTo(layer);
@@ -3731,6 +4468,18 @@ class WebUI:
                             return self._send(400, json.dumps({"error": "welcome DM is too long after {room} is replaced (maximum %d UTF-8 bytes)" % MAX_POST_TEXT_LEN}))
                     events.put(("welcome_config", updates))      # main loop persists updates before a member can receive them
                     return self._send(200, json.dumps({"ok": True, "updates": updates}))
+                if parts == ["api", "mqtt"]:
+                    try:
+                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                    except ValueError:
+                        body = {}
+                    ch = {k: bool(body[j]) for j, k in (("enabled", "mqtt_enabled"), ("ack_ingest", "mqtt_ack_ingest"),
+                                                         ("msg_ingest", "mqtt_msg_ingest"), ("topo_ingest", "mqtt_topo_ingest"),
+                                                         ("advert_ingest", "mqtt_advert_ingest"), ("activity", "mqtt_activity")) if j in body}
+                    if not ch:
+                        return self._send(400, '{"error":"nothing to change"}')
+                    events.put(("mqtt_cfg", ch))                    # applied (and saved) by the main loop
+                    return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "advert"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
@@ -3863,6 +4612,7 @@ def main():
             # starting.  The error is visible in the normal MeshRoom log.
             log.error("MQTT observer disabled: %s", e)
     start_observer()
+    room.mqtt_apply()
     if cfg.web_port:
         try:
             room.publish_web_state()
@@ -3907,6 +4657,13 @@ def main():
         elif kind == "suggest":
             room.suggest_route(ev[1], ev[2])
             room.web_dirty = True
+        elif kind == "obs":
+            room.observer_event(ev)
+        elif kind == "mqtt_cfg":
+            for k, v in ev[1].items():
+                room.cfg.set(k, v)                          # saved to the config file, in place
+            room.mqtt_apply()
+            room.web_dirty = True
         elif kind == "web_wake":
             room.web_dirty = True
             room.next_map = 0.0                             # first view after idle: the map part too
@@ -3949,11 +4706,24 @@ def main():
                     ev = events.get_nowait()
                 except queue.Empty:
                     ev = None
+            # MQTT ingestion has its own bounded queue so a broker burst cannot
+            # grow the serial/main event queue without limit.  Drain a bounded
+            # slice here, after radio/UI events have had priority.
+            if running and room.feed:
+                for _ in range(32):
+                    ev = room.feed.pop()
+                    if ev is None:
+                        break
+                    running = handle(ev)
+                    if not running:
+                        break
             if running:
                 room.run_once()                             # push scheduler, transmit queue, periodic jobs
         except Exception:
             log.exception("main loop")
     log.info("shutting down: saving state")
+    if room.feed:
+        room.feed.stop()                                    # stop inbound producer before serial/state teardown
     room.flush()
     room.flush_topology()
     if observer:
