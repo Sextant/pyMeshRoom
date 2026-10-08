@@ -830,6 +830,27 @@ class Store:
         db.close()
 
 
+def mqtt_changes(body):
+    """Dashboard MQTT settings -> config changes. Credentials are write-only."""
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    ch = {k: bool(body[j]) for j, k in (("enabled", "mqtt_enabled"), ("ack_ingest", "mqtt_ack_ingest"),
+                                         ("msg_ingest", "mqtt_msg_ingest"), ("topo_ingest", "mqtt_topo_ingest"),
+                                         ("advert_ingest", "mqtt_advert_ingest"), ("activity", "mqtt_activity")) if j in body}
+    if "username" in body or "password" in body:
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "")
+        if not username or not password:
+            raise ValueError("subscriber username and password are both required")
+        if len(username.encode()) > 256 or len(password.encode()) > 512 or "\0" in username or "\0" in password:
+            raise ValueError("subscriber credentials are invalid or too long")
+        # These keys are saved in the local, owner-protected configuration but
+        # deliberately never included in dashboard state or a response body.
+        ch["mqtt_username"] = username
+        ch["mqtt_password"] = password
+    return ch
+
+
 def repeater_changes(body):
     """Dashboard repeater settings -> {config key: value}, validated. Raises ValueError with a readable message."""
     if not isinstance(body, dict):
@@ -2806,8 +2827,11 @@ class RoomServer:
             self.stats["obs_wakes"] += 1
             log.info("%s seen by an observer: resuming sync", self.member_label(m))
 
-    def mqtt_apply(self):
+    def mqtt_apply(self, restart=False):
         """Start or stop the observer feed to match the settings."""
+        if restart and self.feed is not None:
+            self.feed.stop()
+            self.feed = None
         want = bool(self.cfg.mqtt_enabled and self.cfg.mqtt_host)
         if want and self.feed is None and self.events_q is not None:
             self.feed = ObserverFeed(self, self.events_q)
@@ -2826,6 +2850,7 @@ class RoomServer:
                     wakes=self.stats["obs_wakes"], links=len(self.obs_edges), adverts=self.stats["obs_adverts"],
                     channel_msgs=self.stats["obs_channel"], queue_depth=(f.depth() if f else 0),
                     queue_max=int(self.cfg.mqtt_queue_max), dropped=(f.dropped if f else 0),
+                    credentials_configured=bool(self.cfg.mqtt_username and self.cfg.mqtt_password),
                     diagnostics=(dict(f.diag) if f else {}),
                     subscriptions=(f.subscription_state() if f else {}),
                     subscription_error=(f.subscription_error if f else ""))
@@ -4515,7 +4540,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .rprow{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:8px 0 6px 26px}
 .rprow label{display:flex;gap:6px;align-items:center}
 .rprow input,.rprow select{width:auto;flex:none;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.sw{cursor:pointer}
-.mqrow input{transform:scale(1.2);margin-right:6px}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
+.mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password]{width:auto;min-width:150px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
 .hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}
 #members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
@@ -4550,6 +4575,7 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_topo" onchange="mqSet({topo_ingest:this.checked})"> Topology ingestion <span class="dim">&mdash; collect route, SNR, and path reliability data for known infrastructure</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_adv" onchange="mqSet({advert_ingest:this.checked})"> Advert ingestion <span class="dim">&mdash; discover users and their locations</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_act" onchange="mqSet({activity:this.checked})"> Activity monitor <span class="dim">&mdash; packets from an inactive member resume sync (at most every 15 min)</span><span id="mqch" class="dim small"></span></label></div>
+<div class="mqrow sub"><label>Subscriber username <input id="mq_user" type="text" autocomplete="username" placeholder="GoMesh username"></label><label>Subscriber password <input id="mq_pass" type="password" autocomplete="current-password" placeholder="GoMesh password"></label><button onclick="mqCredentials()">Save subscriber credentials</button><span id="mqcred" class="dim small"></span></div>
 <div class="mqnote">RF will always be used for fallback and route calculations: what the observers report never changes routes,
 delivery scores or the push pace, and if the broker is unreachable the room carries on exactly as before.</div></div>
 <div class="card" id="rpcard" style="display:none"><h2>Virtual repeater <span class="hdesc">a second identity on the room's radio that relays for the mesh</span></h2>
@@ -4632,6 +4658,8 @@ function rpSave(){rpSet({name:$("rp_name").value,lat:$("rp_lat").value.trim(),lo
  airtime_cap:+$("rp_air").value,loop_detect:$("rp_loop").value,advert_min:+$("rp_adv").value,flood_advert_h:+$("rp_fadv").value})}
 async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  if(r.status===401){alert("Your admin session has expired: log in again.");session()}setTimeout(load,400)}
+async function mqCredentials(){const u=$("mq_user").value.trim(),p=$("mq_pass").value;if(!u||!p){$("mqcred").textContent="username and password are both required";$("mqcred").className="poor small";return}
+ const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u,password:p})});let m="credentials were not saved";if(r.ok){$("mq_user").value="";$("mq_pass").value="";m="subscriber credentials saved; reconnecting"}else{try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("mqcred").className=r.ok?"good small":"poor small";$("mqcred").textContent=m;setTimeout(load,700)}
 async function sendAdvert(flood,btn){
  if(flood&&!confirm("Send a flood advert? It is relayed across the whole mesh."))return;
  btn.disabled=true;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({flood})});
@@ -4759,6 +4787,7 @@ async function load(){
   $("mq_topo").checked=!!Mq.topo_ingest;$("mq_adv").checked=!!Mq.advert_ingest;$("mq_act").checked=!!Mq.activity;
   $("mq_ack").disabled=$("mq_msg").disabled=$("mq_topo").disabled=$("mq_adv").disabled=$("mq_act").disabled=!Mq.enabled;
   $("mqch").textContent=(Mq.channels||[]).length?" · channels watched: "+Mq.channels.join(", "):"";
+  $("mqcred").innerHTML=Mq.credentials_configured?'<span class="good">subscriber credentials configured</span>':'<span class="mid">subscriber credentials not configured</span>';
   $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; ${subStatus} &middot; MQTT packets received: ${Md.received||0}; accepted: ${Md.accepted||0} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
    :`<span class="poor">not connected</span> ${esc(Mq.error||"(connecting...)")}`):"off"}
  const Rp=st.repeater||{};
@@ -5177,11 +5206,9 @@ class WebUI:
                 if parts == ["api", "mqtt"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
-                    except ValueError:
-                        body = {}
-                    ch = {k: bool(body[j]) for j, k in (("enabled", "mqtt_enabled"), ("ack_ingest", "mqtt_ack_ingest"),
-                                                         ("msg_ingest", "mqtt_msg_ingest"), ("topo_ingest", "mqtt_topo_ingest"),
-                                                         ("advert_ingest", "mqtt_advert_ingest"), ("activity", "mqtt_activity")) if j in body}
+                        ch = mqtt_changes(body)
+                    except (ValueError, TypeError) as e:
+                        return self._send(400, json.dumps({"error": str(e) or "bad request"}))
                     if not ch:
                         return self._send(400, '{"error":"nothing to change"}')
                     events.put(("mqtt_cfg", ch))                    # applied (and saved) by the main loop
@@ -5378,9 +5405,10 @@ def main():
         elif kind == "obs":
             room.observer_event(ev)
         elif kind == "mqtt_cfg":
+            reconnect = any(k in ("mqtt_username", "mqtt_password") for k in ev[1])
             for k, v in ev[1].items():
                 room.cfg.set(k, v)                          # saved to the config file, in place
-            room.mqtt_apply()
+            room.mqtt_apply(restart=reconnect)
             room.web_dirty = True
         elif kind == "rpt_cfg":
             for k, v in ev[1].items():

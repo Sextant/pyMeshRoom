@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "meshroom"))
-from meshroom import ObserverFeed, PT_ACK, Packet
+from meshroom import ObserverFeed, PT_ACK, Packet, mqtt_changes
 
 
 class IngestionTests(unittest.TestCase):
@@ -60,4 +60,11 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(state["meshcore/#"]["state"], "granted")
         self.assertEqual(state["private/#"]["state"], "denied")
         self.assertIn("private/#", feed.subscription_error)
+
+    def test_subscriber_credentials_require_both_values(self):
+        changes = mqtt_changes({"username": "viewer", "password": "secret"})
+        self.assertEqual(changes["mqtt_username"], "viewer")
+        self.assertEqual(changes["mqtt_password"], "secret")
+        with self.assertRaises(ValueError):
+            mqtt_changes({"username": "viewer"})
 
