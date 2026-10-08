@@ -28,7 +28,7 @@ See pyMeshRoom operating in the wild:
 
 ### The three optional subsystems
 
-**MQTT Observer — outbound.** Add or delete regional standard MeshCore observer servers from the admin card. Each one has its own endpoint, JWT audience, WebSocket path, topic prefix, TLS controls, health state, and traffic counters. A failed observer never blocks RF.
+**MQTT Observer — outbound.** Add or delete regional standard MeshCore observer servers from the admin card. Each one has its own endpoint, JWT audience, WebSocket path, topic prefix, TLS controls, health state, and traffic counters. Its Paho MQTT client is bundled with pyMeshRoom, so enabling the Observer does not require a separate Paho installation. A failed observer never blocks RF.
 
 **MQTT Augmentation — inbound.** Configure the regional broker, TLS, topic filters, and read-only credentials in the admin card. The dashboard distinguishes a successful connection from an actually granted MQTT subscription. RF routing remains authoritative.
 
@@ -124,7 +124,7 @@ This branch keeps the normal MeshRoom RF/KISS room server as the authority for r
 
 The Observer card is an admin-only, outbound control surface. It is intentionally separate from MQTT Augmentation: it publishes copies of RF traffic and never needs inbound subscription access.
 
-When `observer_enabled` is true, the observer makes a non-blocking copy of locally received RF packets and publishes them independently to GoMesh and/or MeshMapper over TLS WebSockets.  It provides:
+When `observer_enabled` is true, the observer makes a non-blocking copy of locally received RF packets and publishes them independently to GoMesh and/or MeshMapper over TLS WebSockets. It uses bundled Paho MQTT 2.1.0 when no installed copy is available, so normal installation does not need a separate Paho step. It provides:
 
 * modem-backed identity signing; the MeshCore private key stays in the modem;
 * independent GoMesh and MeshMapper connections, diagnostics, retained online/offline status, and reconnect handling;
@@ -193,7 +193,7 @@ cd pyMeshRoom
 ./scripts/install-pymeshroom.sh
 ```
 
-The installer creates a virtual environment, installs the complete Python dependency set, creates a protected private configuration if it does not yet exist, makes a local data directory, validates JSON, and runs the automated tests.
+The installer creates a virtual environment, installs the core Python dependencies, creates a protected private configuration if it does not yet exist, makes a local data directory, validates JSON, and runs the automated tests. The optional MQTT Observer uses the bundled Paho client, so the installer does not download a separate `paho-mqtt` package.
 
 ```bash
 ./scripts/install-pymeshroom.sh --service
@@ -334,7 +334,7 @@ Add a server only after obtaining its endpoint and protocol details from the reg
 
 ## Optional Virtual Repeater
 
-`repeater_enabled` creates a second logical MeshCore identity using the existing RoomServer KISS reader/writer and TX scheduler. It does not open a second serial connection. On first enable, a random repeater key is generated and saved only to the private local configuration; use `chmod 600` on that file.
+`repeater_enabled` creates a second logical MeshCore identity using the existing RoomServer KISS reader/writer and TX scheduler. It does not open a second serial connection. New configurations use **pyMeshRoom Virtual Repeater** as the default advertised name. On first enable, a random repeater key is generated and saved only to the private local configuration; use `chmod 600` on that file.
 
 ![Virtual Repeater configuration](docs/images/virtual-repeater-current.png)
 
