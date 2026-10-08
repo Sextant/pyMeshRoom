@@ -57,4 +57,3 @@ class VirtualRepeaterTests(unittest.TestCase):
         packet.path_len = 1
         packet.path = b"R"
         self.assertTrue(relay.looped(packet))
-
