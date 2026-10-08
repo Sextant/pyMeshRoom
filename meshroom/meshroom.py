@@ -845,6 +845,14 @@ def repeater_changes(body):
     for j, k in (("enabled", "repeater_enabled"), ("relay", "repeater_relay")):
         if j in body:
             ch[k] = bool(body[j])
+    if "private_key" in body:
+        key = str(body["private_key"]).strip().lower()
+        if len(key) not in (64, 128) or any(c not in "0123456789abcdef" for c in key):
+            raise ValueError("private key must be 64 or 128 hexadecimal characters")
+        # Never return this value through dashboard state or logs.  The POST
+        # handler permits replacement only while the repeater is off.
+        RepeaterIdentity(bytes.fromhex(key))
+        ch["repeater_key"] = key
     if "name" in body:
         name = str(body["name"]).strip()
         if not name or len(name.encode()) > 31:
@@ -2817,7 +2825,8 @@ class RoomServer:
                     channels=list(self.cfg.mqtt_channels or []), acks=self.stats["obs_acks"], posts=self.stats["obs_posts"],
                     wakes=self.stats["obs_wakes"], links=len(self.obs_edges), adverts=self.stats["obs_adverts"],
                     channel_msgs=self.stats["obs_channel"], queue_depth=(f.depth() if f else 0),
-                    queue_max=int(self.cfg.mqtt_queue_max), dropped=(f.dropped if f else 0))
+                    queue_max=int(self.cfg.mqtt_queue_max), dropped=(f.dropped if f else 0),
+                    diagnostics=(dict(f.diag) if f else {}))
 
     # ------------------------------------------------------------------ virtual repeater
 
@@ -4290,6 +4299,7 @@ class ObserverFeed:
         self.bad = 0                                         # malformed messages skipped
         self.connects = 0
         self.recent = collections.deque()                    # (time, relevant) for the rate shown in the header
+        self.diag = collections.Counter()                    # received and intentionally ignored MQTT observations
         self.ingress = queue.Queue(maxsize=max(10, int(room.cfg.mqtt_queue_max)))
         self.dropped = 0
         self.thread = threading.Thread(target=self.worker, name="mqtt", daemon=True)
@@ -4361,14 +4371,18 @@ class ObserverFeed:
                 log.warning("MQTT: skipped a malformed message on %s (%r) [%d so far]", topic, e, self.bad)
 
     def _on_message(self, topic, payload, retain):
+        self.diag["received"] += 1
         if retain or not topic.endswith("/packets"):
+            self.diag["retained" if retain else "non_packet_topic"] += 1
             return                                          # retained = an old packet replayed; status messages: not needed
         try:
             obj = json.loads(payload)
             raw = bytes.fromhex(obj["raw"])
         except (ValueError, KeyError, TypeError, AttributeError):
+            self.diag["malformed"] += 1
             return
         if len(raw) < 2:
+            self.diag["malformed"] += 1
             return                                          # empty / truncated packet
         now = time.monotonic()
         cfg = self.room.cfg
@@ -4378,6 +4392,7 @@ class ObserverFeed:
         except (ValueError, TypeError):
             origin = b""
         if origin == self.room.id.pub_key:
+            self.diag["self_origin"] += 1
             return                                          # never ingest this room's own published observation
         try:
             snr = float(obj.get("SNR"))
@@ -4405,9 +4420,11 @@ class ObserverFeed:
             keep = []
             for key, ev in out:
                 if key in self.seen:
+                    self.diag["duplicate"] += 1
                     continue                                # another observer's copy of the same thing
                 self.seen[key] = now
                 keep.append(ev)
+            self.diag["accepted"] += len(keep)
             while len(self.seen) > 4000:
                 self.seen.popitem(last=False)
         for ev in keep:
@@ -4505,6 +4522,7 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="mqnote">RF will always be used for fallback and route calculations: what the observers report never changes routes,
 delivery scores or the push pace, and if the broker is unreachable the room carries on exactly as before.</div></div>
 <div class="card" id="rpcard" style="display:none"><h2>Virtual repeater <span class="hdesc">a second identity on the room's radio that relays for the mesh</span></h2>
+<div class="mqrow sub"><label>Import private key <input id="rp_key" type="password" autocomplete="new-password" placeholder="64 or 128 hex characters"></label><button onclick="rpImportKey()">Import key</button><span id="rpkeymsg" class="dim small"></span></div>
 <div class="mqrow"><label class="sw"><input type="checkbox" id="rp_en" onchange="rpSet({enabled:this.checked})"> <b>Virtual repeater</b></label>
 <span id="rpstat" class="dim small"></span></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="rp_relay" onchange="rpSet({relay:this.checked})"> Relay packets <span class="dim">&mdash; turning this off stops relaying at once (queued relays are dropped); it keeps advertising</span></label></div>
@@ -4578,6 +4596,7 @@ async function rpSet(o){const r=await fetch("api/repeater",{method:"POST",header
  let m="";if(!r.ok){m="Could not save";try{m=(await r.json()).error||m}catch(e){}}
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
  $("rpmsg").className=r.ok?"good small":"poor small";$("rpmsg").textContent=r.ok?"saved":m;delete SIG.rpform;setTimeout(load,400);return r.ok}
+async function rpImportKey(){const k=$("rp_key").value.trim();if(!k)return;const ok=await rpSet({private_key:k});$("rp_key").value="";$("rpkeymsg").textContent=ok?"key imported; repeater remains disabled":"key was not imported"}
 function rpSave(){rpSet({name:$("rp_name").value,lat:$("rp_lat").value.trim(),lon:$("rp_lon").value.trim(),scope_mode:$("rp_mode").value,regions:$("rp_regions").value,
  airtime_cap:+$("rp_air").value,loop_detect:$("rp_loop").value,advert_min:+$("rp_adv").value,flood_advert_h:+$("rp_fadv").value})}
 async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
@@ -5134,6 +5153,8 @@ class WebUI:
                 if parts == ["api", "repeater"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        if "private_key" in body and room.cfg.repeater_enabled:
+                            return self._send(409, '{"error":"disable the virtual repeater before importing a private key"}')
                         ch = repeater_changes(body)
                     except ValueError as e:
                         return self._send(400, json.dumps({"error": str(e) or "bad request"}))
