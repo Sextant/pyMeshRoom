@@ -1,6 +1,8 @@
 # The-Platinum-Most-Excellent-MeshCore-Pi-Room
 MeshCore Room firmware running on basic nodes is too limiting for active high traffic volume Rooms.  Meet the Platinum Most Excellent MeshCore Pi Room (PMEMPR)!
 
+> **The Full Monty branch.** `feature/the-full-monty` is the complete, RF-first edition: Room Server, optional MQTT ingestion, optional MQTT observer publishing, and an optional Virtual Repeater sharing one KISS modem. Internet access is optional. With every optional subsystem disabled, it remains a normal persistent RF-only MeshCore Room Server.
+
 See stats and what repeaters the room is well connected to
 <img width="1553" height="597" alt="image" src="https://github.com/user-attachments/assets/b9add1ee-5f80-4d57-b767-3be9e5889e07" />
 See a member list, with click-to-expand to get more details
@@ -130,6 +132,64 @@ Install
    * Stop meshroom
    * Clone again
    * Start meshroom
+
+# Full Monty: build your own instance
+
+## What you need
+
+* A Linux host (a Raspberry Pi 4 or newer is a practical choice), Python 3, Git, and a MeshCore KISS modem attached by USB.
+* A modem serial device such as `/dev/ttyUSB0`; the service user needs read/write permission, normally through the `dialout` group.
+* A stable storage directory for the SQLite room database.
+* Optional internet access only if you enable MQTT features or host the dashboard remotely. RF Room Server and Virtual Repeater functions do not require internet.
+
+Create a virtual environment and install the core packages:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pyserial cryptography
+```
+
+Add `paho-mqtt` only when enabling the outbound MQTT observer:
+
+```bash
+.venv/bin/python -m pip install --upgrade paho-mqtt
+```
+
+## First configuration
+
+Copy `meshroom/meshroom.json.example` to a private `meshroom/meshroom.json`, set permissions to owner-only, and set the room name, coordinates, serial device, radio parameters, data directory, passwords, and dashboard bind address. Never commit that file: it can contain passwords and a locally generated Virtual Repeater key.
+
+Start with every optional feature disabled:
+
+```json
+"mqtt_enabled": false,
+"observer_enabled": false,
+"repeater_enabled": false
+```
+
+This is the recommended initial installation. Confirm normal RF room operation before enabling any optional feature.
+
+## Optional MQTT
+
+`mqtt_enabled` activates inbound supplemental observations. It can improve ACK confirmation, activity awareness, advert/map data, and topology awareness, but it never replaces RF routing or makes the Room Server dependent on a broker. Broker loss is reported in dashboard status and the RF room keeps operating.
+
+`observer_enabled` copies locally received RF packets to GoMesh and/or MeshMapper. It uses the modem-backed Room identity for signing; the Room private key never leaves the modem. Its `observer_queue_max` limits asynchronous outgoing observations. MQTT ingestion has its own `mqtt_queue_max` ingress limit, default 1000. If it is full, the newest remote event is ignored rather than evicting an already accepted older ACK or direct packet; FIFO delivery-state ordering is safer than keeping a fresher topology update.
+
+## Optional Virtual Repeater
+
+`repeater_enabled` creates a second logical MeshCore identity using the existing RoomServer KISS reader/writer and TX scheduler. It does not open a second serial connection. On first enable, a random repeater key is generated and saved only to the private local configuration; use `chmod 600` on that file.
+
+`repeater_relay` is an independent immediate relay kill switch. When false, the repeater may advertise but relays no packets. Configure its name, coordinates, scoped regions, advert intervals, airtime cap, and loop-detection mode through the admin dashboard. Keep it disabled until RF validation is explicitly planned.
+
+## Operations, upgrades, and rollback
+
+Run the included unit tests before touching a live modem:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Use a separate checkout and virtual environment for any upgrade test. Never run two MeshRoom processes against the same serial modem. Keep a known-good checkout and systemd override rollback path. If an optional MQTT component fails, disable it in the dashboard or configuration; core RF operation continues. If Virtual Repeater behavior is unwanted, set `repeater_relay` false or `repeater_enabled` false and restart cleanly.
 
 # Dependencies
 
