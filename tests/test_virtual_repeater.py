@@ -34,6 +34,13 @@ class VirtualRepeaterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RepeaterIdentity(b"x" * 31)
 
+    def test_admin_accepts_a_valid_private_key_without_exposing_it(self):
+        key = bytes(range(32)).hex()
+        changes = repeater_changes({"private_key": key})
+        self.assertEqual(changes, {"repeater_key": key})
+        with self.assertRaises(ValueError):
+            repeater_changes({"private_key": "not-a-private-key"})
+
     def test_admin_changes_keep_relay_independent(self):
         changes = repeater_changes({"enabled": False, "relay": True,
                                     "airtime_cap": 25, "loop_detect": "strict"})

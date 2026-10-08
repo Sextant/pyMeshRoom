@@ -22,6 +22,7 @@ class IngestionTests(unittest.TestCase):
         feed = ObserverFeed.__new__(ObserverFeed)
         feed.room, feed.lock = room, threading.Lock()
         feed.seen, feed.recent, feed.diag = collections.OrderedDict(), collections.deque(), collections.Counter()
+        feed.subscriptions, feed.subscription_error = {}, ""
         feed.ingress, feed.dropped, feed.bad = queue.Queue(queue_max), 0, 0
         return feed
 
@@ -48,4 +49,15 @@ class IngestionTests(unittest.TestCase):
         feed = self.feed()
         feed._on_message("meshcore/SJC/a/packets", json.dumps({"raw": self.ack_raw().hex()}).encode(), True)
         self.assertEqual(feed.depth(), 0)
+
+    def test_subscription_ack_distinguishes_connected_from_authorized(self):
+        feed = self.feed()
+        topics = {7: "meshcore/#", 8: "private/#"}
+        feed.subscriptions = {topic: {"state": "pending", "codes": []} for topic in topics.values()}
+        feed.record_suback(topics, 7, [0])
+        feed.record_suback(topics, 8, [0x80])
+        state = feed.subscription_state()
+        self.assertEqual(state["meshcore/#"]["state"], "granted")
+        self.assertEqual(state["private/#"]["state"], "denied")
+        self.assertIn("private/#", feed.subscription_error)
 

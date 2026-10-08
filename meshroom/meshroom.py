@@ -2826,7 +2826,9 @@ class RoomServer:
                     wakes=self.stats["obs_wakes"], links=len(self.obs_edges), adverts=self.stats["obs_adverts"],
                     channel_msgs=self.stats["obs_channel"], queue_depth=(f.depth() if f else 0),
                     queue_max=int(self.cfg.mqtt_queue_max), dropped=(f.dropped if f else 0),
-                    diagnostics=(dict(f.diag) if f else {}))
+                    diagnostics=(dict(f.diag) if f else {}),
+                    subscriptions=(f.subscription_state() if f else {}),
+                    subscription_error=(f.subscription_error if f else ""))
 
     # ------------------------------------------------------------------ virtual repeater
 
@@ -4302,6 +4304,8 @@ class ObserverFeed:
         self.diag = collections.Counter({                    # received and intentionally ignored MQTT observations
             "received": 0, "accepted": 0, "retained": 0, "non_packet_topic": 0,
             "malformed": 0, "self_origin": 0, "duplicate": 0})
+        self.subscriptions = {}                               # topic -> pending/granted/denied, set by broker SUBACK
+        self.subscription_error = ""
         self.ingress = queue.Queue(maxsize=max(10, int(room.cfg.mqtt_queue_max)))
         self.dropped = 0
         self.thread = threading.Thread(target=self.worker, name="mqtt", daemon=True)
@@ -4329,6 +4333,28 @@ class ObserverFeed:
         span = 60.0
         return round(n / span, 1), round(rel / span, 2)
 
+    def subscription_state(self):
+        """A copy suitable for the public status API; it contains no credentials."""
+        with self.lock:
+            return {topic: dict(status) for topic, status in self.subscriptions.items()}
+
+    def record_suback(self, topic_by_pid, pid, codes):
+        """Record a broker acknowledgement for a requested subscription.
+
+        A TCP/WebSocket connection alone does not prove that the broker accepted a
+        topic filter. MQTT 3.1.1 uses 0, 1 or 2 for a granted QoS and 0x80 for a
+        refused filter.
+        """
+        topic = topic_by_pid.get(pid)
+        if topic is None:
+            return
+        granted = bool(codes) and all(code in (0, 1, 2) for code in codes)
+        with self.lock:
+            self.subscriptions[topic] = {"state": "granted" if granted else "denied",
+                                         "codes": list(codes)}
+            denied = [t for t, status in self.subscriptions.items() if status.get("state") == "denied"]
+            self.subscription_error = ("subscription denied: " + ", ".join(denied)) if denied else ""
+
     def worker(self):
         cfg = self.room.cfg
         delay = 2
@@ -4339,12 +4365,15 @@ class ObserverFeed:
                          tls=bool(cfg.mqtt_tls), verify=bool(cfg.mqtt_tls_verify))
             try:
                 c.connect()
-                for tp in (cfg.mqtt_topics or ["meshcore/#"]):
-                    c.subscribe(tp)
+                topics = list(cfg.mqtt_topics or ["meshcore/#"])
+                with self.lock:
+                    self.subscriptions = {tp: {"state": "pending", "codes": []} for tp in topics}
+                    self.subscription_error = ""
+                topic_by_pid = {c.subscribe(tp): tp for tp in topics}
                 self.connected, self.error, delay = True, "", 2
                 self.connects += 1
                 log.info("MQTT: connected to %s", cfg.mqtt_host)
-                c.loop(self.on_message, lambda pid, codes: None, self.stop_ev)
+                c.loop(self.on_message, lambda pid, codes: self.record_suback(topic_by_pid, pid, codes), self.stop_ev)
             except MQTTError as e:
                 self.error = str(e)
                 if "REFUSED" in str(e):
@@ -4719,13 +4748,18 @@ async function load(){
  $("rname").textContent=R.name; document.title=R.name+" - meshroom";
  $("rinfo").textContent=(R.radio?(R.radio[0]/1e6).toFixed(3)+" MHz BW"+R.radio[1]/1e3+" SF"+R.radio[2]+" CR4/"+R.radio[3]:"")+"  key "+R.key.slice(0,12)+"  "+R.fw;
  const Mq=st.mqtt||{};
+ const Md=Mq.diagnostics||{}, Ms=Mq.subscriptions||{}, subValues=Object.values(Ms), granted=subValues.filter(x=>x.state==="granted").length,
+  denied=subValues.filter(x=>x.state==="denied").length, pending=subValues.filter(x=>x.state==="pending").length,
+  subStatus=denied?`<span class="poor">subscription denied</span>${Mq.subscription_error?": "+esc(Mq.subscription_error):""}`:
+   pending?`<span class="mid">subscription awaiting broker acknowledgement</span>`:
+   granted?`<span class="good">subscription granted</span>`:`<span class="mid">no topic subscription configured</span>`;
  $("rmqtt").innerHTML=Mq.enabled?`<span class="dim">MQTT ingestion</span> <span class="mqdot ${Mq.connected?"on":"off"}" title="${esc(Mq.connected?"connected":(Mq.error||"connecting..."))}"></span> ${esc(Mq.host||"")} <span class="dim small">pps: ${Mq.pps} (${Mq.rel_pps} relevant)</span>`
    :'<span class="dim">MQTT ingestion off</span>';
  if(ADMIN){$("mq_en").checked=!!Mq.enabled;$("mq_ack").checked=!!Mq.ack_ingest;$("mq_msg").checked=!!Mq.msg_ingest;
   $("mq_topo").checked=!!Mq.topo_ingest;$("mq_adv").checked=!!Mq.advert_ingest;$("mq_act").checked=!!Mq.activity;
   $("mq_ack").disabled=$("mq_msg").disabled=$("mq_topo").disabled=$("mq_adv").disabled=$("mq_act").disabled=!Mq.enabled;
   $("mqch").textContent=(Mq.channels||[]).length?" · channels watched: "+Mq.channels.join(", "):"";
-  $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
+  $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; ${subStatus} &middot; MQTT packets received: ${Md.received||0}; accepted: ${Md.accepted||0} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
    :`<span class="poor">not connected</span> ${esc(Mq.error||"(connecting...)")}`):"off"}
  const Rp=st.repeater||{};
  $("rrpt").innerHTML=Rp.enabled?`<span class="dim">Repeater</span> ${esc(Rp.name)} <span class="dim small">${esc(Rp.id||"")}</span> `+
