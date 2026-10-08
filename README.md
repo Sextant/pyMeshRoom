@@ -188,6 +188,24 @@ Some GoMesh installations may permit a public topic filter; others require a bro
 
 The password is write-only: it is saved in the owner-protected local configuration and is never returned by the dashboard/API or shown after it is saved. Keep the configuration file mode at `0600`. The project does not ship GoMesh credentials.
 
+### MQTT Augmentation admin form reference
+
+All fields below are for **inbound** MQTT augmentation. They do not change the outbound Observer card, the Room identity, RF routing, or the KISS modem settings. Start with the broker operator's values; the defaults are an example GoMesh-compatible WebSocket endpoint, not a promise of anonymous access in every region.
+
+| Admin field | What to enter | Safe starting value / notes |
+| --- | --- | --- |
+| MQTT augmentation | Enable only after the connection settings are saved. | Off by default. Turning it off stops only inbound MQTT. |
+| Broker host | Broker DNS name or IP address, without `mqtt://` or `wss://`. | `mqtt.gomesh.dev` for the GoMesh example. |
+| Port | The broker's MQTT or MQTT-over-WebSocket port. | `443` for TLS WebSockets; use the operator's value otherwise. |
+| Transport | `WebSockets` or `TCP`. | `WebSockets` for the GoMesh example. |
+| WebSocket path | The path supplied by the broker operator. | `/mqtt` for the GoMesh example. It is unused with TCP. |
+| TLS / Verify TLS certificate | Enable TLS when the broker supports it; leave certificate verification enabled for a public broker. | Both enabled for the GoMesh example. Disable verification only for a deliberately trusted private/self-signed deployment. |
+| Topic filter(s) | One or more MQTT subscription filters, separated with commas. | Use the operator-approved filter. `meshcore/#` is only a broad example; a region such as `SJC` is not portable to another installation. |
+| Subscriber username / password | The read-only credentials issued by the broker operator. Enter both fields together. | They are write-only and never appear in the status API or after page reload. |
+| ACK, Message, Topology, Advert, Activity ingestion | Choose which accepted MQTT packets can augment local room state. | All are enabled by default when MQTT augmentation is enabled. Disable a category if it is not useful to your deployment. |
+
+After saving broker/topic fields or credentials, the inbound client reconnects automatically. Do not judge success only by the word **connected**: look for **subscription granted** and nonzero MQTT packets received over time. **Subscription denied** means the broker rejected the exact requested topic filter; verify the filter or obtain credentials.
+
 `observer_enabled` copies locally received RF packets to GoMesh and/or MeshMapper. It uses the modem-backed Room identity for signing; the Room private key never leaves the modem. Its `observer_queue_max` limits asynchronous outgoing observations. MQTT ingestion has its own `mqtt_queue_max` ingress limit, default 1000. If it is full, the newest remote event is ignored rather than evicting an already accepted older ACK or direct packet; FIFO delivery-state ordering is safer than keeping a fresher topology update.
 
 ## Optional Virtual Repeater
