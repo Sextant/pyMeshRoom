@@ -205,6 +205,17 @@ If a `meshroom.service` already exists, the installer deliberately refuses to re
 
 It **never overwrites** an existing `meshroom/meshroom.json`. The new configuration starts RF-first: MQTT Observer, MQTT Augmentation, Virtual Repeater, and repeater relaying are disabled.
 
+### Updating an existing installation
+
+Run the updater from the same checkout used for the installation:
+
+```bash
+cd /path/to/pyMeshRoom
+./scripts/update-pymeshroom.sh --restart
+```
+
+It fetches and fast-forwards `main`, refreshes the core Python dependencies, validates the private configuration, runs the tests, and then restarts `meshroom.service` only because `--restart` was requested. It never reclones over the checkout and never overwrites the private configuration or room database. It refuses to proceed when tracked project files have local edits or local commits that are not contained in `origin/main`; resolve those first. Use `--config NAME` for a non-default configuration filename or `--skip-tests` only when you deliberately need to skip the test run.
+
 ### Option 2 — Manual / DIY installation
 
 Use these steps if you prefer to create and verify every component yourself before touching the modem:
