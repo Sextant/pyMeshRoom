@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" role="img" aria-labelledby="title desc">
+  <title id="title">GoMesh inbound MQTT authorization flow</title>
+  <desc id="desc">A room server connects to GoMesh, requests a topic subscription, and only processes packets after the broker grants its subscription acknowledgement.</desc>
+  <style>
+    .bg{fill:#111418}.card{fill:#1a1f26;stroke:#2a313b;stroke-width:2}.accent{fill:#5cb3ff}.ok{fill:#4caf7a}.warn{fill:#e0a83e}.bad{fill:#e05a5a}.t{font-family:system-ui,sans-serif;fill:#d8dee6}.d{font-family:system-ui,sans-serif;fill:#8a94a3}.a{stroke:#5cb3ff;stroke-width:3;fill:none;marker-end:url(#arrow)}
+  </style>
+  <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#5cb3ff"/></marker></defs>
+  <rect class="bg" width="1200" height="430" rx="14"/>
+  <text class="t" x="42" y="55" font-size="27" font-weight="700">Inbound MQTT is optional and authorization is explicit</text>
+  <text class="d" x="42" y="84" font-size="17">A CONNECT response alone does not grant access to packet topics.</text>
+  <rect class="card" x="42" y="130" width="255" height="190" rx="12"/>
+  <text class="accent" x="66" y="172" font-size="20" font-weight="700">RoomServer</text>
+  <text class="t" x="66" y="209" font-size="17">RF room keeps running</text>
+  <text class="d" x="66" y="238" font-size="15">Read-only MQTT client</text>
+  <text class="d" x="66" y="264" font-size="15">Admin enters subscriber</text>
+  <text class="d" x="66" y="286" font-size="15">credentials if required</text>
+  <path class="a" d="M300 219 H447"/>
+  <text class="d" x="325" y="195" font-size="14">CONNECT + SUBSCRIBE</text>
+  <rect class="card" x="450" y="130" width="300" height="190" rx="12"/>
+  <text class="accent" x="475" y="172" font-size="20" font-weight="700">GoMesh broker</text>
+  <text class="t" x="475" y="210" font-size="17">Checks topic authorization</text>
+  <text class="d" x="475" y="240" font-size="15">Public filter or operator-issued</text>
+  <text class="d" x="475" y="264" font-size="15">read-only subscriber account</text>
+  <path class="a" d="M753 219 H895"/>
+  <text class="d" x="780" y="195" font-size="14">SUBACK</text>
+  <rect class="card" x="900" y="112" width="260" height="226" rx="12"/>
+  <circle class="ok" cx="930" cy="159" r="9"/><text class="t" x="951" y="166" font-size="17" font-weight="700">Granted</text>
+  <text class="d" x="951" y="190" font-size="14">Packets may be ingested</text>
+  <circle class="warn" cx="930" cy="230" r="9"/><text class="t" x="951" y="237" font-size="17" font-weight="700">Pending</text>
+  <text class="d" x="951" y="261" font-size="14">Waiting for acknowledgement</text>
+  <circle class="bad" cx="930" cy="301" r="9"/><text class="t" x="951" y="308" font-size="17" font-weight="700">Denied</text>
+  <text class="d" x="951" y="332" font-size="14">Ask operator for access</text>
+  <text class="d" x="42" y="383" font-size="16">No inbound MQTT condition can stop the RF room, alter RF routes, or block KISS modem processing.</text>
+</svg>

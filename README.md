@@ -173,11 +173,40 @@ This is the recommended initial installation. Confirm normal RF room operation b
 
 `mqtt_enabled` activates inbound supplemental observations. It can improve ACK confirmation, activity awareness, advert/map data, and topology awareness, but it never replaces RF routing or makes the Room Server dependent on a broker. Broker loss is reported in dashboard status and the RF room keeps operating.
 
+### GoMesh inbound subscriber access
+
+Inbound MQTT is separate from outbound observer publishing. An observer can publish a modem-signed local-RF observation while inbound MQTT remains unavailable. For inbound access, the RoomServer opens a read-only MQTT/WebSocket connection and requests the configured topic filter. A successful connection is **not** proof that the topic was authorized: the broker must grant the MQTT `SUBACK` response before packets can arrive.
+
+![GoMesh inbound authorization flow](docs/images/gomesh-inbound-authorization.svg)
+
+Some GoMesh installations may permit a public topic filter; others require a broker operator to issue a read-only subscriber username and password or to name an approved topic filter. The MQTT Augmentation admin card has **Subscriber username**, **Subscriber password**, and **Save subscriber credentials** controls for this purpose.
+
+1. Obtain the read-only credentials and/or approved topic filter from the broker operator.
+2. Log into the dashboard as an administrator and open **MQTT Augmentation**.
+3. Enter both subscriber fields and select **Save subscriber credentials**. The inbound client reconnects immediately; RF service and outbound observer publishing continue independently.
+4. Check the card status. It reports **subscription granted**, **subscription awaiting broker acknowledgement**, or **subscription denied**. The received and accepted MQTT counts provide the next confirmation that inbound data is flowing.
+
+The password is write-only: it is saved in the owner-protected local configuration and is never returned by the dashboard/API or shown after it is saved. Keep the configuration file mode at `0600`. The project does not ship GoMesh credentials.
+
 `observer_enabled` copies locally received RF packets to GoMesh and/or MeshMapper. It uses the modem-backed Room identity for signing; the Room private key never leaves the modem. Its `observer_queue_max` limits asynchronous outgoing observations. MQTT ingestion has its own `mqtt_queue_max` ingress limit, default 1000. If it is full, the newest remote event is ignored rather than evicting an already accepted older ACK or direct packet; FIFO delivery-state ordering is safer than keeping a fresher topology update.
 
 ## Optional Virtual Repeater
 
 `repeater_enabled` creates a second logical MeshCore identity using the existing RoomServer KISS reader/writer and TX scheduler. It does not open a second serial connection. On first enable, a random repeater key is generated and saved only to the private local configuration; use `chmod 600` on that file.
+
+![Virtual repeater key lifecycle](docs/images/virtual-repeater-key-lifecycle.svg)
+
+### Default key or imported vanity key
+
+If `repeater_key` is empty, enabling the Virtual Repeater creates a cryptographically random 32-byte private seed, derives its public key, and saves the private seed in the local `meshroom.json`. This is the default identity; it is separate from the Room identity, and it is stable across restarts because it is saved after creation.
+
+If you already generated a matching private key for a vanity public key elsewhere, import it through the **Virtual Repeater** admin card:
+
+1. Disable the Virtual Repeater first. Key replacement is deliberately rejected while it is running.
+2. Paste the private material into **Import private key** and select **Import key**. The accepted form is 64 hexadecimal characters (a 32-byte seed) or 128 hexadecimal characters (a 64-byte private-key representation).
+3. The dashboard validates the material, saves it locally, clears the browser input, and leaves the repeater disabled. Review the derived public identity after re-enabling it.
+
+The RoomServer does not search for vanity keys and never exports a private key through the dashboard or status API. Preserve an encrypted offline backup of the private configuration before replacing a key. `repeater_relay` remains a separate relay kill switch: a repeater may advertise while forwarding is off.
 
 `repeater_relay` is an independent immediate relay kill switch. When false, the repeater may advertise but relays no packets. Configure its name, coordinates, scoped regions, advert intervals, airtime cap, and loop-detection mode through the admin dashboard. Keep it disabled until RF validation is explicitly planned.
 
@@ -203,4 +232,4 @@ The optional outbound MQTT observer additionally requires:
 
 * `paho-mqtt` (tested here with version 2.1.0) for signed publishing to GoMesh and MeshMapper.
 
-The optional inbound MQTT ingestion uses only Python's standard library for MQTT, TLS, and WebSockets; it does **not** require an additional MQTT package.  It needs network access to the configured broker (the default is `mqtt.gomesh.dev:443` with TLS WebSockets).  Credentials, if the broker requires them, are configured with `mqtt_username` and `mqtt_password`.
+The optional inbound MQTT ingestion uses only Python's standard library for MQTT, TLS, and WebSockets; it does **not** require an additional MQTT package. It needs network access to the configured broker (the default is `mqtt.gomesh.dev:443` with TLS WebSockets). If the broker requires read-only subscriber authorization, configure it through the admin controls or the private `mqtt_username` and `mqtt_password` settings. The dashboard’s `SUBACK` status—not merely “connected”—confirms whether the broker accepted the topic filter.
