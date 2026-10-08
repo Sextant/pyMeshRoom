@@ -178,40 +178,40 @@ Install
 * A stable storage directory for the SQLite room database.
 * Optional internet access only if you enable MQTT features or host the dashboard remotely. RF Room Server and Virtual Repeater functions do not require internet.
 
-Create a virtual environment and install the core packages:
+## Installation
+
+You can install pyMeshRoom in either of two ways:
+
+1. **Installer script (recommended):** creates the Python environment, installs dependencies, creates a protected configuration, validates it, and runs tests.
+2. **Manual / DIY installation:** use this if you want to perform each setup step yourself.
+
+Both paths require Git and Python 3 with virtual-environment support. A KISS-capable MeshCore modem is needed only when you are ready to operate an RF room.
+
+### Option 1 — Installer script (recommended)
+
+Clone the repository, enter it, then run the installer:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pyserial cryptography
-```
-
-Add `paho-mqtt` only when enabling the outbound MQTT observer:
-
-```bash
-.venv/bin/python -m pip install --upgrade paho-mqtt
-```
-
-## First configuration
-
-### One-command bootstrap (recommended)
-
-After cloning this branch, use the installer script to create a virtual environment, install the complete Python dependency set, create a protected private configuration if it does not yet exist, make a local data directory, validate JSON, and run the automated tests:
-
-```bash
+git clone https://github.com/Sextant/pyMeshRoom.git pyMeshRoom
+cd pyMeshRoom
 ./scripts/install-pymeshroom.sh
 ```
 
-It **never overwrites** an existing `meshroom/meshroom.json`. The new configuration starts RF-first: MQTT Observer, MQTT Augmentation, Virtual Repeater, and repeater relaying are disabled. Edit its room name, serial device, coordinates, passwords, and dashboard settings before starting a live modem.
-
-For a systemd installation after reviewing the generated configuration, use:
+The installer creates a virtual environment, installs the complete Python dependency set, creates a protected private configuration if it does not yet exist, makes a local data directory, validates JSON, and runs the automated tests.
 
 ```bash
 ./scripts/install-pymeshroom.sh --service
 ```
 
+Run that second command only after reviewing the generated configuration and only when you want this checkout installed as the systemd service.
+
 If a `meshroom.service` already exists, the installer deliberately refuses to replace it. Review the existing deployment and use `--service --replace-service` only when you explicitly want this checkout to become the systemd service. Run `./scripts/install-pymeshroom.sh --help` for data-directory, config-path, service-user, and test options.
 
-Clone the selected branch, create the private configuration, and verify it before touching the modem:
+It **never overwrites** an existing `meshroom/meshroom.json`. The new configuration starts RF-first: MQTT Observer, MQTT Augmentation, Virtual Repeater, and repeater relaying are disabled.
+
+### Option 2 — Manual / DIY installation
+
+Use these steps if you prefer to create and verify every component yourself before touching the modem:
 
 ```bash
 git clone https://github.com/Sextant/pyMeshRoom.git pyMeshRoom
@@ -223,7 +223,7 @@ chmod 600 meshroom/meshroom.json
 .venv/bin/python -m json.tool meshroom/meshroom.json >/dev/null
 ```
 
-Edit the private `meshroom/meshroom.json` and set the room name, coordinates, serial device, radio parameters, data directory, passwords, and dashboard bind address. Never commit that file: it can contain passwords, MQTT credentials, and a locally generated Virtual Repeater key.
+For either installation path, edit the private `meshroom/meshroom.json` and set the room name, coordinates, serial device, radio parameters, data directory, passwords, and dashboard bind address. Never commit that file: it can contain passwords, MQTT credentials, and a locally generated Virtual Repeater key.
 
 Start with every optional feature disabled:
 
