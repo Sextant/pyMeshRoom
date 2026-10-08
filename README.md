@@ -1,6 +1,6 @@
 # pyMeshRoom
 
-**Platinum Most Excellent MeshCore Py Room**
+aka **Platinum Most Excellent MeshCore Py Room**
 
 MeshCore Room firmware running on basic nodes is too limiting for active, high-traffic rooms. **pyMeshRoom** is an RF-first persistent MeshCore Room Server with optional MQTT augmentation, MQTT observation, and Virtual Repeater capabilities.
 
