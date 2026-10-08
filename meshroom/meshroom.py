@@ -55,7 +55,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 4.7"
+FIRMWARE_VERSION = "meshroom-py 4.8"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -135,6 +135,18 @@ DEFAULT_CONFIG = {
     "observer_meshmapper": True,
     "observer_queue_max": 1000,
     "log_level": "INFO",
+    "repeater_enabled": False,      # virtual repeater: a second identity on the room's radio that relays like a repeater
+    "repeater_relay": True,         #   relay packets (False = kill switch: still advertises, relays nothing)
+    "repeater_name": "meshroom rpt",
+    "repeater_key": "",             #   private key, hex: 32-byte seed or 64-byte MeshCore key ("" = make one, saved here)
+    "repeater_lat": 0.0,            #   its advertised position (0, 0 = the room's), e.g. a little apart so map icons
+    "repeater_lon": 0.0,            #   don't sit on top of each other
+    "repeater_advert_interval_min": 60,       # zero-hop advert (0 = off)
+    "repeater_flood_advert_interval_h": 12,   # flood advert (0 = off)
+    "repeater_scope_mode": "allow", #   scoped (region) floods: "allow" = relay only these regions, "deny" = all but these
+    "repeater_regions": [],         #   region names ("#name" or "name"); unscoped floods are always relayed
+    "repeater_airtime_pct": 10,     #   relays may use at most this share of airtime (100 = no cap)
+    "repeater_loop_detect": "minimal",        # off / minimal / moderate / strict (the firmware's loop.detect)
 }
 
 
@@ -375,6 +387,86 @@ class ModemIdentity:
         return bytes(r[:32])
 
 
+# Ed25519 signing from an expanded key [scalar || prefix], as MeshCore stores private keys (orlp ed25519). The
+# cryptography package only signs from a 32-byte seed, and a firmware key can't be turned back into one.
+_ED_D = -121665 * pow(121666, _P - 2, _P) % _P
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+
+
+def _ed_add(p, q):
+    a = (p[1] - p[0]) * (q[1] - q[0]) % _P
+    b = (p[1] + p[0]) * (q[1] + q[0]) % _P
+    c = 2 * p[3] * q[3] * _ED_D % _P
+    d = 2 * p[2] * q[2] % _P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _ed_mul(s, p):
+    q = (0, 1, 1, 0)
+    while s:
+        if s & 1:
+            q = _ed_add(q, p)
+        p = _ed_add(p, p)
+        s >>= 1
+    return q
+
+
+def _ed_encode(p):
+    zi = pow(p[2], _P - 2, _P)
+    x, y = p[0] * zi % _P, p[1] * zi % _P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_base():
+    y = 4 * pow(5, _P - 2, _P) % _P
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _P - 2, _P) % _P
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P:
+        x = x * pow(2, (_P - 1) // 4, _P) % _P
+    if x & 1:
+        x = _P - x
+    return (x, y, 1, x * y % _P)
+
+
+_ED_B = _ed_base()
+
+
+class RepeaterIdentity:
+    """The virtual repeater's own key, from the config: a 32-byte seed or a 64-byte MeshCore private key."""
+
+    def __init__(self, key):
+        if len(key) == 32:
+            h = bytearray(hashlib.sha512(key).digest())
+            h[0] &= 248; h[31] &= 127; h[31] |= 64
+            key = bytes(h)
+        if len(key) != 64:
+            raise ValueError("repeater_key must be 32 or 64 bytes of hex")
+        self._a = int.from_bytes(key[:32], "little") & ((1 << 255) - 1)
+        self._prefix = key[32:]
+        self.pub_key = _ed_encode(_ed_mul(self._a, _ED_B))
+
+    def sign(self, msg):
+        r = int.from_bytes(hashlib.sha512(self._prefix + msg).digest(), "little") % _ED_L
+        big_r = _ed_encode(_ed_mul(r, _ED_B))
+        h = int.from_bytes(hashlib.sha512(big_r + self.pub_key + msg).digest(), "little") % _ED_L
+        return big_r + ((r + h * self._a) % _ED_L).to_bytes(32, "little")
+
+
+def transport_key(region):
+    """MeshCore auto (hashtag) region key: SHA-256 of "#name", first 16 bytes (TransportKeyStore::getAutoKeyFor;
+    RegionMap treats a plain name as "#name"). "$" private regions need a key store, which the firmware lacks too."""
+    name = region if region.startswith("#") else "#" + region
+    return hashlib.sha256(name.encode()).digest()[:16]
+
+
+def transport_code(key, pkt):
+    """TransportKey::calcTransportCode: HMAC-SHA256(key, type || payload), first 2 bytes little-endian;
+    0000 and FFFF are reserved."""
+    code = struct.unpack("<H", hmac.new(key, bytes([pkt.ptype]) + pkt.payload, hashlib.sha256).digest()[:2])[0]
+    return 1 if code == 0 else 0xFFFE if code == 0xFFFF else code
+
+
 # ============================================================================
 # Packet
 # ============================================================================
@@ -445,6 +537,12 @@ class Packet:
 
     def raw_length(self):
         return 2 + path_bytes(self.path_len) + len(self.payload) + (4 if self.has_transport else 0)
+
+    def copy(self):
+        p = Packet()
+        p.header, p.transport_codes, p.path_len, p.path, p.payload = self.header, self.transport_codes, self.path_len, self.path, self.payload
+        p.snr, p.rssi, p.raw_len = self.snr, self.rssi, self.raw_len
+        return p
 
 
 # ============================================================================
@@ -732,6 +830,85 @@ class Store:
         db.close()
 
 
+def repeater_changes(body):
+    """Dashboard repeater settings -> {config key: value}, validated. Raises ValueError with a readable message."""
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+
+    def num(j):
+        try:
+            v = float(body[j])
+        except (TypeError, ValueError):
+            raise ValueError("%s: not a number" % j)
+        return int(v) if v == int(v) else v
+    ch = {}
+    for j, k in (("enabled", "repeater_enabled"), ("relay", "repeater_relay")):
+        if j in body:
+            ch[k] = bool(body[j])
+    if "name" in body:
+        name = str(body["name"]).strip()
+        if not name or len(name.encode()) > 31:
+            raise ValueError("name: 1 to 31 bytes")
+        ch["repeater_name"] = name
+    if "scope_mode" in body:
+        if body["scope_mode"] not in ("allow", "deny"):
+            raise ValueError("scope mode: allow or deny")
+        ch["repeater_scope_mode"] = body["scope_mode"]
+    if "regions" in body:
+        regs = body["regions"]
+        if isinstance(regs, str):
+            regs = regs.split(",")
+        regs = [str(r).strip() for r in regs if str(r).strip()]
+        for r in regs:                                      # RegionMap::is_name_char, after an optional leading #
+            if len(r) > 30 or r.startswith("$") or not all(c in "-$#" or "0" <= c <= "9" or c >= "A" for c in r):
+                raise ValueError("region %r: letters, digits and - only (private $ regions aren't supported)" % r)
+        ch["repeater_regions"] = regs
+    if "airtime_cap" in body:
+        v = num("airtime_cap")
+        if not 1 <= v <= 100:
+            raise ValueError("airtime cap: 1 to 100 %")
+        ch["repeater_airtime_pct"] = v
+    if "loop_detect" in body:
+        if body["loop_detect"] not in ("off", "minimal", "moderate", "strict"):
+            raise ValueError("loop detection: off, minimal, moderate or strict")
+        ch["repeater_loop_detect"] = body["loop_detect"]
+    for j, k, hi in (("lat", "repeater_lat", 90), ("lon", "repeater_lon", 180)):
+        if j in body:
+            v = 0.0 if body[j] in ("", None) else float(num(j))   # blank = the room's position
+            if not -hi <= v <= hi:
+                raise ValueError("%s: -%d to %d" % (j, hi, hi))
+            ch[k] = v
+    for j, k, hi in (("advert_min", "repeater_advert_interval_min", 1440), ("flood_advert_h", "repeater_flood_advert_interval_h", 168)):
+        if j in body:
+            v = num(j)
+            if not 0 <= v <= hi:
+                raise ValueError("%s: 0 to %d" % (j, hi))
+            ch[k] = v
+    return ch
+
+
+def make_advert(identity, atype, name, lat, lon):
+    """A signed advert: type, position (only when set), name (cut to fit, never mid-character)."""
+    flags = atype
+    body = b""
+    if lat or lon:
+        flags |= ADV_LATLON_MASK
+        body += struct.pack("<ii", int(lat * 1e6), int(lon * 1e6))
+    name = str(name).encode()[:MAX_ADVERT_DATA_SIZE - 1 - len(body)]
+    while name:
+        try:
+            name.decode()
+            break
+        except UnicodeDecodeError:
+            name = name[:-1]
+    if name:
+        flags |= ADV_NAME_MASK
+    app_data = bytes([flags]) + body + name
+    ts = struct.pack("<I", now_s())
+    sig = identity.sign(identity.pub_key + ts + app_data)
+    return Packet(PT_ADVERT, identity.pub_key + ts + sig + app_data)
+
+
 def resolve_route(text, repeaters):
     """'Seaside (E3C5), 4322, Williams Hill' -> [bytes, ...] (room side first) or raises ValueError.
     repeaters: iterable of (name, id_hex). Tokens: a hex id (1-3 bytes), 'Name (HEX)', or an exact name."""
@@ -965,6 +1142,8 @@ class RoomServer:
         self.map_shape, self.map_version = None, 0
         self.web_clients = (0, 0)         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.observer = None            # attached by main when explicitly enabled
+        self.vr = None                    # VirtualRepeater while repeater_enabled
+        self.consumed = False             # set while handling a packet that turned out to be for the room
         self.feed = None                  # ObserverFeed while MQTT augmentation is on         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.web_port_active = bool(cfg.web_port)
         self.web_last_request = 0.0
@@ -972,6 +1151,7 @@ class RoomServer:
         self.events_q = None              # main event queue (set by main): housekeeping yields to waiting packets
         self.next_web = 0.0
         self.load()
+        self.repeater_apply()
 
     # ------------------------------------------------------------------ persistence
 
@@ -1110,11 +1290,14 @@ class RoomServer:
 
     # ------------------------------------------------------------------ TX queue
 
-    def queue_tx(self, pkt, prio, delay=0.0, deferrable=False):
+    def queue_tx(self, pkt, prio, delay=0.0, deferrable=False, relay=False):
         raw = pkt.encode()
-        self.seen_mark(pkt)
+        if not relay:
+            self.seen_mark(pkt)
+        if self.vr is not None:
+            self.vr.seen_mark(pkt)                          # the virtual repeater never relays what this radio sent
         self.txseq += 1
-        heapq.heappush(self.txq, (time.monotonic() + delay, prio, self.txseq, raw, pkt.ptype, pkt.is_flood, deferrable))
+        heapq.heappush(self.txq, (time.monotonic() + delay, prio, self.txseq, raw, pkt.ptype, pkt.is_flood, deferrable, relay))
 
     def service_tx(self):
         now = time.monotonic()
@@ -1126,10 +1309,12 @@ class RoomServer:
         due = [e for e in self.txq if e[0] <= now and (quiet or not e[6])]
         if not due:
             return
-        best = min(due, key=lambda e: (e[1], e[2]))       # highest priority, then FIFO
+        # the room's own ACKs and replies first, then the virtual repeater's relays, then pushes;
+        # within each, highest priority, then FIFO
+        best = min(due, key=lambda e: (2 if e[6] else 1 if e[7] else 0, e[1], e[2]))
         self.txq.remove(best)
         heapq.heapify(self.txq)
-        _, _, _, raw, ptype, is_flood, _ = best
+        _, _, _, raw, ptype, is_flood, _, _ = best
         self.modem.send_packet(raw)
         at = self.airtime_ms(len(raw))
         self.tx_busy_until = now + at / 1000.0 + 3.0       # cleared early by TxDone
@@ -1192,6 +1377,8 @@ class RoomServer:
         self.queue_tx(pkt, prio, delay, deferrable)
 
     def send_direct(self, pkt, path, path_len, delay=0.0, deferrable=False):
+        if self.vr is not None and path_len & 63:
+            path, path_len = self.vr.strip_first_hops(path, path_len)    # our own repeater is this radio: skip it
         pkt.header = (pkt.header & ~0x03) | ROUTE_DIRECT
         pkt.path_len = path_len
         pkt.path = path[:path_bytes(path_len)]
@@ -1226,25 +1413,7 @@ class RoomServer:
         return Packet(PT_ACK, ack + extra)
 
     def make_advert(self):
-        flags = ADV_TYPE_ROOM
-        body = b""
-        lat, lon = float(self.cfg.lat), float(self.cfg.lon)
-        if lat or lon:
-            flags |= ADV_LATLON_MASK
-            body += struct.pack("<ii", int(lat * 1e6), int(lon * 1e6))
-        name = self.cfg.name.encode()[:MAX_ADVERT_DATA_SIZE - 1 - len(body)]
-        while name:
-            try:
-                name.decode()
-                break
-            except UnicodeDecodeError:
-                name = name[:-1]
-        if name:
-            flags |= ADV_NAME_MASK
-        app_data = bytes([flags]) + body + name
-        ts = struct.pack("<I", now_s())
-        sig = self.id.sign(self.id.pub_key + ts + app_data)
-        return Packet(PT_ADVERT, self.id.pub_key + ts + sig + app_data)
+        return make_advert(self.id, ADV_TYPE_ROOM, self.cfg.name, float(self.cfg.lat), float(self.cfg.lon))
 
     # ------------------------------------------------------------------ dedupe
 
@@ -1276,6 +1445,20 @@ class RoomServer:
         self.last_rx_mono = time.monotonic()
         self.rx_airtime_ms += self.airtime_ms(len(raw))
         self.stats["recv_flood" if pkt.is_flood else "recv_direct"] += 1
+        consumed = self._room_rx(pkt)
+        if self.vr is not None:
+            self.vr.on_rx(pkt, consumed)
+
+    def internal_rx(self, pkt):
+        """A packet the virtual repeater is about to send on its last hop: the room gets it first, internally.
+        True if it was for the room (then it isn't transmitted)."""
+        pkt.snr, pkt.rssi = VIRTUAL_LINK_SNR, 0
+        return self._room_rx(pkt)
+
+    def _room_rx(self, pkt):
+        """The room's own handling of a packet. Returns True if it was for the room (it decrypted as ours, or it is
+        an ACK we were waiting for): the virtual repeater doesn't relay those, as firmware doesn't relay its own."""
+        self.consumed = False
         if pkt.is_flood or (pkt.ptype == PT_ADVERT and pkt.hop_count == 0):
             try:
                 self.observe_flood_path(pkt)                 # repeater map: every flood, duplicates included
@@ -1288,23 +1471,25 @@ class RoomServer:
         if pkt.ptype == PT_TRACE and pkt.is_direct:
             try:
                 self.observe_trace(pkt)                      # free per-hop SNR from other people's traces
-                if not self.trace_reply(pkt):                # our own neighbour trace coming back?
+                if self.trace_reply(pkt):                    # our own neighbour trace coming back?
+                    self.consumed = True
+                else:
                     self.relay_trace(pkt)                    # else take part when a trace names the room as next hop
             except Exception:
                 log.exception("trace")
-            return
+            return self.consumed
         if pkt.is_direct and pkt.hop_count > 0:
-            return                                         # being routed via others: not for us (no forwarding)
+            return False                                   # being routed via others: not for the room itself
         t = pkt.ptype
         if t == PT_ACK:
             if len(pkt.payload) >= 4 and not self.check_dup(pkt):
-                self.process_ack(pkt.payload[:4])
+                self.consumed = self.process_ack(pkt.payload[:4])
         elif t == PT_MULTIPART:
             if len(pkt.payload) >= 5 and (pkt.payload[0] & 0x0F) == PT_ACK:
                 tmp = Packet(PT_ACK, pkt.payload[1:])
                 tmp.header = pkt.header
                 if not self.check_dup(tmp):
-                    self.process_ack(tmp.payload[:4])
+                    self.consumed = self.process_ack(tmp.payload[:4])
         elif t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG):
             self.on_peer_packet(pkt)
         elif t == PT_ANON_REQ:
@@ -1313,6 +1498,7 @@ class RoomServer:
             self.on_advert(pkt)
         elif t == PT_CONTROL and pkt.is_direct and pkt.hop_count == 0:
             self.on_control(pkt)
+        return self.consumed
 
     def on_peer_packet(self, pkt):
         p = pkt.payload
@@ -1326,12 +1512,14 @@ class RoomServer:
                 if data is not None and path_valid(data[0]):
                     k = 1 + path_bytes(data[0])
                     if k < len(data) and (data[k] & 0x0F) == PT_ACK and len(data) >= k + 5:
+                        self.consumed = True
                         self.process_ack(data[k + 1:k + 5])
                         return
         for m in [m for m in self.members.values() if m.pub[0] == p[1]]:
             data = mac_then_decrypt(self.secret_for(m), p[2:])
             if data is None:
                 continue
+            self.consumed = True
             self.heard_from(m)
             if pkt.is_flood:
                 self.observe_member_at(m, pkt.path[:pkt.hash_size] if pkt.hop_count else b"")
@@ -1363,7 +1551,10 @@ class RoomServer:
         known = self.members.get(sender)
         secret = known.secret if known and known.secret else self.id.shared_secret(sender)
         data = mac_then_decrypt(secret, p[1 + PUB_KEY_SIZE:])
-        if data is None or len(data) < 9:
+        if data is None:
+            return
+        self.consumed = True                                # addressed to the room (whatever the password)
+        if len(data) < 9:
             return
         sender_ts, sync_since = struct.unpack_from("<II", data, 0)
         password = data[8:].split(b"\0", 1)[0].decode(errors="replace")
@@ -1887,7 +2078,9 @@ class RoomServer:
         p = pkt.payload
         hdr = PUB_KEY_SIZE + 4 + SIGNATURE_SIZE
         origin = None
-        if pkt.ptype == PT_ADVERT and len(p) > hdr and (p[hdr] & 0x0F) == ADV_TYPE_REPEATER and p[:32] != self.id.pub_key:
+        vr = self.vr.pub if self.vr is not None else None
+        if pkt.ptype == PT_ADVERT and len(p) > hdr and (p[hdr] & 0x0F) == ADV_TYPE_REPEATER and p[:32] != self.id.pub_key \
+                and p[:32] != vr:
             origin = p[:32]                                 # the sending repeater: known exactly
         if sz == 1:
             # 1-byte path entries are ambiguous (a 2-byte repeater relaying a 1-byte packet adds only its
@@ -1901,9 +2094,19 @@ class RoomServer:
         if origin is not None:
             path = origin[:sz] + path
             k += 1
-        if k == 0:
+        elif pkt.ptype == PT_ADVERT and vr is not None and p[:32] == vr:
+            path = vr[:sz] + path                           # our own repeater's advert, relayed back to us
+            k += 1
+        hashes = [path[i * sz:(i + 1) * sz] for i in range(k)]
+        if vr is not None and vr[:sz] in hashes:
+            # our virtual repeater is this radio: what came before it the room heard itself at the time; the
+            # first repeater after it heard this radio directly
+            hashes = hashes[len(hashes) - hashes[::-1].index(vr[:sz]):]
+            if hashes:
+                self._link(b"", hashes[0][:2], None, now_s(), self.thalf())
+        if not hashes:
             return
-        self._observe_hashes([path[i * sz:(i + 1) * sz] for i in range(k)], sz, pkt.snr)
+        self._observe_hashes(hashes, sz, pkt.snr)
 
     # ------------------------------------------------------------------ repeater discovery (zero-hop)
 
@@ -2062,6 +2265,10 @@ class RoomServer:
         fwd.path = pkt.path[:pkt.hop_count] + struct.pack("b", max(-128, min(127, int(round(pkt.snr * 4)))))
         fwd.path_len = pkt.hop_count + 1
         self.stats["traces_relayed"] = self.stats.get("traces_relayed", 0) + 1
+        if self.vr is not None and self.vr.trace_next_is_me(fwd):
+            fwd.snr = VIRTUAL_LINK_SNR                      # next hop is our own repeater, on this radio
+            self.vr.relay_trace(fwd)
+            return
         log.info("relaying trace (hop %d of %d, SNR %.1f)", fwd.path_len, len(route) // es, pkt.snr)
         self.queue_tx(fwd, 5, random.uniform(0.05, 0.4))    # small random delay, like repeaters
 
@@ -2075,15 +2282,19 @@ class RoomServer:
         if es == 1:
             return                                          # 1-byte ids are ambiguous: ignored
         hops = [p[i:i + es][:2] for i in range(9, len(p) - es + 1, es)]   # keyed by 2-byte id like the rest of the map
+        if self.vr is not None:
+            hops = [b"" if h == self.vr.pub[:2] else h for h in hops]     # our own repeater = this radio = the room
         snrs = [struct.unpack("b", bytes([b]))[0] / 4.0 for b in pkt.path[:pkt.hop_count]]
         now = now_s()
         th = self.thalf()
         done = min(len(snrs), len(hops))                    # hops completed so far
         for i in range(1, done):                            # hops[i] received it from hops[i-1] at snrs[i]
-            self._link(hops[i - 1], hops[i], snrs[i], now, th)
+            if hops[i - 1] != hops[i]:
+                self._link(hops[i - 1], hops[i], snrs[i], now, th)
         for h in hops[:done]:
-            self._touch_heard(h, direct=False)
-        if done:                                            # we heard the repeater that forwarded it last
+            if h:
+                self._touch_heard(h, direct=False)
+        if done and hops[done - 1]:                         # we heard the repeater that forwarded it last
             self._link(hops[done - 1], b"", pkt.snr, now, th)
             self._touch_heard(hops[done - 1], direct=True, snr=pkt.snr)
             self.stats["traces"] += 1
@@ -2608,6 +2819,61 @@ class RoomServer:
                     channel_msgs=self.stats["obs_channel"], queue_depth=(f.depth() if f else 0),
                     queue_max=int(self.cfg.mqtt_queue_max), dropped=(f.dropped if f else 0))
 
+    # ------------------------------------------------------------------ virtual repeater
+
+    def repeater_apply(self):
+        """Start, stop or update the virtual repeater from the config (startup and every settings change)."""
+        c = self.cfg
+        if not c.repeater_enabled:
+            if self.vr is not None:
+                self.vr.purge()
+                log.info("virtual repeater off")
+            self.vr = None
+            return
+        if not c.repeater_key:                              # first start: a random identity, saved in the config
+            while True:
+                seed = os.urandom(32)
+                ident = RepeaterIdentity(seed)
+                if ident.pub_key[0] not in (0x00, 0xFF):    # (reserved: firmware won't import such a key)
+                    break
+            c.set("repeater_key", seed.hex())
+            log.info("virtual repeater: new identity %s (key saved in the config)", hexs(ident.pub_key[:8]))
+        try:
+            ident = RepeaterIdentity(bytes.fromhex(str(c.repeater_key)))
+        except ValueError as e:
+            log.error("repeater_key: %s - the virtual repeater stays off until the config has its key", e)
+            if self.vr is not None:
+                self.vr.purge()
+            self.vr = None
+            return
+        if self.vr is None or self.vr.pub != ident.pub_key:
+            self.vr = VirtualRepeater(self, ident)
+            log.info("virtual repeater %r on, id %s, %s", c.repeater_name, hexs(ident.pub_key[:2]),
+                     "relaying" if c.repeater_relay else "not relaying")
+        if not c.repeater_relay:
+            n = self.vr.purge()
+            if n:
+                log.info("virtual repeater: relaying off, %d queued relay(s) dropped", n)
+        lat, lon = self.vr.position()
+        old = self.repeaters.get(self.vr.pub, {})
+        new = dict(name=c.repeater_name, lat=lat if (lat or lon) else None, lon=lon if (lat or lon) else None,
+                   adv_ts=old.get("adv_ts", 0), last_advert=old.get("last_advert", 0))
+        if old and (old.get("name"), old.get("lat"), old.get("lon")) != (new["name"], new["lat"], new["lon"]):
+            self.vr.next_zero_advert = min(self.vr.next_zero_advert, time.monotonic() + 3)   # tell neighbours soon
+            self.next_map = 0.0
+        self.repeaters[self.vr.pub] = new
+        self._rpt_idx = None                                # its name labels paths that go through it
+
+    def vr_state(self):
+        c = self.cfg
+        out = dict(enabled=self.vr is not None, relay=bool(c.repeater_relay), name=c.repeater_name, lat=float(c.repeater_lat or 0), lon=float(c.repeater_lon or 0),
+                   scope_mode=c.repeater_scope_mode, regions=list(c.repeater_regions or []),
+                   airtime_cap=c.repeater_airtime_pct, loop_detect=c.repeater_loop_detect,
+                   advert_min=c.repeater_advert_interval_min, flood_advert_h=c.repeater_flood_advert_interval_h)
+        if self.vr is not None:
+            out.update(self.vr.state(), key=hexs(self.vr.pub), id=hexs(self.vr.pub[:2]))
+        return out
+
     def heard_from(self, m):
         """Any packet we can attribute to m: the 'Last heard' time (saved with the member)."""
         m.last_heard = now_s()
@@ -2979,6 +3245,14 @@ class RoomServer:
         self.names[k8] = (ts, name)
         self.mark_dirty()
 
+    def dashboard_advert(self, flood):
+        """The dashboard's advert buttons: the room's advert, and the virtual repeater's too when it's on."""
+        self.send_advert(flood)
+        if self.vr is not None:
+            self.vr.send_advert(flood)
+        log.info("%s sent from the dashboard%s", "flood advert" if flood else "advert (zero-hop)",
+                 " (room and virtual repeater)" if self.vr is not None else "")
+
     def send_advert(self, flood):
         try:
             pkt = self.make_advert()
@@ -3099,6 +3373,8 @@ class RoomServer:
         if self.cfg.flood_advert_interval_h and now >= self.next_flood_advert:
             self.send_advert(True)
             self.next_flood_advert = now + self.cfg.flood_advert_interval_h * 3600
+        if self.vr is not None:
+            self.vr.periodic()
         if self.cfg.discovery_interval_min and now >= self.next_discovery:
             if not self.disc_due_since:
                 self.disc_due_since = now
@@ -3387,7 +3663,7 @@ class RoomServer:
                 uptime=0, last_rx=0, last_error="", brokers={
                     "gomesh": dict(enabled=bool(self.cfg.observer_gomesh), connected=False, last_publish=0, last_error=""),
                     "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}),
-            mqtt=self.mqtt_state())
+            mqtt=self.mqtt_state(), repeater=self.vr_state())
 
     def member_inroutes(self, m, n=5):
         """Other paths the member's floods took to reach us (member side first), most seen first, excluding the current."""
@@ -3421,7 +3697,13 @@ class RoomServer:
                 out_last=st["out_last"], out_avg=None if st["out_avg"] is None else round(st["out_avg"], 1),
                 rtt=None if st["rtt"] is None else int(st["rtt"]), last_ok=st["last_ok"])))
         rows.sort(key=lambda r: r[0])
-        return [r[1] for r in rows[:n]]
+        out = [r[1] for r in rows[:n]]
+        if self.vr is not None:                             # our own repeater: the same radio, a perfect link
+            snr = VIRTUAL_LINK_SNR
+            out.insert(0, dict(name="%s (virtual)" % self.rpt_label(self.vr.pub[:2]), hash=hexs(self.vr.pub[:2]), loss=0.0,
+                               traces=0, few=False, in_last=snr, in_avg=snr, out_last=snr, out_avg=snr, rtt=None,
+                               last_ok=now_s(), virtual=True))
+        return out
 
     @staticmethod
     def path_hex(plen, path):
@@ -3451,6 +3733,333 @@ class RoomServer:
 
 
 # ============================================================================
+# Virtual repeater: a second identity on the room's radio, relaying like MeshCore's simple_repeater
+# ============================================================================
+
+VIRTUAL_LINK_SNR = 12.0               # room <-> its own repeater: the same radio, reported as a perfect link
+RPT_FLOOD_MAX = 64                    # firmware flood.max / flood.max.unscoped
+RPT_FLOOD_MAX_ADVERT = 8              # firmware flood.max.advert
+RPT_TX_DELAY_FACTOR = 0.5             # firmware tx_delay_factor (floods)
+RPT_DIRECT_TX_DELAY_FACTOR = 0.3      # firmware direct_tx_delay_factor
+RPT_MAX_QUEUED = 16                   # relays waiting to go out at once (the firmware's packet pool is 32)
+RPT_LOOP_MAX = {"minimal": {1: 4, 2: 2, 3: 1}, "moderate": {1: 2, 2: 1, 3: 1}, "strict": {1: 1, 2: 1, 3: 1}}
+
+
+class VirtualRepeater:
+    """A light repeater sharing the room's radio, with its own key. It follows the firmware's relay rules
+    (Mesh.cpp onRecvPacket / routeRecvPacket, simple_repeater MyMesh.cpp allowPacketForward, onControlDataRecv) with
+    its own duplicate table. No logins or remote management. Room <-> repeater traffic never goes on the air: the
+    repeater doesn't relay the room's transmissions or packets for the room, hands the room anything it would
+    forward to it on a last hop, and the room skips it at the start of its own direct routes."""
+
+    def __init__(self, room, ident):
+        self.room, self.id, self.pub = room, ident, ident.pub_key
+        self.seen = {}                                      # packet hash -> None (insertion ordered)
+        self.stats = dict(flood=0, direct=0, acks=0, traces=0, discovery=0, internal=0, adverts=0, dups=0,
+                          drop_scope=0, drop_hops=0, drop_loop=0, drop_airtime=0, drop_queue=0, drop_off=0)
+        self.recent = collections.deque()                   # (monotonic, airtime ms) of each relay, last 10 minutes
+        self.budget_ms, self.budget_t = None, time.monotonic()
+        self.disc_window = [0, 0]                           # discovery answers: window start (s), count
+        self.started = now_s()                              # the firmware's discovery_mod_timestamp
+        self.next_zero_advert = time.monotonic() + 8
+        self.next_flood_advert = time.monotonic() + 20
+        self._region_cache = (None, [])
+
+    cfg = property(lambda s: s.room.cfg)
+
+    # ---------------------------------------------------------------- duplicates
+
+    def was_seen(self, pkt):
+        return pkt.packet_hash() in self.seen
+
+    def seen_mark(self, pkt):
+        self.seen[pkt.packet_hash()] = None
+        while len(self.seen) > 512:
+            self.seen.pop(next(iter(self.seen)))
+
+    # ---------------------------------------------------------------- relay policy
+
+    def regions(self):
+        names = tuple(str(r).strip() for r in (self.cfg.repeater_regions or []) if str(r).strip())
+        if self._region_cache[0] != names:
+            self._region_cache = (names, [(n, transport_key(n)) for n in names])
+        return self._region_cache[1]
+
+    def scope_ok(self, pkt):
+        """Unscoped floods are always relayed. A scoped flood carries a code computed from its region's key
+        (RegionMap::findMatch): "allow" relays only listed regions, "deny" everything but them. Code 0 means
+        'send to nowhere' (shares) and FFFF is reserved: never relayed."""
+        if pkt.route_type != ROUTE_TRANSPORT_FLOOD:
+            return True
+        code = pkt.transport_codes[0]
+        if code in (0, 0xFFFF):
+            return False
+        match = any(transport_code(key, pkt) == code for _, key in self.regions())
+        return match if self.cfg.repeater_scope_mode != "deny" else not match
+
+    def looped(self, pkt):
+        """MyMesh::isLooped: this repeater already appears in the path too often (per path id size)."""
+        maxes = RPT_LOOP_MAX.get(str(self.cfg.repeater_loop_detect))
+        if not maxes:
+            return False
+        sz, k = pkt.hash_size, pkt.hop_count
+        mine = self.pub[:sz]
+        n = sum(1 for i in range(k) if pkt.path[i * sz:(i + 1) * sz] == mine)
+        return n >= maxes.get(sz, 1)
+
+    def allow_forward(self, pkt):
+        """MyMesh::allowPacketForward."""
+        if not self.cfg.repeater_relay:
+            self.stats["drop_off"] += 1
+            return False
+        if pkt.is_flood:
+            hops = pkt.hop_count
+            if hops >= RPT_FLOOD_MAX or (pkt.ptype == PT_ADVERT and hops >= RPT_FLOOD_MAX_ADVERT):
+                self.stats["drop_hops"] += 1
+                return False
+            if not self.scope_ok(pkt):
+                self.stats["drop_scope"] += 1
+                return False
+            if self.looped(pkt):
+                self.stats["drop_loop"] += 1
+                return False
+        return True
+
+    def tx_delay(self, pkt, factor):
+        """Firmware getRetransmitDelay / getDirectRetransmitDelay: random 0..5 x (airtime x factor), in seconds."""
+        t = int(self.room.airtime_ms(path_bytes(pkt.path_len) + len(pkt.payload) + 2) * factor)
+        return random.randint(0, 5 * t) / 1000.0
+
+    def airtime_ok(self, airtime):
+        """Relays share an airtime budget: refills at repeater_airtime_pct of the time, holds a minute's worth."""
+        pct = max(0.0, min(100.0, float(self.cfg.repeater_airtime_pct or 0)))
+        if pct >= 100:
+            return True
+        now = time.monotonic()
+        cap = 60000.0 * pct / 100.0
+        if self.budget_ms is None:
+            self.budget_ms = cap
+        self.budget_ms = min(cap, self.budget_ms + (now - self.budget_t) * 1000.0 * pct / 100.0)
+        self.budget_t = now
+        if self.budget_ms < airtime:
+            return False
+        self.budget_ms -= airtime
+        return True
+
+    def transmit(self, fwd, prio, delay, kind):
+        if sum(1 for e in self.room.txq if e[7]) >= RPT_MAX_QUEUED:
+            self.stats["drop_queue"] += 1
+            return False
+        at = self.room.airtime_ms(fwd.raw_length())
+        if not self.airtime_ok(at):
+            self.stats["drop_airtime"] += 1
+            return False
+        self.room.queue_tx(fwd, prio, delay, relay=True)
+        self.stats[kind] += 1
+        now = time.monotonic()
+        self.recent.append((now, at))
+        while self.recent and now - self.recent[0][0] > 600:
+            self.recent.popleft()
+        return True
+
+    def purge(self):
+        """Kill switch: drop every relay still waiting to go out."""
+        n = len(self.room.txq)
+        self.room.txq[:] = [e for e in self.room.txq if not e[7]]
+        heapq.heapify(self.room.txq)
+        return n - len(self.room.txq)
+
+    # ---------------------------------------------------------------- receive
+
+    def on_rx(self, pkt, for_room):
+        try:
+            if pkt.is_flood:
+                self.relay_flood(pkt, for_room)
+            elif pkt.ptype == PT_TRACE:
+                self.relay_trace(pkt)
+            elif pkt.ptype == PT_CONTROL and pkt.payload[:1] and pkt.payload[0] & 0x80:
+                if pkt.hop_count == 0:
+                    self.on_control(pkt)                    # (only zero-hop control packets of this kind)
+            elif pkt.hop_count > 0:
+                self.forward_direct(pkt)
+        except Exception:
+            log.exception("virtual repeater")
+
+    def relay_flood(self, pkt, for_room):
+        p, t = pkt.payload, pkt.ptype
+        if t == PT_ACK:
+            ok = len(p) >= 4
+        elif t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG):
+            ok = len(p) > 2 + CIPHER_MAC_SIZE
+        elif t == PT_ANON_REQ:
+            ok = len(p) > 1 + PUB_KEY_SIZE + 2
+        elif t in (PT_GRP_TXT, PT_GRP_DATA):
+            ok = len(p) > 1 + 2
+        elif t == PT_ADVERT:
+            ok = len(p) >= PUB_KEY_SIZE + 4 + SIGNATURE_SIZE and p[:32] not in (self.pub, self.room.id.pub_key)
+        else:
+            return                                          # traces, multipart, control, raw, unknown: never flooded on
+        if not ok:
+            return
+        if self.was_seen(pkt):
+            self.stats["dups"] += 1
+            return
+        self.seen_mark(pkt)
+        if t == PT_ADVERT and not ed25519_verify(p[:32], p[36:100], p[:36] + p[100:100 + MAX_ADVERT_DATA_SIZE]):
+            return                                          # forged: not relayed
+        if for_room:
+            self.stats["internal"] += 1                     # it was for the room: the destination has it
+            return
+        n, sz = pkt.hop_count, pkt.hash_size
+        if (n + 1) * sz > MAX_PATH_SIZE or n + 1 > 63:     # (the hop count is 6 bits: the firmware's size check
+            self.stats["drop_hops"] += 1                    #  alone lets a 64th 1-byte hop overflow into the id size)
+            return
+        if not self.allow_forward(pkt):
+            return
+        fwd = pkt.copy()
+        fwd.path = pkt.path[:n * sz] + self.pub[:sz]        # append our id at the packet's id size
+        fwd.path_len = (pkt.path_len & ~63) | (n + 1)
+        self.transmit(fwd, n + 1, self.tx_delay(fwd, RPT_TX_DELAY_FACTOR), "flood")   # closer sources first
+
+    def forward_direct(self, pkt):
+        """Direct routing: we are the next hop -> consume our hop and pass it on (Mesh.cpp)."""
+        sz = pkt.hash_size
+        if pkt.path[:sz] != self.pub[:sz] or not self.allow_forward(pkt):
+            return
+        p, t = pkt.payload, pkt.ptype
+        if t == PT_MULTIPART:
+            if len(p) >= 5 and (p[0] & 0x0F) == PT_ACK:     # a multipart ACK: forwarded as a plain ACK
+                tmp = Packet(PT_ACK, p[1:])
+                tmp.header, tmp.path_len, tmp.path = pkt.header, pkt.path_len, pkt.path
+                if not self.was_seen(tmp):
+                    self.seen_mark(tmp)
+                    self.direct_ack(self.consume_hop(tmp), ((p[0] >> 4) + 1) * 0.3)
+            return
+        if self.was_seen(pkt):
+            self.stats["dups"] += 1
+            return
+        self.seen_mark(pkt)
+        fwd = self.consume_hop(pkt)
+        if t == PT_ACK:
+            self.direct_ack(fwd, 0.0)
+            return
+        if fwd.hop_count == 0 and self.room.internal_rx(fwd.copy()):
+            self.stats["internal"] += 1                     # last hop to the room itself
+            return
+        self.transmit(fwd, 0, self.tx_delay(fwd, RPT_DIRECT_TX_DELAY_FACTOR), "direct")
+
+    @staticmethod
+    def consume_hop(pkt):
+        fwd = pkt.copy()
+        sz = pkt.hash_size
+        fwd.path = pkt.path[sz:path_bytes(pkt.path_len)]
+        fwd.path_len = (pkt.path_len & ~63) | (pkt.hop_count - 1)
+        return fwd
+
+    def direct_ack(self, pkt, delay):
+        """Mesh::routeDirectRecvAcks (no extra ACKs: multi_acks 0): a fresh direct ACK on the remaining path."""
+        ack = Packet(PT_ACK, pkt.payload)
+        ack.header = (ack.header & ~0x03) | ROUTE_DIRECT
+        ack.path_len, ack.path = pkt.path_len, pkt.path
+        if ack.hop_count == 0 and self.room.internal_rx(ack.copy()):
+            self.stats["internal"] += 1
+            return
+        self.transmit(ack, 0, delay, "acks")
+
+    def trace_next_is_me(self, pkt):
+        p = pkt.payload
+        if len(p) < 9 or pkt.path_len >= MAX_PATH_SIZE:
+            return False
+        es = 1 << (p[8] & 0x03)
+        off = pkt.path_len * es
+        return off < len(p) - 9 and p[9 + off:9 + off + es] == self.pub[:es]
+
+    def relay_trace(self, pkt):
+        """Mesh.cpp TRACE: if the next entry in its route is us, append the SNR we heard it at and send it on."""
+        if not self.trace_next_is_me(pkt) or not self.allow_forward(pkt) or self.was_seen(pkt):
+            return
+        self.seen_mark(pkt)
+        fwd = pkt.copy()
+        fwd.path = pkt.path[:pkt.path_len] + struct.pack("b", max(-128, min(127, int(pkt.snr * 4))))
+        fwd.path_len = pkt.path_len + 1
+        es = 1 << (pkt.payload[8] & 0x03)
+        off = fwd.path_len * es
+        if pkt.payload[9 + off:9 + off + es] == self.room.id.pub_key[:es] and off < len(pkt.payload) - 9:
+            fwd.snr = VIRTUAL_LINK_SNR                      # next hop is the room itself, on this radio
+            self.stats["internal"] += 1
+            self.room.relay_trace(fwd)
+            return
+        self.transmit(fwd, 5, self.tx_delay(fwd, RPT_DIRECT_TX_DELAY_FACTOR), "traces")
+
+    def on_control(self, pkt):
+        """Answer node discovery (MyMesh::onControlDataRecv): at most 4 answers every 2 minutes, randomised."""
+        p = pkt.payload
+        if (p[0] & 0xF0) != 0x80 or len(p) < 6 or not self.cfg.repeater_relay:
+            return
+        now = now_s()
+        if now < self.disc_window[0] + 120:                 # RateLimiter(4, 120)
+            self.disc_window[1] += 1
+            if self.disc_window[1] > 4:
+                return
+        else:
+            self.disc_window[:] = [now, 1]
+        since = struct.unpack_from("<I", p, 6)[0] if len(p) >= 10 else 0
+        if not (p[1] & (1 << ADV_TYPE_REPEATER)) or self.started < since:
+            return
+        prefix_only = p[0] & 1
+        data = bytes([0x90 | ADV_TYPE_REPEATER]) + struct.pack("b", max(-128, min(127, int(pkt.snr * 4)))) + p[2:6] \
+            + self.pub[:8 if prefix_only else PUB_KEY_SIZE]
+        resp = Packet(PT_CONTROL, data)
+        resp.header = (resp.header & ~0x03) | ROUTE_DIRECT
+        resp.path_len, resp.path = 0, b""
+        self.room.queue_tx(resp, 0, self.tx_delay(resp, RPT_TX_DELAY_FACTOR) * 4, relay=True)
+        self.stats["discovery"] += 1
+
+    # ---------------------------------------------------------------- the room's side
+
+    def strip_first_hops(self, path, path_len):
+        sz, k = (path_len >> 6) + 1, path_len & 63
+        mine = self.pub[:sz]
+        while k and path[:sz] == mine:
+            path, k = path[sz:], k - 1
+        return path, (path_len & ~63) | k
+
+    # ---------------------------------------------------------------- adverts
+
+    def position(self):
+        """Its own position if set, else the room's (if the room has one), else none (0, 0)."""
+        lat, lon = float(self.cfg.repeater_lat or 0), float(self.cfg.repeater_lon or 0)
+        if lat or lon:
+            return lat, lon
+        return float(self.cfg.lat or 0), float(self.cfg.lon or 0)
+
+    def send_advert(self, flood):
+        lat, lon = self.position()
+        pkt = make_advert(self.id, ADV_TYPE_REPEATER, self.cfg.repeater_name, lat, lon)
+        if flood:
+            self.room.send_flood(pkt)
+        else:
+            self.room.send_zero_hop(pkt)
+        self.stats["adverts"] += 1
+        log.info("virtual repeater: sent %s advert", "flood" if flood else "zero-hop")
+
+    def periodic(self):
+        now = time.monotonic()
+        c = self.cfg
+        if c.repeater_advert_interval_min and now >= self.next_zero_advert:
+            self.send_advert(False)
+            self.next_zero_advert = now + float(c.repeater_advert_interval_min) * 60
+        if c.repeater_flood_advert_interval_h and now >= self.next_flood_advert:
+            self.send_advert(True)
+            self.next_flood_advert = now + float(c.repeater_flood_advert_interval_h) * 3600
+
+    def state(self):
+        now = time.monotonic()
+        recent = [x for x in self.recent if now - x[0] <= 600]
+        span = max(60.0, min(600.0, now - self.room.boot))
+        relayed = sum(self.stats[k] for k in ("flood", "direct", "acks", "traces"))
+        return dict(self.stats, relayed=relayed, per_min=round(len(recent) / (span / 60.0), 1),
+                    airtime_used=round(100.0 * sum(x[1] for x in recent) / (span * 1000.0), 1))
 
 # ============================================================================
 # Observer feed (MQTT augmentation): read-only, its own thread, filters before anything reaches the main loop
@@ -3854,7 +4463,10 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .chatlog .msg{padding:3px 0;border-bottom:1px solid #1f262e}.chatlog .when{color:var(--dim);font-size:11px;margin-right:6px}
 .chatlog .who{font-weight:600;margin-right:6px}.chatlog .who.room{color:var(--acc)}
 .chatin{display:flex;gap:8px;align-items:center;margin-top:8px}.chatin input{flex:1;padding:7px 9px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}
-.mqrow{display:flex;gap:14px;align-items:center;margin:6px 0}.mqrow.sub{margin-left:26px}.sw{cursor:pointer}
+.mqrow{display:flex;gap:14px;align-items:center;margin:6px 0}.mqrow.sub{margin-left:26px}
+.rprow{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:8px 0 6px 26px}
+.rprow label{display:flex;gap:6px;align-items:center}
+.rprow input,.rprow select{width:auto;flex:none;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.sw{cursor:pointer}
 .mqrow input{transform:scale(1.2);margin-right:6px}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
 .hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}
@@ -3867,9 +4479,9 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
-#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#mapcard{order:8}#bestcard{order:9}#welcomecard{order:10}#repeaterscard{order:11}#banscard{order:12}
+#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
 </style></head><body>
-<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
+<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
 <div id="hstats" class="hstats"></div></header>
 <div id="suggestbox" class="modal"><div class="mbox wide"><h3 id="sgtitle">Suggest a route</h3>
@@ -3892,7 +4504,24 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_act" onchange="mqSet({activity:this.checked})"> Activity monitor <span class="dim">&mdash; packets from an inactive member resume sync (at most every 15 min)</span><span id="mqch" class="dim small"></span></label></div>
 <div class="mqnote">RF will always be used for fallback and route calculations: what the observers report never changes routes,
 delivery scores or the push pace, and if the broker is unreachable the room carries on exactly as before.</div></div>
-<div class="card" id="advcard" style="display:none"><h2>Room adverts</h2><div class="advrow">
+<div class="card" id="rpcard" style="display:none"><h2>Virtual repeater <span class="hdesc">a second identity on the room's radio that relays for the mesh</span></h2>
+<div class="mqrow"><label class="sw"><input type="checkbox" id="rp_en" onchange="rpSet({enabled:this.checked})"> <b>Virtual repeater</b></label>
+<span id="rpstat" class="dim small"></span></div>
+<div class="mqrow sub"><label class="sw"><input type="checkbox" id="rp_relay" onchange="rpSet({relay:this.checked})"> Relay packets <span class="dim">&mdash; turning this off stops relaying at once (queued relays are dropped); it keeps advertising</span></label></div>
+<div class="rprow"><label>Name <input id="rp_name" maxlength="31" size="16"></label>
+<label>Scoped floods <select id="rp_mode"><option value="allow">relay only these regions</option><option value="deny">relay all except these regions</option></select></label>
+<label><input id="rp_regions" size="24" placeholder="e.g. us-ca, #monterey"></label>
+<span class="dim small">unscoped floods are always relayed</span></div>
+<div class="rprow"><label>Position <input id="rp_lat" size="10" placeholder="room's"> , <input id="rp_lon" size="11" placeholder="room's"></label>
+<span class="dim small">lat, lon in degrees; blank = the room's (set it a little apart so map icons don't overlap)</span></div>
+<div class="rprow"><label>Airtime cap <input id="rp_air" type="number" min="1" max="100" step="1" style="width:4.5em">%</label>
+<label>Loop detection <select id="rp_loop"><option>off</option><option>minimal</option><option>moderate</option><option>strict</option></select></label>
+<label>Adverts every <input id="rp_adv" type="number" min="0" max="1440" style="width:5em"> min</label>
+<label>flood every <input id="rp_fadv" type="number" min="0" max="168" style="width:4.5em"> h</label>
+<button onclick="rpSave()">Save</button><span id="rpmsg" class="small"></span></div>
+<div id="rpcounts" class="dim small" style="margin-left:26px"></div>
+</div>
+<div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the room's, and the virtual repeater's when it's on</span></h2><div class="advrow">
 <div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
 <div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
 <span id="advmsg" class="dim small"></span></div></div>
@@ -3945,12 +4574,18 @@ async function loadChat(reset){if(!ADMIN||CHAT_BUSY)return;CHAT_BUSY=true;
    div.innerHTML=`<span class="when">${new Date(m.ts*1000).toLocaleString()}</span><span class="who ${m.room?"room":""}">${esc(m.who)}</span>${esc(m.text)}`;
    L.appendChild(div);CHAT_TS=Math.max(CHAT_TS,m.ts)});
   if(d.messages.length&&(atBottom||reset))L.scrollTop=L.scrollHeight}catch(e){}CHAT_BUSY=false}
+async function rpSet(o){const r=await fetch("api/repeater",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
+ let m="";if(!r.ok){m="Could not save";try{m=(await r.json()).error||m}catch(e){}}
+ if(r.status===401){m="Your admin session has expired: log in again.";session()}
+ $("rpmsg").className=r.ok?"good small":"poor small";$("rpmsg").textContent=r.ok?"saved":m;delete SIG.rpform;setTimeout(load,400);return r.ok}
+function rpSave(){rpSet({name:$("rp_name").value,lat:$("rp_lat").value.trim(),lon:$("rp_lon").value.trim(),scope_mode:$("rp_mode").value,regions:$("rp_regions").value,
+ airtime_cap:+$("rp_air").value,loop_detect:$("rp_loop").value,advert_min:+$("rp_adv").value,flood_advert_h:+$("rp_fadv").value})}
 async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  if(r.status===401){alert("Your admin session has expired: log in again.");session()}setTimeout(load,400)}
 async function sendAdvert(flood,btn){
  if(flood&&!confirm("Send a flood advert? It is relayed across the whole mesh."))return;
  btn.disabled=true;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({flood})});
- let m=r.ok?(flood?"Flood advert sent":"Advert sent (zero-hop)"):"Could not send";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}
+ let m=r.ok?(flood?"Flood advert sent":"Advert sent (zero-hop)"):"Could not send";try{const d=await r.json();if(!r.ok)m=d.error||m;else if(d.repeater)m+=" (room and repeater)"}catch(e){}
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
  $("advmsg").textContent=m+" · "+new Date().toLocaleTimeString();setTimeout(()=>btn.disabled=false,10000)}
 async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chaterr").textContent="";
@@ -3960,6 +4595,7 @@ async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chat
 async function session(){try{const r=await (await fetch("api/session")).json();ADMIN=r.admin;LOGIN_ON=r.login_enabled}catch(e){}
  const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=ADMIN?"":"none";$("trafficcard").style.display=ADMIN?"":"none";$("welcomecard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);if(ADMIN&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
  $("mqcard").style.display=ADMIN?"":"none";
+ $("rpcard").style.display=ADMIN?"":"none";
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
 function observerState(o,key){
  const d=o||{enabled:false,iata:"SJC",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
@@ -4070,6 +4706,19 @@ async function load(){
   $("mqch").textContent=(Mq.channels||[]).length?" · channels watched: "+Mq.channels.join(", "):"";
   $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
    :`<span class="poor">not connected</span> ${esc(Mq.error||"(connecting...)")}`):"off"}
+ const Rp=st.repeater||{};
+ $("rrpt").innerHTML=Rp.enabled?`<span class="dim">Repeater</span> ${esc(Rp.name)} <span class="dim small">${esc(Rp.id||"")}</span> `+
+   (Rp.relay?`<span class="good">relaying</span> <span class="dim small">${Rp.per_min}/min &middot; ${Rp.airtime_used}% air (cap ${Rp.airtime_cap}%)</span>`:'<span class="mid">not relaying</span>')
+   :'<span class="dim">Repeater off</span>';
+ if(ADMIN){$("rp_en").checked=!!Rp.enabled;$("rp_relay").checked=!!Rp.relay;$("rp_relay").disabled=!Rp.enabled;
+  const f=document.activeElement,typing=f&&f.closest&&f.closest("#rpcard")&&f.tagName!=="BUTTON"&&f.type!=="checkbox";
+  if(!typing&&changed("rpform",[Rp.name,Rp.lat,Rp.lon,Rp.scope_mode,Rp.regions,Rp.airtime_cap,Rp.loop_detect,Rp.advert_min,Rp.flood_advert_h])){
+   $("rp_name").value=Rp.name||"";$("rp_lat").value=Rp.lat||Rp.lon?Rp.lat:"";$("rp_lon").value=Rp.lat||Rp.lon?Rp.lon:"";$("rp_mode").value=Rp.scope_mode||"allow";$("rp_regions").value=(Rp.regions||[]).join(", ");
+   $("rp_air").value=Rp.airtime_cap;$("rp_loop").value=Rp.loop_detect||"minimal";$("rp_adv").value=Rp.advert_min;$("rp_fadv").value=Rp.flood_advert_h}
+  $("rpstat").innerHTML=Rp.enabled?`id ${esc(Rp.id)} &middot; key ${esc((Rp.key||"").slice(0,16))}&hellip;`:"off";
+  $("rpcounts").innerHTML=Rp.enabled?`relayed: ${Rp.flood} flood, ${Rp.direct} direct, ${Rp.acks} ACKs, ${Rp.traces} traces &middot; discovery answers: ${Rp.discovery} &middot; `+
+   `kept internal: ${Rp.internal} &middot; duplicates: ${Rp.dups} &middot; not relayed: ${Rp.drop_scope} scope, ${Rp.drop_hops} hop limit, ${Rp.drop_loop} loop, `+
+   `${Rp.drop_airtime} airtime cap, ${Rp.drop_queue} queue full${Rp.relay?"":`, ${Rp.drop_off} while off`} &middot; adverts: ${Rp.adverts}`:""}
  const Wb=st.web||{};
  $("rweb").innerHTML=`<span class="dim">Web</span> ${Wb.viewers||0} viewer${Wb.viewers==1?"":"s"}${Wb.admins?` <span class="dim small">(${Wb.admins} admin)</span>`:""}`;
  if(st.map_version!==MAPVER)loadMap();                       // the map's shape changed (e.g. a new repeater): fetch now
@@ -4118,7 +4767,7 @@ async function load(){
  const TL=st.top_links||[], sn2=(a,b)=>`${a==null?"-":(a>0?"+":"")+a}<span class="dim"> / ${b==null?"-":(b>0?"+":"")+b}</span>`;
  $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Packet loss</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
   TL.map(r=>{const c=r.loss==null?"dim":r.loss<=5?"good":r.loss<=20?"mid":"poor";
-   return `<tr><td>${esc(r.name)}</td><td>${r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${r.loss.toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
+   return `<tr><td>${esc(r.name)}</td><td>${r.virtual?'<span class="good">0%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${r.loss.toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
    `<td>${sn2(r.in_last,r.in_avg)}</td><td>${sn2(r.out_last,r.out_avg)}</td><td>${r.rtt!=null?r.rtt+" ms":"-"}</td><td>${r.last_ok?ago(r.last_ok)+" ago":"never"}</td></tr>`}).join("")
   :`<tr><td class="dim">no neighbours yet: the room discovers its direct repeaters every ${st.discovery_min||15} minutes</td></tr>`;
  }
@@ -4482,6 +5131,16 @@ class WebUI:
                         return self._send(400, '{"error":"nothing to change"}')
                     events.put(("mqtt_cfg", ch))                    # applied (and saved) by the main loop
                     return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
+                if parts == ["api", "repeater"]:
+                    try:
+                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        ch = repeater_changes(body)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e) or "bad request"}))
+                    if not ch:
+                        return self._send(400, '{"error":"nothing to change"}')
+                    events.put(("rpt_cfg", ch))                     # applied (and saved) by the main loop
+                    return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "advert"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
@@ -4493,7 +5152,8 @@ class WebUI:
                         last_advert[0] = time.monotonic()
                     flood = bool(body.get("flood"))
                     events.put(("advert", flood))                   # sent by the main loop
-                    return self._send(200, json.dumps({"ok": True, "flood": flood}))
+                    rpt = bool((room.web_state.get("repeater") or {}).get("enabled"))
+                    return self._send(200, json.dumps({"ok": True, "flood": flood, "repeater": rpt}))
                 if parts == ["api", "chat"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
@@ -4652,8 +5312,7 @@ def main():
             getattr(room, "force_resync" if kind == "resync" else kind)(ev[1])
             room.web_dirty = True                           # refresh the dashboard once the radio is idle
         elif kind == "advert":
-            room.send_advert(ev[1])
-            log.info("%s sent from the dashboard", "flood advert" if ev[1] else "advert (zero-hop)")
+            room.dashboard_advert(ev[1])
         elif kind == "say":
             room.room_say(ev[1])
         elif kind == "suggest":
@@ -4665,6 +5324,11 @@ def main():
             for k, v in ev[1].items():
                 room.cfg.set(k, v)                          # saved to the config file, in place
             room.mqtt_apply()
+            room.web_dirty = True
+        elif kind == "rpt_cfg":
+            for k, v in ev[1].items():
+                room.cfg.set(k, v)
+            room.repeater_apply()
             room.web_dirty = True
         elif kind == "web_wake":
             room.web_dirty = True
