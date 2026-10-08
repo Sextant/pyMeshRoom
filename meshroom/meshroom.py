@@ -25,6 +25,7 @@ import hashlib
 import heapq
 import hmac
 import collections
+import gzip
 import json
 import logging
 import math
@@ -51,7 +52,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 4.1.1"
+FIRMWARE_VERSION = "meshroom-py 4.5"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -839,7 +840,8 @@ class Member:
         self.fresh = None                 # (plen, path): route reversed from where we just heard them (tried first)
         self.last_heard = 0               # any packet from them: ACKs, keepalives, logins, posts, requests, adverts
         self.suspended_at = 0             # when they were suspended (wall clock)
-        self.push_healthy = False         # the push in flight counts toward the shared pace
+        self.pace_sample = None           # the push in flight counts toward the shared pace: {"p": expected, "ok": ...}
+        self.timed_sample = None          # its sample if it timed out (a late ACK turns it back into a success)
         self.attempts_avg = None          # recency-weighted attempts per delivered post (1.0 = always first try)
         self.deliveries = 0
         self.attempts_cur = 0             # attempts on the post being delivered
@@ -864,8 +866,9 @@ class RoomServer:
         self.last_pushed = None           # member of the most recent push (its ACK ends the gap early)
         self.last_push_at, self.last_push_flood = 0.0, False
         self.pace = cfg.push_pace_start_ms / 1000.0       # seconds between pushes (self-adjusting)
-        self.pace_hist = collections.deque(maxlen=20)      # outcomes of pushes to healthy members
-        self.pace_hold = 0
+        self.pace_hist = collections.deque(maxlen=30)      # samples: {"ok", "p" (route's rate when sent), "who"}
+        self.pace_last_slow = time.monotonic()
+        self.pace_last_ease = time.monotonic()
         self.inpaths = {}                 # member key8 -> {(plen, path): [w, t]}  paths their floods took to reach us
         self.flood_owner = {}             # flood packet hash -> (member pubkey, expiry): attribute duplicate copies
         self.disc_tag, self.disc_until, self.disc_replies = None, 0.0, 0
@@ -929,6 +932,10 @@ class RoomServer:
         self.last_hw_reply = time.monotonic()
         self.push_fail_since = 0.0
         self.web_state = {}
+        self.web_map = {}
+        self.next_map = 0.0
+        self.map_shape, self.map_version = None, 0
+        self.web_clients = (0, 0)         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.observer = None            # attached by main when explicitly enabled
         self.web_port_active = bool(cfg.web_port)
         self.web_last_request = 0.0
@@ -1747,9 +1754,12 @@ class RoomServer:
             self.stats["late_acks" if late is not None else "acks"] += 1
             entry = m.prev_entries[late] if late is not None else m.inflight
             self.attempt_result(m, entry, True, lat_ms)
-            if late is None and m.push_healthy:
-                self.pace_outcome(True)
-            m.push_healthy = False
+            if late is None and m.pace_sample is not None:
+                m.pace_sample["ok"] = True
+                self.pace_outcome(m.pace_sample)
+            elif late is not None and m.timed_sample is not None:
+                m.timed_sample["ok"] = True                 # a late ACK: that "timeout" was delivered after all
+            m.pace_sample = m.timed_sample = None
             if late is None and m.pub == self.last_pushed and self.last_push_flood:
                 self.next_push = min(self.next_push, time.monotonic() + 0.5)   # flood ACK back: the wave is done
             if m.attempts_cur:
@@ -2366,31 +2376,45 @@ class RoomServer:
                 return c[0]["plen"] & 63
         return 0xFF
 
-    def pace_outcome(self, ok):
-        """Shared pace, TCP-style: back off fast when pushes to healthy members start timing out (a busy channel or
-        a saturated repeater), recover slowly while they're delivered. One member's trouble doesn't count."""
-        self.pace_hist.append(ok)
+    def pace_outcome(self, sample):
+        """Shared push pace. Each counted push carries the success rate its route had when it was sent, so the window
+        is judged against what those routes normally deliver: distance alone never looks like congestion. Slow down
+        only when deliveries fall well below that baseline AND the channel is genuinely busy; recover otherwise."""
+        self.pace_hist.append(sample)
         lo, hi = self.cfg.push_pace_min_ms / 1000.0, self.cfg.push_pace_max_ms / 1000.0
-        if self.pace_hold > 0:
-            self.pace_hold -= 1
-            return
-        if len(self.pace_hist) < 10:
-            return
-        loss = 1.0 - sum(self.pace_hist) / float(len(self.pace_hist))
-        if loss > 0.25:
+        n = len(self.pace_hist)
+        if n < 12 or len({x["who"] for x in self.pace_hist}) < 3:
+            return                                          # not enough evidence (and no single member can swing it)
+        delivered = sum(1 for x in self.pace_hist if x["ok"])
+        expected = sum(x["p"] for x in self.pace_hist)
+        busy = self.channel_use(5)
+        if delivered < 0.75 * expected and busy >= 15.0:
             old = self.pace
             self.pace = min(self.pace * 1.5, hi)
-            self.pace_hold = 10
+            self.pace_hist.clear()                          # judge the new pace on fresh evidence
+            self.pace_last_slow = self.pace_last_ease = time.monotonic()
             if self.pace != old:
-                log.info("push pace %.1f s -> %.1f s (%.0f%% of recent pushes to healthy members timed out)", old, self.pace, loss * 100)
-        elif loss < 0.10 and ok and not self.channel_busy():
+                log.info("push pace %.1f s -> %.1f s (delivered %d of %d, routes would normally deliver %.1f; channel use %.0f%%)",
+                         old, self.pace, delivered, n, expected, busy)
+        elif sample["ok"] and delivered >= 0.95 * expected:
             self.pace = max(self.pace - 0.1, lo)
 
-    def channel_busy(self):
-        if not self.minutes:
-            return False
-        x = self.minutes[-1]
-        return (x["tx_ms"] + x["rx_ms"]) / 60000.0 > 0.40
+    def pace_ease(self):
+        """Every 3 minutes without a slowdown, ease 20% back toward the minimum, so the pace can never stick at the top."""
+        now = time.monotonic()
+        lo = self.cfg.push_pace_min_ms / 1000.0
+        if self.pace > lo and now - self.pace_last_slow >= 180 and now - self.pace_last_ease >= 180:
+            old = self.pace
+            self.pace = max(lo, self.pace * 0.8)
+            self.pace_last_ease = now
+            log.info("push pace %.1f s -> %.1f s (no congestion for 3+ min)", old, self.pace)
+
+    def channel_use(self, minutes):
+        """The room's measured channel use (TX + RX airtime), % over the last few minutes."""
+        ms = list(self.minutes)[-minutes:]
+        if not ms:
+            return 0.0
+        return 100.0 * sum(x["tx_ms"] + x["rx_ms"] for x in ms) / (len(ms) * 60000.0)
 
     def flood_gap_done(self, now):
         """After a flooded push, stop waiting once the rebroadcast wave around us has passed: at least 2 s, and the
@@ -2444,9 +2468,11 @@ class RoomServer:
             m.inflight = None
             self.stats["timeouts"] += 1
             self.attempt_result(m, entry, False)
-            if m.push_healthy:
-                self.pace_outcome(False)
-                m.push_healthy = False
+            if m.pace_sample is not None:
+                m.pace_sample["ok"] = False
+                m.timed_sample = m.pace_sample              # kept: a late ACK can still correct it
+                self.pace_outcome(m.pace_sample)
+                m.pace_sample = None
             if m.plan is not None and m.push_failures >= len(m.plan):
                 if m.attempts_cur:                          # undelivered after all of them: a bad sample
                     self.delivery_sample(m, m.attempts_cur + 1)
@@ -2508,8 +2534,10 @@ class RoomServer:
             m.plan, m.plan_retry, m.push_failures = self.build_plan(m, retry=True), True, 0
         entry = m.plan[m.push_failures]
         r_ = entry.get("proven")
-        m.push_healthy = bool(not m.given_up and not m.stuck_since and entry["plen"] is not None and r_ is not None
-                              and r_.rate(now_s(), self.rhalf()) >= 0.7)          # counts toward the shared pace
+        online = now_s() - max(m.last_heard or 0, m.last_activity or 0) < 900
+        first = m.push_failures == 0 and not m.plan_retry
+        m.pace_sample = (dict(ok=None, p=max(0.05, min(0.95, r_.rate(now_s(), self.rhalf()))), who=m.pub[:4])
+                         if (online and first and not m.given_up and entry["plen"] is not None and r_ is not None) else None)
         m.attempts_cur += 1
         data = struct.pack("<I", ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | random.randrange(4)]) \
             + author[:4] + text.encode()
@@ -2578,6 +2606,8 @@ class RoomServer:
                 if la or lo:
                     lat, lon = la / 1e6, lo / 1e6
             old_r = self.repeaters.get(pub, {})
+            if lat is not None and (old_r.get("lat"), old_r.get("lon")) != (lat, lon):
+                self.next_map = 0.0                         # new or moved on the map: rebuild the map part now
             self.repeaters[pub] = dict(name=name or old_r.get("name", ""), lat=lat if lat is not None else old_r.get("lat"),
                                        lon=lon if lon is not None else old_r.get("lon"), adv_ts=ts, last_advert=now_s())
             self._rpt_idx = None                                # names changed: rebuild the lookup index on next use
@@ -2749,6 +2779,7 @@ class RoomServer:
         if now >= self.next_topo_flush:
             self.flush_topology()
             self.next_topo_flush = now + 60
+        self.pace_ease()
         if now >= self.next_sys:
             self.sample_system()
             self.next_sys = now + 5
@@ -2759,7 +2790,10 @@ class RoomServer:
                 and (self.events_q is None or self.events_q.empty()):
             self.publish_web_state()                         # only while a browser is polling, never while packets wait
             self.web_dirty = False
-            self.next_web = now + 3
+            self.next_web = now + 1
+            if now >= self.next_map:
+                self.publish_map()                           # the slow part: every 30 s
+                self.next_map = now + 30
         if now >= self.next_radio_check:
             self.modem.request(0x0B)                        # verify radio settings survived (async)
             self.next_radio_check = now + 300
@@ -2900,6 +2934,60 @@ class RoomServer:
 
     # ------------------------------------------------------------------ dashboard state (read by the web thread)
 
+    def publish_map(self):
+        """The slow-changing part of the dashboard (repeater list, detail panes, map links), rebuilt every 30 s while
+        someone's watching. Only the repeaters actually sent get their routes and neighbour lists computed."""
+        t = now_s()
+        self.build_rpt_index()
+        th = self.thalf()
+        heard_by_x, x_heard_by = {}, {}                     # index the links once: O(links)
+        for (a, b), e in self.edges.items():
+            w = fade(e[0], e[1], t, th)
+            if w < 0.2:
+                continue
+            item = (w, e[2])
+            heard_by_x.setdefault(b, []).append((a,) + item)
+            x_heard_by.setdefault(a, []).append((b,) + item)
+
+        def nlist(items):
+            items = sorted(items, key=lambda x: -x[1])[:8]
+            return [dict(name=self.rpt_label(n) if n else "room", seen=round(w, 1), snr=None if snr is None else round(snr, 1))
+                    for n, w, snr in items]
+
+        def has_pos(h):
+            hit = self.rpt_lookup(h)
+            return bool(hit and hit[1].get("lat") is not None and (hit[1].get("lat") or hit[1].get("lon")))
+        positioned = {h for h in self.heard if has_pos(h)}
+        act = {h: fade(d["w"], d["t"], t, 6 * 3600.0) for h, d in self.heard.items()}
+        shown = sorted(self.heard, key=lambda h: -act[h])[:200]
+        shown += [h for h in positioned if h not in set(shown)]         # everything that can go on the map
+        rpts = []
+        for h in shown:
+            d = self.heard[h]
+            hit = self.rpt_lookup(h)
+            info_pub, info = hit if hit else (None, None)
+            rpts.append(dict(hash=hexs(h), name=(info or {}).get("name") or "", lat=(info or {}).get("lat"), lon=(info or {}).get("lon"),
+                             key=hexs(info_pub) if info_pub else None, last_advert=(info or {}).get("last_advert"),
+                             last=d["last"], last_direct=d["last_direct"], activity=round(act[h], 1),
+                             disc=d.get("disc") or 0, out_snr=None if d.get("out_snr") is None else round(d["out_snr"], 1),
+                             snr=None if d["snr"] is None else round(d["snr"], 1),
+                             routes=[dict(path=self.path_names(rr.plen, rr.path), conf=round(c * 100)) for rr, c in self.top_rpt_routes(h)],
+                             heard=nlist(heard_by_x.get(h, [])), heard_by=nlist(x_heard_by.get(h, []))))
+        rpts.sort(key=lambda r: -r["activity"])
+        if self.cfg.lat or self.cfg.lon:
+            positioned.add(b"")                             # the room, when it has a position
+        edges = [dict(a=hexs(a), b=hexs(b) if b else "", w=round(fade(e[0], e[1], t, th), 1),
+                      snr=None if e[2] is None else round(e[2], 1)) for (a, b), e in self.edges.items()
+                 if a in positioned and b in positioned and fade(e[0], e[1], t, th) >= 0.5]
+        # the map's *shape* (positions + drawable links): its version only changes when the drawing would
+        shape = repr((sorted((r["hash"], r["lat"], r["lon"]) for r in rpts if r["lat"] is not None),
+                      sorted((e["a"], e["b"]) for e in edges), self.cfg.lat, self.cfg.lon))
+        if shape != self.map_shape:
+            self.map_shape = shape
+            self.map_version += 1
+        self.web_map = dict(room=dict(name=self.cfg.name, lat=self.cfg.lat, lon=self.cfg.lon), repeaters=rpts, edges=edges,
+                            time=t, version=self.map_version)
+
     def publish_web_state(self):
         """Build a fresh, self-contained dict; the web thread only ever reads the latest one."""
         t = now_s()
@@ -2926,35 +3014,6 @@ class RoomServer:
                         for r in sorted(m.routes, key=lambda r: -r.rate(t, rh))],
                 near=[dict(rpt=self.rpt_label(k) if k else "direct", hex=hexs(k) if k else "direct", share=round(sh * 100))
                       for k, sh in self.member_locations(m)]))
-        th = self.thalf()
-        heard_by_x, x_heard_by = {}, {}                     # index the links once: O(links)
-        for (a, b), e in self.edges.items():
-            w = fade(e[0], e[1], t, th)
-            if w < 0.2:
-                continue
-            item = (w, e[2])
-            heard_by_x.setdefault(b, []).append((a,) + item)
-            x_heard_by.setdefault(a, []).append((b,) + item)
-
-        def nlist(items):
-            items = sorted(items, key=lambda x: -x[1])[:8]
-            return [dict(name=self.rpt_label(n) if n else "room", seen=round(w, 1), snr=None if snr is None else round(snr, 1))
-                    for n, w, snr in items]
-        rpts = []
-        for h, d in self.heard.items():
-            best, conf = self.best_rpt_route(h)
-            hit = self.rpt_lookup(h)
-            info_pub, info = hit if hit else (None, None)
-            rpts.append(dict(hash=hexs(h), name=(info or {}).get("name") or "", lat=(info or {}).get("lat"), lon=(info or {}).get("lon"),
-                             key=hexs(info_pub) if info_pub else None, last_advert=(info or {}).get("last_advert"),
-                             last=d["last"], last_direct=d["last_direct"], activity=round(fade(d["w"], d["t"], t, 6 * 3600.0), 1),
-                             disc=d.get("disc") or 0, out_snr=None if d.get("out_snr") is None else round(d["out_snr"], 1),
-                             snr=None if d["snr"] is None else round(d["snr"], 1),
-                             routes=[dict(path=self.path_names(rr.plen, rr.path), conf=round(c * 100)) for rr, c in self.top_rpt_routes(h)],
-                             heard=nlist(heard_by_x.get(h, [])), heard_by=nlist(x_heard_by.get(h, []))))
-        rpts.sort(key=lambda r: -r["activity"])
-        edges = [dict(a=hexs(a), b=hexs(b) if b else "", w=round(fade(e[0], e[1], t, th), 1),
-                      snr=None if e[2] is None else round(e[2], 1)) for (a, b), e in self.edges.items() if fade(e[0], e[1], t, th) >= 0.5]
         s = self.stats
         self.web_state = dict(
             room=dict(name=self.cfg.name, key=hexs(self.id.pub_key), lat=self.cfg.lat, lon=self.cfg.lon, fw=FIRMWARE_VERSION,
@@ -2963,9 +3022,9 @@ class RoomServer:
             stats=dict(s, posts_held=sum(1 for p in self.posts if p[3] is None), names_known=len(self.names),
                        tx_queue=len(self.txq)),
             members=sorted(members, key=lambda x: (x["delivery"] is None, -(x["delivery"] or 0), -x["last_activity"])),
-            repeaters=rpts[:200], edges=edges,
             bans=[dict(pub=hexs(k), key=hexs(k[:6]), name=v["name"], ts=v["ts"]) for k, v in sorted(self.bans.items(), key=lambda x: -x[1]["ts"])],
             top_links=self.top_links(), discovery_min=self.cfg.discovery_interval_min, hour=self.hour_stats(),
+            map_version=self.map_version, web=dict(viewers=self.web_clients[0], admins=self.web_clients[1]),
             sys=self.sys_stats(), observer=self.observer.status() if self.observer else dict(
                 enabled=bool(self.cfg.observer_enabled), iata=str(self.cfg.observer_iata).upper(),
                 status=bool(self.cfg.observer_status), packets=bool(self.cfg.observer_packets), rx=bool(self.cfg.observer_rx),
@@ -3094,7 +3153,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
 </style></head><body>
-<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
+<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
 <div id="hstats" class="hstats"></div></header>
 <div id="suggestbox" class="modal"><div class="mbox wide"><h3 id="sgtitle">Suggest a route</h3>
@@ -3242,15 +3301,39 @@ function detail(r){
   `<div class="sec">Best routes from the room</div>${r.routes.length?"<table><tr><th>Route</th><th>Hops</th><th>Conf.</th></tr>"+r.routes.map(x=>`<tr><td>${route(x.path)}</td><td>${x.path.length}</td><td>${x.conf}%</td></tr>`).join("")+"</table>":'<span class="dim">none yet</span>'}`+
   `<div class="sec">Neighbours it has heard</div>${nb(r.heard)}`+
   `<div class="sec">Heard by</div>${nb(r.heard_by)}`}
+let MAPSHAPE=true,DRAWNSEL=undefined;
 function select(hash){SEL=hash;const r=RPTS.find(x=>x.hash===hash);
  $("rdetail").innerHTML=r?detail(r):'<div class="dim pick">Select a repeater from the map</div>';
  document.querySelectorAll("#rpts tr[data-i]").forEach(tr=>tr.classList.toggle("sel",RPTS[+tr.dataset.i]&&RPTS[+tr.dataset.i].hash===SEL));
- if(map&&layer)drawMap(LAST)}
+ if(map&&layer&&(MAPSHAPE||DRAWNSEL!==SEL))drawMap(LAST);
+ DRAWNSEL=SEL;MAPSHAPE=false}
+let MAPSIG="",MAPVER=null,MAPBUSY=false;
+async function loadMap(){
+ if(MAPBUSY)return; MAPBUSY=true;
+ let MP; try{MP=await (await fetch("api/map")).json()}catch(e){MAPBUSY=false;return}
+ MAPBUSY=false;
+ if(!MP.repeaters)return;
+ const shapeChanged=MP.version!==MAPVER; MAPVER=MP.version;
+ const sig=JSON.stringify(MP.repeaters)+JSON.stringify(MP.edges);
+ if(sig===MAPSIG)return;                                     // nothing changed: leave the table, map and panel alone
+ MAPSIG=sig;
+ $("rpts").innerHTML="<tr><th>Repeater</th><th>Activity</th><th>Last seen</th><th>Heard directly</th><th>SNR (direct)</th><th>Position</th><th>Best routes from room</th></tr>"+
+  MP.repeaters.map((r,i)=>`<tr data-i="${i}"><td>${esc(r.name)||'<span class="dim">?</span>'} <span class="dim">${r.hash}</span></td><td>${r.activity}</td><td>${ago(r.last)}</td><td>${r.last_direct?ago(r.last_direct):"-"}</td><td>${r.snr??"-"}</td><td class="small">${r.lat!=null?r.lat.toFixed(4)+", "+r.lon.toFixed(4):'<span class="dim">none sent</span>'}</td><td class="small">${r.routes.length?r.routes.map(x=>route(x.path)+` <span class="dim">${x.conf}%</span>`).join("<br>"):"-"}</td></tr>`).join("");
+ RPTS=MP.repeaters; LAST=MP; MAPSHAPE=shapeChanged;
+ document.querySelectorAll("#rpts tr[data-i]").forEach(tr=>{const r=RPTS[+tr.dataset.i];tr.onclick=()=>select(r.hash)});
+ if(SEL)select(SEL); else if(shapeChanged||!map)drawMap(MP);
+}
+const SIG={};
+function changed(k,v){const j=typeof v==="string"?v:JSON.stringify(v);if(SIG[k]===j)return false;SIG[k]=j;return true}
+const CID=Math.random().toString(36).slice(2,12);           // this tab's id (for the viewer count)
 async function load(){
- let st; try{st=await (await fetch("api/state")).json()}catch(e){return}
+ let st; try{st=await (await fetch("api/state?c="+CID)).json()}catch(e){return}
  if(!st.room)return; const R=st.room,S=st.stats;
  $("rname").textContent=R.name; document.title=R.name+" - meshroom";
  $("rinfo").textContent=(R.radio?(R.radio[0]/1e6).toFixed(3)+" MHz BW"+R.radio[1]/1e3+" SF"+R.radio[2]+" CR4/"+R.radio[3]:"")+"  key "+R.key.slice(0,12)+"  "+R.fw;
+ const Wb=st.web||{};
+ $("rweb").innerHTML=`<span class="dim">Web</span> ${Wb.viewers||0} viewer${Wb.viewers==1?"":"s"}${Wb.admins?` <span class="dim small">(${Wb.admins} admin)</span>`:""}`;
+ if(st.map_version!==MAPVER)loadMap();                       // the map's shape changed (e.g. a new repeater): fetch now
  const Sy=st.sys, lvl=v=>v>=85?"poor":v>=60?"mid":"";
  $("rsys").innerHTML=Sy?`<span class="dim">CPU</span> <span class="${lvl(Sy.cpu)}">${Sy.cpu}%</span> <span class="dim small">(${Sy.window_min>=10?"10m":Sy.window_min+"m"} avg ${Sy.cpu_avg}%)</span> &nbsp; `+
   `<span class="dim">Mem</span> <span class="${lvl(Sy.mem)}">${Sy.mem}%</span> <span class="dim small">(avg ${Sy.mem_avg}% of ${Sy.mem_total_mb} MB)</span>`:"";
@@ -3268,6 +3351,8 @@ async function load(){
  const k=[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks],["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
  $("kpis").innerHTML=k.map(x=>`<div class="kpi"><span class="dim small">${x[0]}</span><b>${esc(x[1])}</b></div>`).join("");
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
+ const memSig=JSON.stringify(st.members)+"|"+ADMIN+"|"+[...EXP].join(",");
+ if(changed("members",memSig)){
  const ACTS=(m,i)=>ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff/suspension, retry now via best routes, then flood${m.outstanding?"":" (nothing outstanding)"}" onclick="event.stopPropagation();resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="event.stopPropagation();openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" onclick="event.stopPropagation();act('api/members/${m.pub}/kick','Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again.')">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" onclick="event.stopPropagation();act('api/members/${m.pub}/ban','Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely.')">${IC("ban")}</button></td>`:"";
  const IDC=(m,caret)=>`<td class="idcell">${caret}<b>${esc(m.name)||'<span class="dim">unknown</span>'}</b><br><span class="dim mono4">${m.key.slice(0,4)}</span><br><span class="small">${m.role}</span></td>`;
  const HX=h=>h==null?'<span class="dim">unknown</span>':h.length?h.join(" &rsaquo; "):"direct";
@@ -3284,25 +3369,24 @@ async function load(){
    <td><span class="tag ${m.push}">${m.push}${m.retry_in?" "+Math.ceil(m.retry_in/60)+"m":""}</span></td>
    <td class="small ${ex?"rcell":""}">${cur}</td><td class="small ${ex?"rcell":""}">${oth||'<span class="dim">-</span>'}</td><td class="small">${near||'<span class="dim">-</span>'}</td></tr>`}).join("")
   :`<tr><td class="dim">no active members</td></tr>`);
- document.querySelectorAll("#members tr.mrow").forEach(tr=>tr.onclick=()=>{const k=tr.dataset.k;EXP.has(k)?EXP.delete(k):EXP.add(k);load()});
+ document.querySelectorAll("#members tr.mrow").forEach(tr=>tr.onclick=()=>{const k=tr.dataset.k;EXP.has(k)?EXP.delete(k):EXP.add(k);SIG.members="";load()});
  $("suspended").innerHTML=sus.length?"<tr>"+(ADMIN?"<th></th>":"")+"<th>ID</th><th>Last heard</th><th>Suspended for</th><th>Posts waiting</th><th>Usually near</th></tr>"+
   sus.map(([m,i])=>`<tr>${ACTS(m,i)}${IDC(m,"")}<td>${ago(m.last_heard)}</td><td>${m.suspended_at?ago(m.suspended_at):"-"}</td><td>${m.outstanding}</td>
    <td class="small">${m.near.slice(0,4).map(n=>`<span class="hexr">${n.hex}</span> <span class="dim">${n.share}%</span>`).join("<br>")||'<span class="dim">-</span>'}</td></tr>`).join("")
   :'<tr><td class="dim">nobody</td></tr>';
+ }
+ if(changed("toplinks",{t:st.top_links,d:st.discovery_min})){
  const TL=st.top_links||[], sn2=(a,b)=>`${a==null?"-":(a>0?"+":"")+a}<span class="dim"> / ${b==null?"-":(b>0?"+":"")+b}</span>`;
  $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Packet loss</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
   TL.map(r=>{const c=r.loss==null?"dim":r.loss<=5?"good":r.loss<=20?"mid":"poor";
    return `<tr><td>${esc(r.name)}</td><td>${r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${r.loss.toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
    `<td>${sn2(r.in_last,r.in_avg)}</td><td>${sn2(r.out_last,r.out_avg)}</td><td>${r.rtt!=null?r.rtt+" ms":"-"}</td><td>${r.last_ok?ago(r.last_ok)+" ago":"never"}</td></tr>`}).join("")
   :`<tr><td class="dim">no neighbours yet: the room discovers its direct repeaters every ${st.discovery_min||15} minutes</td></tr>`;
+ }
  MEMBERS=st.members;
  const bans=st.bans||[];
+ if(changed("bans",{b:bans,a:ADMIN}))
  $("bans").innerHTML=bans.length?"<tr><th>Name</th><th>Key</th><th>Banned</th><th></th></tr>"+bans.map(b=>`<tr><td>${esc(b.name)||'<span class="dim">unknown</span>'}</td><td class="dim">${b.key}</td><td>${ago(b.ts)} ago</td><td>${ADMIN?`<button onclick="act('api/bans/${b.pub}/unban','Unban ${esc(b.name||b.key)}? They will be able to log in again.')">Unban</button>`:""}</td></tr>`).join(""):'<tr><td class="dim">nobody</td></tr>';
- $("rpts").innerHTML="<tr><th>Repeater</th><th>Activity</th><th>Last seen</th><th>Heard directly</th><th>SNR (direct)</th><th>Position</th><th>Best routes from room</th></tr>"+
-  st.repeaters.map((r,i)=>`<tr data-i="${i}"><td>${esc(r.name)||'<span class="dim">?</span>'} <span class="dim">${r.hash}</span></td><td>${r.activity}</td><td>${ago(r.last)}</td><td>${r.last_direct?ago(r.last_direct):"-"}</td><td>${r.snr??"-"}</td><td class="small">${r.lat!=null?r.lat.toFixed(4)+", "+r.lon.toFixed(4):'<span class="dim">none sent</span>'}</td><td class="small">${r.routes.length?r.routes.map(x=>route(x.path)+` <span class="dim">${x.conf}%</span>`).join("<br>"):"-"}</td></tr>`).join("");
- RPTS=st.repeaters; LAST=st;
- document.querySelectorAll("#rpts tr[data-i]").forEach(tr=>{const r=RPTS[+tr.dataset.i];tr.onclick=()=>select(r.hash)});
- if(SEL)select(SEL); else drawMap(st);
 }
 function drawMap(st){
  if(typeof L==="undefined"){$("mapnote").textContent="Map needs internet access (Leaflet / OpenStreetMap). Tables above still work.";return}
@@ -3343,7 +3427,7 @@ $("sgpath").addEventListener("keydown",e=>{const it=acItems();
  else if(e.key==="Enter"){doSuggest()}else if(e.key==="Escape"){closeSuggest()}});
 $("chatmsg").addEventListener("input",chatLeft);$("chatmsg").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});chatLeft();
 setInterval(()=>loadChat(false),3000);
-session().then(load);setInterval(load,5000);setInterval(session,60000);
+session().then(()=>{load();loadMap()});setInterval(load,1000);setInterval(loadMap,30000);setInterval(session,60000);
 </script></body></html>"""
 
 
@@ -3370,18 +3454,56 @@ class WebUI:
         SESSION_S = 12 * 3600
         # web traffic must never compete with the radio side: serialize each snapshot once (in the web
         # threads, not the main loop), cache the history query, and cap concurrent requests
-        cache = {"state_obj": None, "state_bytes": b"{}"}
         clock_ = threading.Lock()
         slots = threading.BoundedSemaphore(16)
         last_advert = [float("-inf")]
 
-        def state_bytes():
-            st = room.web_state                             # the main loop swaps in a new dict; never mutated
+        files = {}                                          # path -> (mtime, raw, gzipped or None)
+        page = (DASHBOARD_HTML.encode(), gzip.compress(DASHBOARD_HTML.encode(), 6))   # the page never changes while running
+        stats_ = {"disk_reads": 0}
+
+        def cached_file(f, compress):
+            """Read + (optionally) gzip a file once, then serve it from RAM; re-read only if it changed on disk."""
+            mt = os.path.getmtime(f)
             with clock_:
-                if cache["state_obj"] is not st:
-                    cache["state_bytes"] = json.dumps(st, default=str).encode()
-                    cache["state_obj"] = st
-                return cache["state_bytes"]
+                hit = files.get(f)
+                if hit and hit[0] == mt:
+                    return hit
+            with open(f, "rb") as fh:
+                raw = fh.read()
+            stats_["disk_reads"] += 1
+            ent = (mt, raw, gzip.compress(raw, 6) if compress else None)
+            with clock_:
+                files[f] = ent
+            return ent
+
+        snaps = {}                                          # name -> (dict object, raw json, gzipped)
+        viewers = {}                                        # client id -> (last seen, admin)
+
+        def note_viewer(qs, admin):
+            cid = ""
+            for kv in qs.split("&"):
+                k, _, v = kv.partition("=")
+                if k == "c":
+                    cid = v[:32]
+            if not cid:
+                return
+            nowm = time.monotonic()
+            with clock_:
+                viewers[cid] = (nowm, admin)
+                for k in [k for k, (ts_, _) in viewers.items() if nowm - ts_ > 15]:
+                    del viewers[k]
+                room.web_clients = (len(viewers), sum(1 for _, a in viewers.values() if a))
+
+        def snap_bytes(name, gz=False):
+            """Encode + compress each snapshot once (the main loop swaps in a new dict; never mutates one)."""
+            st = getattr(room, name)
+            with clock_:
+                hit = snaps.get(name)
+                if hit is None or hit[0] is not st:
+                    raw = json.dumps(st, default=str, separators=(",", ":")).encode()
+                    hit = snaps[name] = (st, raw, gzip.compress(raw, 5))
+                return hit[2] if gz else hit[1]
 
         class H(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -3405,12 +3527,17 @@ class WebUI:
                         return False
                     return True
 
-            def _send(self, code, body, ctype="application/json", cookie=None):
+            def _send(self, code, body, ctype="application/json", cookie=None, gz=False, cache_s=0):
                 b = body if isinstance(body, bytes) else body.encode()
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(b)))
-                self.send_header("Cache-Control", "no-store")
+                if gz:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
+                self.send_header("Cache-Control", "public, max-age=%d" % cache_s if cache_s else "no-store")
+                if code == 503:
+                    self.send_header("Retry-After", "1")
                 if cookie:
                     self.send_header("Set-Cookie", cookie)
                 self.end_headers()
@@ -3420,6 +3547,8 @@ class WebUI:
                     pass                                    # the client hung up (health check, closed tab): nothing to do
 
             def do_GET(self):
+                if self.path.startswith(("/icons/", "/static/")):
+                    return self._get()                      # small, cacheable files: don't count toward the cap
                 if not slots.acquire(blocking=False):
                     return self._send(503, '{"error":"busy"}')    # flood guard: at most 16 requests at once
                 try:
@@ -3446,8 +3575,10 @@ class WebUI:
                     if f.startswith(root + os.sep) and os.path.isfile(f):
                         ctype = {".js": "application/javascript", ".css": "text/css", ".png": "image/png",
                                  ".svg": "image/svg+xml"}.get(os.path.splitext(f)[1], "application/octet-stream")
-                        with open(f, "rb") as fh:
-                            return self._send(200, fh.read(), ctype)
+                        compress = ctype in ("application/javascript", "text/css", "image/svg+xml")
+                        _, raw, gzd = cached_file(f, compress)
+                        gz = gzd is not None and "gzip" in (self.headers.get("Accept-Encoding") or "")
+                        return self._send(200, gzd if gz else raw, ctype, cache_s=86400, gz=gz)
                     if path[8:] in ("leaflet.js", "leaflet.css") or path[8:].startswith("images/"):
                         self.send_response(302)
                         self.send_header("Location", "https://unpkg.com/leaflet@1.9.4/dist/" + path[8:])
@@ -3460,13 +3591,14 @@ class WebUI:
                     if name in ("resync", "suggest", "kick", "ban", "advert", "flood_advert"):
                         f = os.path.join(cfg.data_dir, "icons", name + ".png")
                         if os.path.exists(f):
-                            with open(f, "rb") as fh:
-                                return self._send(200, fh.read(), "image/png")
-                        return self._send(200, BUILTIN_ICONS[name], "image/svg+xml")
+                            return self._send(200, cached_file(f, False)[1], "image/png", cache_s=86400)   # PNG: already compressed
+                        return self._send(200, BUILTIN_ICONS[name], "image/svg+xml", cache_s=86400)
                     return self._send(404, '{"error":"not found"}')
                 if path in ("/", "/index.html"):
-                    return self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+                    gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                    return self._send(200, page[1] if gz else page[0], "text/html; charset=utf-8", gz=gz)
                 if path == "/api/state":
+                    note_viewer(self.path.partition("?")[2], self._is_admin())
                     fresh = time.monotonic() - room.web_last_request > 20
                     room.web_last_request = time.monotonic()        # wakes up the main loop's refreshes
                     if fresh:
@@ -3475,7 +3607,8 @@ class WebUI:
                         deadline = time.monotonic() + 1.5
                         while room.web_state is before and time.monotonic() < deadline:
                             time.sleep(0.02)                        # ...and answer with it, not the stale one
-                    return self._send(200, state_bytes())
+                    gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                    return self._send(200, snap_bytes("web_state", gz), gz=gz)
                 if path == "/api/observer/stats":
                     if not self._is_admin():
                         return self._send(401, '{"error":"log in first"}')
@@ -3484,6 +3617,15 @@ class WebUI:
                     snapshot = room.observer.statistics()
                     snapshot["available"] = True
                     return self._send(200, json.dumps(snapshot))
+                if path == "/api/map":
+                    room.web_last_request = time.monotonic()
+                    if not room.web_map:
+                        events.put(("web_wake",))
+                        deadline = time.monotonic() + 3
+                        while not room.web_map and time.monotonic() < deadline:
+                            time.sleep(0.05)
+                    gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                    return self._send(200, snap_bytes("web_map", gz), gz=gz)
                 if path == "/api/chat":
                     if not self._is_admin():
                         return self._send(401, '{"error":"log in first"}')
@@ -3617,7 +3759,7 @@ class WebUI:
                     try:
                         pub = bytes.fromhex(parts[2])
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
-                        reps = [(r.get("name") or "", r["hash"]) for r in room.web_state.get("repeaters", [])]
+                        reps = [(r.get("name") or "", r["hash"]) for r in (room.web_map or {}).get("repeaters", [])]
                         hops = resolve_route(str(body.get("path", "")), reps)
                     except ValueError as e:
                         return self._send(400, json.dumps({"error": str(e)}))
@@ -3644,6 +3786,7 @@ class WebUI:
                 log.warning("dashboard request from %s failed: %r", client_address[0], exc)
 
         self.server = Server((cfg.web_bind, int(cfg.web_port)), H)
+        self.file_stats = stats_                            # (disk reads of cached files: for checking the cache)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, name="web", daemon=True).start()
         log.info("dashboard on http://%s:%d/", cfg.web_bind, int(cfg.web_port))
@@ -3766,6 +3909,7 @@ def main():
             room.web_dirty = True
         elif kind == "web_wake":
             room.web_dirty = True
+            room.next_map = 0.0                             # first view after idle: the map part too
         elif kind == "observer_config":
             for key, value in ev[1].items():
                 cfg.set(key, value)
