@@ -1,12 +1,25 @@
 import pathlib
 import sys
 import unittest
+from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "meshroom"))
-from meshroom import DEFAULTS, RepeaterIdentity, repeater_changes
+from meshroom import DEFAULTS, Packet, PT_ADVERT, VirtualRepeater, repeater_changes
 
 
 class VirtualRepeaterTests(unittest.TestCase):
+    def relay(self, **overrides):
+        cfg = SimpleNamespace(repeater_relay=True, repeater_airtime_pct=100,
+                              repeater_regions=[], repeater_scope_mode="allow",
+                              repeater_loop_detect="minimal")
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        relay = VirtualRepeater.__new__(VirtualRepeater)
+        relay.room = SimpleNamespace(cfg=cfg)
+        relay.pub = b"R" * 32
+        relay.stats = {"drop_off": 0, "drop_hops": 0, "drop_scope": 0, "drop_loop": 0}
+        relay._region_cache = (None, [])
+        return relay
     def test_repeater_is_disabled_by_default(self):
         self.assertFalse(DEFAULTS["repeater_enabled"])
         self.assertEqual(DEFAULTS["repeater_key"], "")
@@ -32,4 +45,16 @@ class VirtualRepeaterTests(unittest.TestCase):
     def test_admin_changes_reject_invalid_scope(self):
         with self.assertRaises(ValueError):
             repeater_changes({"scope_mode": "everywhere"})
+
+    def test_relay_kill_switch_rejects_forwarding(self):
+        relay = self.relay(repeater_relay=False)
+        self.assertFalse(relay.allow_forward(Packet(PT_ADVERT, b"x" * 100)))
+        self.assertEqual(relay.stats["drop_off"], 1)
+
+    def test_loop_detection_rejects_own_path(self):
+        relay = self.relay()
+        packet = Packet(PT_ADVERT, b"x" * 100)
+        packet.path_len = 1
+        packet.path = b"R"
+        self.assertTrue(relay.looped(packet))
 
