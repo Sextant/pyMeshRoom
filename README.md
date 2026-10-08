@@ -6,6 +6,13 @@ MeshCore Room firmware running on basic nodes is too limiting for active, high-t
 
 > **Runs beyond the Raspberry Pi.** pyMeshRoom can run on any Linux computer that runs Python 3 and provides USB or serial access to a KISS-capable MeshCore modem. A Raspberry Pi is a convenient deployment target, not a requirement. The modem is the RF component; the Linux computer runs the room server.
 
+## Live examples
+
+See pyMeshRoom operating in the wild:
+
+* [MRY MeshRoom](https://mrymeshroom.sploitinum.com/)
+* [Carmel Valley Room](https://meshroom.petenoto.com/)
+
 ## Executive summary
 
 **Build a dependable MeshCore Room on Linux without making the mesh dependent on the internet.** The Pi and KISS modem remain the RF authority; every internet-connected capability is optional, independently switchable, and fails safely.
