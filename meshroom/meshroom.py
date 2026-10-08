@@ -55,7 +55,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 4.6.1"
+FIRMWARE_VERSION = "meshroom-py 4.6.2"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -847,6 +847,7 @@ class Member:
         self.fresh = None                 # (plen, path): route reversed from where we just heard them (tried first)
         self.last_heard = 0               # any packet from them: ACKs, keepalives, logins, posts, requests, adverts
         self.obs_wake_at = -1e9           # last wake from suspension triggered by an observer sighting
+        self.obs_confirmed = None         # a push an observer confirmed first: its RF ACK is still credited (2 min)
         self.suspended_at = 0             # when they were suspended (wall clock)
         self.pace_sample = None           # the push in flight counts toward the shared pace: {"p": expected, "ok": ...}
         self.timed_sample = None          # its sample if it timed out (a late ACK turns it back into a success)
@@ -908,7 +909,7 @@ class RoomServer:
         self.stats = dict(recv=0, sent=0, recv_flood=0, recv_direct=0, sent_flood=0, sent_direct=0,
                           flood_dups=0, direct_dups=0, errors=0, airtime_ms=0, posted=0, pushes=0,
                           acks=0, late_acks=0, timeouts=0, flood_fallbacks=0, deduped=0, traces=0,
-                          obs_acks=0, obs_posts=0, obs_wakes=0)
+                          obs_acks=0, obs_posts=0, obs_wakes=0, delivered=0, rf_after_obs=0)
         self.lat_sum = [0] * 6
         self.lat_cnt = [0] * 6
         self.next_zero_advert = time.monotonic() + 5
@@ -1752,6 +1753,10 @@ class RoomServer:
                         match, late = True, j
                         break
             if not match:
+                oc = m.obs_confirmed
+                if oc and time.monotonic() < oc["until"] and ack in oc["acks"]:
+                    self.rf_after_observer(m, ack)
+                    return True
                 continue
             self.heard_from(m)                              # their ACK: heard from them
             lat_ms = None
@@ -1775,6 +1780,8 @@ class RoomServer:
                 self.delivery_sample(m, m.attempts_cur)
                 m.deliveries += 1
                 m.attempts_cur = 0
+            self.stats["delivered"] += 1
+            m.obs_confirmed = None
             m.pending_ack = None
             m.inflight = None
             m.prev_acks = [None, None]
@@ -2328,6 +2335,15 @@ class RoomServer:
             late = any(a is not None and ack == a for a in m.prev_acks)
             if not (cur or late):
                 continue
+            # keep every attempt of this post: its RF ACK may still arrive, and RF stays the source of route credit
+            acks = {}
+            if m.pending_ack is not None:
+                acks[m.pending_ack] = (m.inflight, True)
+            for j in (0, 1):
+                if m.prev_acks[j] is not None:
+                    acks[m.prev_acks[j]] = (m.prev_entries[j], False)
+            m.obs_confirmed = dict(acks=acks, sent=m.push_sent, hops=m.push_hops, pace=m.pace_sample, timed=m.timed_sample,
+                                   attempts=m.attempts_cur, until=time.monotonic() + 120)
             m.sync_since = max(m.sync_since, m.push_post_ts)
             self.drop_private(m.pub, m.push_post_ts)
             m.pending_ack, m.inflight, m.prev_acks, m.prev_entries = None, None, [None, None], [None, None]
@@ -2335,11 +2351,33 @@ class RoomServer:
             m.push_failures, m.plan, m.plan_retry = 0, None, False
             m.backoff, m.retry_at, m.stuck_since, m.attempts_cur = 0, 0.0, 0.0, 0
             self.stats["obs_acks"] += 1
+            self.stats["delivered"] += 1                    # counted once per push, whichever confirmation came first
             log.info("delivery to %s confirmed by an observer's ACK", self.member_label(m))
             self.observer_wake(m)
             self.mark_dirty()
             return True
         return False
+
+    def rf_after_observer(self, m, ack):
+        """The RF ACK of a push an observer already confirmed: credit it exactly like any RF ACK (route, latency,
+        delivery score, pace, last heard). The delivery itself was already counted."""
+        oc = m.obs_confirmed
+        entry, latest = oc["acks"][ack]
+        self.heard_from(m)
+        lat_ms = int((time.monotonic() - oc["sent"]) * 1000) if latest and oc["sent"] else None
+        self.stats["acks" if latest else "late_acks"] += 1
+        self.stats["rf_after_obs"] += 1
+        self.attempt_result(m, entry, True, lat_ms)
+        if latest and oc["pace"] is not None:
+            oc["pace"]["ok"] = True
+            self.pace_outcome(oc["pace"])
+        elif not latest and oc["timed"] is not None:
+            oc["timed"]["ok"] = True
+        if oc["attempts"]:
+            self.delivery_sample(m, oc["attempts"])
+            m.deliveries += 1
+        m.obs_confirmed = None
+        self.mark_dirty()
 
     def observer_packet(self, raw):
         """A packet addressed to the room (by its first byte) that some observer heard: verified by decrypting with
@@ -2941,12 +2979,14 @@ class RoomServer:
     def record_metric(self):
         """Once a minute: deltas of the counters + noise-floor range, kept in memory for the dashboard header."""
         s = self.stats
-        cur = (s["recv"], s["sent"], s["airtime_ms"], self.rx_airtime_ms, s["pushes"], s["acks"] + s["late_acks"])
+        cur = (s["recv"], s["sent"], s["airtime_ms"], self.rx_airtime_ms, s["pushes"], s["acks"] + s["late_acks"], s["delivered"])
         prev = self.metric_prev or cur
         self.metric_prev = cur
-        rx, tx, tx_ms, rx_ms, pushes, acks = [c - p for c, p in zip(cur, prev)]
+        if len(prev) != len(cur):
+            prev = cur
+        rx, tx, tx_ms, rx_ms, pushes, acks, delivered = [c - p for c, p in zip(cur, prev)]
         self.minutes.append(dict(nf=self.noise_floor, nf_min=self.m_nf_min or self.noise_floor, nf_max=self.m_nf_max or self.noise_floor,
-                                 rx=rx, tx=tx, tx_ms=tx_ms, rx_ms=rx_ms, pushes=pushes, acks=acks))
+                                 rx=rx, tx=tx, tx_ms=tx_ms, rx_ms=rx_ms, pushes=pushes, acks=acks, delivered=delivered))
         self.m_nf_min = self.m_nf_max = 0
 
     def sample_system(self):
@@ -2990,6 +3030,7 @@ class RoomServer:
         n = len(ms)
         nfs = [x["nf"] for x in ms if x["nf"]]
         pushes, acks = sum(x["pushes"] for x in ms), sum(x["acks"] for x in ms)
+        delivered = sum(x.get("delivered", x["acks"]) for x in ms)
         return dict(minutes=n,
                     nf_avg=round(sum(nfs) / len(nfs)) if nfs else None,
                     nf_min=min((x["nf_min"] for x in ms if x["nf_min"]), default=None),
@@ -2997,7 +3038,8 @@ class RoomServer:
                     tx_pct=round(100.0 * sum(x["tx_ms"] for x in ms) / (n * 60000.0), 1),
                     rx_pct=round(100.0 * sum(x["rx_ms"] for x in ms) / (n * 60000.0), 1),
                     rx_pm=round(sum(x["rx"] for x in ms) / n, 1), tx_pm=round(sum(x["tx"] for x in ms) / n, 1),
-                    pushes_pm=round(pushes / n, 1), push_ok=round(100.0 * min(acks, pushes) / pushes) if pushes else None,
+                    pushes_pm=round(pushes / n, 1), push_ok=round(100.0 * min(delivered, pushes) / pushes) if pushes else None,
+                    push_rf=round(100.0 * min(acks, pushes) / pushes) if pushes else None,
                     pace=round(self.pace, 1))
 
     # ------------------------------------------------------------------ labels
@@ -3747,7 +3789,7 @@ async function load(){
   `<span><span class="dim">Channel use</span>TX <b>${Hs.tx_pct}%</b> &middot; RX <b>${Hs.rx_pct}%</b></span>`,
   `<span><span class="dim">Packets / min</span>RX <b>${Hs.rx_pm}</b> &middot; TX <b>${Hs.tx_pm}</b></span>`,
   `<span><span class="dim">Push pace</span><b>${Hs.pace} s</b></span>`,
-  `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_ok!=null?` &middot; <b class="${Hs.push_ok>=80?"good":Hs.push_ok>=50?"mid":"poor"}">${Hs.push_ok}%</b> delivered`:""}</span>`,
+  `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_rf!=null?` &middot; <b class="${Hs.push_rf>=80?"good":Hs.push_rf>=50?"mid":"poor"}">${Hs.push_rf}%</b> delivered${(st.mqtt||{}).enabled?` <span class="dim small">(${Hs.push_ok}% per MQTT)</span>`:""}`:""}</span>`,
   `<span class="dim small">last ${Hs.minutes>=60?"hour":Hs.minutes+" min"}</span>`].join(""):'<span class="dim small">stats appear after the first minute</span>';
  $("rclock").textContent="up "+ago(Date.now()/1000-R.uptime).replace("s"," s")+(R.clock_ok?"":"  CLOCK NOT SYNCED");
  const k=[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks],["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
