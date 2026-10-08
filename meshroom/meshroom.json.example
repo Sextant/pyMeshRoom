@@ -101,7 +101,7 @@
     "_note": "Virtual repeater: a second identity on the room's radio, relaying like MeshCore's simple_repeater. repeater_key \"\" = a new identity is generated and saved here on first start (a 32-byte seed, or paste a 64-byte MeshCore private key; never reuse a key a hardware repeater is still using). Unscoped floods are always relayed; scope mode/regions apply to region-scoped floods ('allow' with no regions = relay no scoped floods, as firmware does by default). repeater_relay false = kill switch: still advertises, relays nothing. All of this can be changed from the dashboard (admin).",
     "repeater_enabled": false,
     "repeater_relay": false,
-    "repeater_name": "MRY TEST RPT",
+    "repeater_name": "PiRoom virtual repeater",
     "repeater_key": "",
     "repeater_advert_interval_min": 60,
     "repeater_flood_advert_interval_h": 12,
