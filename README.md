@@ -3,6 +3,29 @@ MeshCore Room firmware running on basic nodes is too limiting for active high tr
 
 > **The Full Monty branch.** `feature/the-full-monty` is the complete, RF-first edition: Room Server, optional MQTT ingestion, optional MQTT observer publishing, and an optional Virtual Repeater sharing one KISS modem. Internet access is optional. With every optional subsystem disabled, it remains a normal persistent RF-only MeshCore Room Server.
 
+## Executive summary
+
+**Build a dependable MeshCore Room on Linux without making the mesh dependent on the internet.** The Pi and KISS modem remain the RF authority; every internet-connected capability is optional, independently switchable, and fails safely.
+
+![Full Monty admin cards](docs/images/full-monty-admin-cards.svg)
+
+| Capability | What it does | Default |
+| --- | --- | --- |
+| RF Room Server | Persistent room, routing, delivery planning, map, dashboard, and admin tools. | On |
+| MQTT Observer | Publishes copies of locally received RF packets to one or more regional MeshCore observer brokers. | Off |
+| MQTT Augmentation | Read-only inbound MQTT observations can confirm deliveries and enrich map/activity data. | Off |
+| Virtual Repeater | A separate optional repeater identity sharing the room's KISS modem and TX scheduler. | Off |
+
+### The three optional subsystems
+
+**MQTT Observer — outbound.** Add or delete regional standard MeshCore observer servers from the admin card. Each one has its own endpoint, JWT audience, WebSocket path, topic prefix, TLS controls, health state, and traffic counters. A failed observer never blocks RF.
+
+**MQTT Augmentation — inbound.** Configure the regional broker, TLS, topic filters, and read-only credentials in the admin card. The dashboard distinguishes a successful connection from an actually granted MQTT subscription. RF routing remains authoritative.
+
+**Virtual Repeater — RF.** Give the Pi a second MeshCore identity without a second serial connection. It is disabled by default; relaying has its own immediate kill switch. Use a generated key or import a previously created vanity private key while disabled.
+
+Read the installation guide below to build an instance, then enable only the optional components you actually need.
+
 See stats and what repeaters the room is well connected to
 <img width="1553" height="597" alt="image" src="https://github.com/user-attachments/assets/b9add1ee-5f80-4d57-b767-3be9e5889e07" />
 See a member list, with click-to-expand to get more details
