@@ -3914,7 +3914,7 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <label><input id="obs_gomesh" type="checkbox"> GoMesh</label><label><input id="obs_meshmapper" type="checkbox"> MeshMapper</label>
 <label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
 <table id="observerstatus" style="margin-top:10px"></table></div>
-<div class="card" id="trafficcard" style="display:none"><h2>Traffic statistics <span class="hdesc">admin only</span></h2><div id="observertraffic"></div></div>
+<div class="card" id="trafficcard" style="display:none"><div id="observertraffic"></div></div>
 <div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members</span></h2>
 <div class="advrow"><label><input id="welcome_enabled" type="checkbox"> Send welcome DM</label><button onclick="saveWelcome()">Save welcome settings</button><span id="welcomemsg" class="small dim"></span></div>
 <div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
