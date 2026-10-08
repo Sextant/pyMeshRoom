@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Bootstrap an existing feature/the-full-monty checkout on Linux.
+# Bootstrap an existing pyMeshRoom checkout on Linux.
 # It never overwrites an existing configuration or installs a service unless asked.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/install-full-monty.sh [options]
+Usage: ./scripts/install-pymeshroom.sh [options]
 
 Bootstrap this checkout in a Python virtual environment and create a private
 configuration if one does not already exist.

@@ -1,13 +1,14 @@
-# The-Platinum-Most-Excellent-MeshCore-Pi-Room
-MeshCore Room firmware running on basic nodes is too limiting for active high traffic volume Rooms.  Meet the Platinum Most Excellent MeshCore Pi Room (PMEMPR)!
+# pyMeshRoom
 
-> **The Full Monty branch.** `feature/the-full-monty` is the complete, RF-first edition: Room Server, optional MQTT ingestion, optional MQTT observer publishing, and an optional Virtual Repeater sharing one KISS modem. Internet access is optional. With every optional subsystem disabled, it remains a normal persistent RF-only MeshCore Room Server.
+MeshCore Room firmware running on basic nodes is too limiting for active, high-traffic rooms. **pyMeshRoom** is an RF-first persistent MeshCore Room Server with optional MQTT augmentation, MQTT observation, and Virtual Repeater capabilities.
+
+> **Runs beyond the Raspberry Pi.** pyMeshRoom can run on any Linux computer that runs Python 3 and provides USB or serial access to a KISS-capable MeshCore modem. A Raspberry Pi is a convenient deployment target, not a requirement. The modem is the RF component; the Linux computer runs the room server.
 
 ## Executive summary
 
 **Build a dependable MeshCore Room on Linux without making the mesh dependent on the internet.** The Pi and KISS modem remain the RF authority; every internet-connected capability is optional, independently switchable, and fails safely.
 
-![Full Monty admin cards](docs/images/full-monty-admin-cards.svg)
+![pyMeshRoom admin cards](docs/images/pymeshroom-admin-cards.svg)
 
 | Capability | What it does | Default |
 | --- | --- | --- |
@@ -166,7 +167,7 @@ Install
    * Clone again
    * Start meshroom
 
-# Full Monty: build your own instance
+# pyMeshRoom: build your own instance
 
 ## What you need
 
@@ -195,7 +196,7 @@ Add `paho-mqtt` only when enabling the outbound MQTT observer:
 After cloning this branch, use the installer script to create a virtual environment, install the complete Python dependency set, create a protected private configuration if it does not yet exist, make a local data directory, validate JSON, and run the automated tests:
 
 ```bash
-./scripts/install-full-monty.sh
+./scripts/install-pymeshroom.sh
 ```
 
 It **never overwrites** an existing `meshroom/meshroom.json`. The new configuration starts RF-first: MQTT Observer, MQTT Augmentation, Virtual Repeater, and repeater relaying are disabled. Edit its room name, serial device, coordinates, passwords, and dashboard settings before starting a live modem.
@@ -203,16 +204,16 @@ It **never overwrites** an existing `meshroom/meshroom.json`. The new configurat
 For a systemd installation after reviewing the generated configuration, use:
 
 ```bash
-./scripts/install-full-monty.sh --service
+./scripts/install-pymeshroom.sh --service
 ```
 
-If a `meshroom.service` already exists, the installer deliberately refuses to replace it. Review the existing deployment and use `--service --replace-service` only when you explicitly want this checkout to become the systemd service. Run `./scripts/install-full-monty.sh --help` for data-directory, config-path, service-user, and test options.
+If a `meshroom.service` already exists, the installer deliberately refuses to replace it. Review the existing deployment and use `--service --replace-service` only when you explicitly want this checkout to become the systemd service. Run `./scripts/install-pymeshroom.sh --help` for data-directory, config-path, service-user, and test options.
 
 Clone the selected branch, create the private configuration, and verify it before touching the modem:
 
 ```bash
-git clone --branch feature/the-full-monty --single-branch https://github.com/Sextant/The-Platinum-Most-Excellent-MeshCore-Pi-Room-.git meshroom
-cd meshroom
+git clone https://github.com/Sextant/pyMeshRoom.git pyMeshRoom
+cd pyMeshRoom
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pyserial cryptography
 cp meshroom/meshroom.json.example meshroom/meshroom.json
