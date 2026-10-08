@@ -11,8 +11,8 @@
   },
 
   "access": {
-    "_note": "room_password \"\" = open room: anyone can join with a blank password. Use different admin and web passwords.",
-    "admin_password": "changeme",
+    "_note": "room_password \"\" = open room: anyone can join with a blank password. admin_password \"\" disables RF admin access. Set non-empty admin and web passwords before enabling their admin functions.",
+    "admin_password": "",
     "room_password": "",
     "allow_read_only": false
   },
@@ -89,8 +89,8 @@
     "mqtt_ws_path": "/mqtt",
     "mqtt_tls": true,
     "mqtt_tls_verify": true,
-    "mqtt_username": "CHANGE-ME",
-    "mqtt_password": "CHANGE-ME-token",
+    "mqtt_username": "",
+    "mqtt_password": "",
     "mqtt_queue_max": 1000,
     "mqtt_topics": [
       "meshcore/#"
@@ -114,7 +114,7 @@
   "dashboard": {
     "web_port": 8081,
     "web_bind": "0.0.0.0",
-    "web_password": "changeme"
+    "web_password": ""
   },
 
   "observer": {

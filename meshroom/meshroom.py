@@ -68,8 +68,10 @@ DEFAULT_CONFIG = {
     "name": "Pi Room",
     "lat": 0.0,
     "lon": 0.0,
-    "admin_password": "password",
-    "room_password": "hello",
+    # Empty means disabled for admin, and open for the room.  Never give a
+    # newly-created server a known administrator password.
+    "admin_password": "",
+    "room_password": "",
     "allow_read_only": False,
     "data_dir": "./meshroom_data",
     "max_posts": 100,               # posts kept (history depth)
@@ -1669,7 +1671,9 @@ class RoomServer:
                 self.member_active(m, pkt)
                 self.mark_dirty()
         if m is None:
-            if password == self.cfg.admin_password:
+            # An empty admin password disables RF admin access; without this
+            # guard, a blank login would accidentally become an admin login.
+            if self.cfg.admin_password and password == self.cfg.admin_password:
                 perm = PERM_ADMIN
             elif password == self.cfg.room_password:
                 perm = PERM_READ_WRITE

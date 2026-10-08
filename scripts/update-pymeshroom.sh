@@ -73,6 +73,13 @@ echo "Refreshing core Python dependencies"
 if [[ -e "$CONFIG" ]]; then
   "$ROOT/.venv/bin/python" -m json.tool "$CONFIG" >/dev/null
   echo "Configuration preserved and valid: $CONFIG"
+  if [[ "$RESTART_SERVICE" == 1 ]]; then
+    CONFIG_MODE="$(stat -c '%a' "$CONFIG")"
+    if (( (8#$CONFIG_MODE & 077) != 0 )); then
+      echo "Refusing to restart: restrict $CONFIG to its owner (for example: chmod 600 $CONFIG)." >&2
+      exit 1
+    fi
+  fi
 else
   echo "No configuration found at $CONFIG (run the installer to create one)."
   [[ "$RESTART_SERVICE" == 0 ]] || {

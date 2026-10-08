@@ -1,0 +1,24 @@
+# Private configuration and credentials. The example is the only config tracked.
+/meshroom/meshroom.json
+/meshroom/meshroom.*.json
+!/meshroom/meshroom.json.example
+
+# Runtime state can contain member data, shared secrets, or generated repeater keys.
+/data/
+/meshroom_data/
+/test-data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Local Python environments and generated files.
+.venv/
+__pycache__/
+*.py[cod]
+
+# Keep locally supplied credentials and keys out of commits.
+.env
+.env.*
+*.pem
+*.key

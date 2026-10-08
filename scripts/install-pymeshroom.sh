@@ -22,7 +22,8 @@ Options:
 
 The script leaves RF-first defaults intact: MQTT Observer, MQTT Augmentation,
 Virtual Repeater, and repeater relaying are all disabled. Edit the private
-configuration before operating a live modem.
+configuration before operating a live modem. Known placeholder passwords are
+rejected when installing a systemd service.
 EOF
 }
 
@@ -99,6 +100,35 @@ if [[ "$INSTALL_SERVICE" == 1 ]]; then
   command -v sudo >/dev/null || { echo "--service requires sudo." >&2; exit 1; }
   if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     echo "Service user does not exist: $SERVICE_USER" >&2; exit 1
+  fi
+  "$ROOT/.venv/bin/python" - "$CONFIG" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as file:
+    layout = json.load(file)
+
+def setting(name):
+    if name in layout:
+        return layout[name]
+    for value in layout.values():
+        if isinstance(value, dict) and name in value:
+            return value[name]
+    return ""
+
+placeholders = {"password", "hello", "changeme", "change-me", "change-me-token"}
+unsafe = []
+for name in ("admin_password", "room_password", "web_password", "mqtt_username", "mqtt_password"):
+    value = str(setting(name) or "").strip().lower()
+    if value in placeholders:
+        unsafe.append(name)
+if unsafe:
+    raise SystemExit("Refusing service installation: replace placeholder value(s): " + ", ".join(unsafe))
+PY
+  CONFIG_MODE="$(stat -c '%a' "$CONFIG")"
+  if (( (8#$CONFIG_MODE & 077) != 0 )); then
+    echo "Refusing service installation: restrict $CONFIG to its owner (for example: chmod 600 $CONFIG)." >&2
+    exit 1
   fi
   sudo tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]

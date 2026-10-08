@@ -203,7 +203,7 @@ Run that second command only after reviewing the generated configuration and onl
 
 If a `meshroom.service` already exists, the installer deliberately refuses to replace it. Review the existing deployment and use `--service --replace-service` only when you explicitly want this checkout to become the systemd service. Run `./scripts/install-pymeshroom.sh --help` for data-directory, config-path, service-user, and test options.
 
-It **never overwrites** an existing `meshroom/meshroom.json`. The new configuration starts RF-first: MQTT Observer, MQTT Augmentation, Virtual Repeater, and repeater relaying are disabled.
+It **never overwrites** an existing `meshroom/meshroom.json`. The new configuration starts RF-first: MQTT Observer, MQTT Augmentation, Virtual Repeater, and repeater relaying are disabled. Empty `room_password` keeps the room open; empty `admin_password` disables RF admin access; empty `web_password` disables dashboard-admin controls. Choose strong, non-empty admin passwords before enabling those functions.
 
 ### Updating an existing installation
 
@@ -231,6 +231,14 @@ chmod 600 meshroom/meshroom.json
 ```
 
 For either installation path, edit the private `meshroom/meshroom.json` and set the room name, coordinates, serial device, radio parameters, data directory, passwords, and dashboard bind address. Never commit that file: it can contain passwords, MQTT credentials, and a locally generated Virtual Repeater key.
+
+### Security checklist for a live or public deployment
+
+* Leave the supplied `.gitignore` in place. It excludes private configurations, runtime databases, logs, local Python environments, and key files; commit only `meshroom/meshroom.json.example`.
+* Give `admin_password` and `web_password` distinct, strong values if you enable RF or dashboard administration. Do not use known placeholders such as `changeme`; the installer rejects them when `--service` is requested. A blank `room_password` intentionally leaves the room open.
+* Keep the private configuration owner-readable only: `chmod 600 meshroom/meshroom.json`. The installer checks this before it installs a service.
+* Do not expose the built-in HTTP dashboard directly to the public internet. Bind it to a trusted interface, or place it behind an HTTPS reverse proxy with appropriate access controls.
+* Repository maintainers should enable GitHub secret scanning/push protection, Dependabot alerts, and branch protection for `main`. These are GitHub account settings, not configuration stored in this repository.
 
 Start with every optional feature disabled:
 

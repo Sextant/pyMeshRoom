@@ -25,6 +25,11 @@ class VirtualRepeaterTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["repeater_key"], "")
         self.assertEqual(DEFAULT_CONFIG["repeater_name"], "pyMeshRoom Virtual Repeater")
 
+    def test_access_defaults_do_not_grant_administration(self):
+        self.assertEqual(DEFAULT_CONFIG["admin_password"], "")
+        self.assertEqual(DEFAULT_CONFIG["room_password"], "")
+        self.assertEqual(DEFAULT_CONFIG["web_password"], "")
+
     def test_identity_is_deterministic_and_not_the_room_identity(self):
         first = RepeaterIdentity(bytes(range(32)))
         second = RepeaterIdentity(bytes(range(32)))
