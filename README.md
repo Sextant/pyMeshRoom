@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/pymeshroom-logo-large.png" alt="pyMeshRoom — Connect, Observe, Augment, Repeat" width="900">
+</p>
+
 # pyMeshRoom
 
 aka **Platinum's Most Excellent MeshCore Py Room**
@@ -68,10 +72,10 @@ Microcontrollers running Meshcore have limited resources that cannot scale to ro
 * No persistence - reboots are devastating.
    * Clock is reset
    * Message queue is lost
-   * Users states lost, and users are logged out
-Usability:
-* No insight into what the room is doing
-* No admin tools
+   * User state is lost, and users are logged out
+* Limited usability
+   * No insight into what the room is doing
+   * No admin tools
 
 # Why pyMeshRoom (Linux + KISS modem) is better
 Core functionality fixed:
