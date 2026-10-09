@@ -30,6 +30,54 @@ def config(**overrides):
 
 
 class ObserverTests(unittest.TestCase):
+    def test_rejected_connection_rebuilds_client_with_fresh_token(self):
+        class Client:
+            def __init__(self, *args, **kwargs):
+                self.username = self.password = None
+
+            def username_pw_set(self, username, password):
+                self.username, self.password = username, password
+
+            def tls_set(self):
+                pass
+
+            def ws_set_options(self, **kwargs):
+                pass
+
+            def reconnect_delay_set(self, **kwargs):
+                pass
+
+            def will_set(self, *args, **kwargs):
+                pass
+
+            def connect_async(self, *args, **kwargs):
+                pass
+
+            def loop_start(self):
+                pass
+
+            def loop_stop(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+        class MQTT:
+            class CallbackAPIVersion:
+                VERSION2 = object()
+            Client = Client
+
+        identity = FakeIdentity()
+        bridge = ObserverBridge(config(observer_meshmapper=False), identity, start=False)
+        spec = bridge._servers()["gomesh"]
+        bridge._connect("gomesh", spec, MQTT)
+        first = bridge.clients["gomesh"]
+        first.on_connect(first, None, None, 4)  # MQTT 3.x: bad username/password
+        self.assertEqual(bridge._take_token_refreshes(), {"gomesh"})
+        bridge._refresh_tokens(MQTT, {"gomesh"})
+        self.assertIsNot(bridge.clients["gomesh"], first)
+        self.assertEqual(len(identity.inputs), 2)  # one modem signature per client/JWT
+
     def test_bundled_paho_is_used_when_none_is_installed(self):
         import subprocess
         meshroom_dir = str(pathlib.Path(__file__).resolve().parents[1] / "meshroom")

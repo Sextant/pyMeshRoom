@@ -93,6 +93,11 @@ class ObserverBridge:
                              for name in self._servers()}
         self._lock = threading.Lock()
         self._refresh = threading.Event()
+        # Paho reconnects its own network loop, but a reconnect needs a new
+        # modem-signed JWT.  The callback only queues this work; the observer
+        # worker owns stopping and replacing clients.
+        self._reconnect = threading.Event()
+        self._reconnect_brokers = set()
         self.thread = None
         if start:
             self.thread = threading.Thread(target=self._run, name="mqtt-observer", daemon=True)
@@ -280,6 +285,21 @@ class ObserverBridge:
         """Apply changed observer settings from the worker, never the RX path."""
         self._refresh.set()
 
+    def _queue_token_refresh(self, name):
+        """Request a replacement client with a freshly signed MQTT JWT."""
+        with self._lock:
+            self._reconnect_brokers.add(name)
+        self._reconnect.set()
+
+    def _take_token_refreshes(self):
+        if not self._reconnect.is_set():
+            return set()
+        with self._lock:
+            names = set(self._reconnect_brokers)
+            self._reconnect_brokers.clear()
+            self._reconnect.clear()
+        return names
+
     def _disconnect(self, name, offline=True):
         client = self.clients.pop(name, None)
         if client is None:
@@ -314,6 +334,16 @@ class ObserverBridge:
             if name not in self.clients:
                 self._connect(name, specs[name], mqtt)
 
+    def _refresh_tokens(self, mqtt, names):
+        """Replace selected clients so their next CONNECT uses a fresh JWT."""
+        specs = self._servers()
+        enabled = set(self._enabled())
+        for name in names:
+            if name not in enabled or name not in specs:
+                continue
+            self._disconnect(name, offline=False)
+            self._connect(name, specs[name], mqtt)
+
     def _connect(self, name, spec, mqtt):
         host, port, audience = spec["host"], int(spec["port"]), spec["audience"]
         token = make_auth_token(self.identity, self.public_key, audience)
@@ -345,10 +375,18 @@ class ObserverBridge:
             if ok:
                 log.info("observer %s connected to %s", name, host)
                 self._publish_status(name)
+            elif self.running and self.clients.get(name) is c:
+                log.warning("observer %s rejected its MQTT token; refreshing it", name)
+                self._queue_token_refresh(name)
 
         def on_disconnect(c, userdata, *args):
             self._set_connected(name, False)
             log.warning("observer %s disconnected", name)
+            # A broker evaluates JWT credentials at CONNECT time.  Do not let
+            # Paho retry indefinitely with the token created for an earlier
+            # connection; replace this client in the worker with a new token.
+            if self.running and self.clients.get(name) is c:
+                self._queue_token_refresh(name)
 
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
@@ -455,6 +493,9 @@ class ObserverBridge:
             if self._refresh.is_set():
                 self._refresh.clear()
                 self._sync_clients(mqtt, rebuild=True)
+            reconnects = self._take_token_refreshes()
+            if reconnects:
+                self._refresh_tokens(mqtt, reconnects)
             try:
                 item = self.q.get(timeout=1.0)
             except queue.Empty:
