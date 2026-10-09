@@ -65,7 +65,7 @@ class ObserverTests(unittest.TestCase):
         class MQTT:
             class CallbackAPIVersion:
                 VERSION2 = object()
-            Client = Client
+        MQTT.Client = Client
 
         identity = FakeIdentity()
         bridge = ObserverBridge(config(observer_meshmapper=False), identity, start=False)
