@@ -4996,7 +4996,20 @@ session().then(()=>{load();loadMap()});setInterval(load,1000);setInterval(loadMa
 </script></body></html>"""
 
 
-BUILTIN_ICONS = {   # fallbacks when data_dir/icons/<name>.png doesn't exist
+ICON_NAMES = ("resync", "suggest", "kick", "ban", "advert", "flood_advert")
+PACKAGED_ICONS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data", "icons")
+
+
+def dashboard_icon_file(data_dir, name):
+    """Return a local icon override or the PNG bundled with this checkout."""
+    for root in (os.path.join(data_dir, "icons"), PACKAGED_ICONS_DIR):
+        path = os.path.join(root, name + ".png")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+BUILTIN_ICONS = {   # final fallback when neither a local nor bundled PNG exists
     "resync": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M5 20.5 L16.2 6.8" stroke="#2a4fa8" stroke-width="2.6" '
               'stroke-linecap="round" fill="none"/><path d="M16.2 6.8 C17.2 3.9 20.3 3.4 21.6 5.4 C22.4 6.6 21.9 8 20.6 8.5" stroke="#2a4fa8" '
               'stroke-width="2.6" stroke-linecap="round" fill="none"/></svg>',
@@ -5153,9 +5166,9 @@ class WebUI:
                     return self._send(404, '{"error":"not found"}')
                 if path.startswith("/icons/"):
                     name = path[7:].split(".")[0]
-                    if name in ("resync", "suggest", "kick", "ban", "advert", "flood_advert"):
-                        f = os.path.join(cfg.data_dir, "icons", name + ".png")
-                        if os.path.exists(f):
+                    if name in ICON_NAMES:
+                        f = dashboard_icon_file(cfg.data_dir, name)
+                        if f:
                             return self._send(200, cached_file(f, False)[1], "image/png", cache_s=86400)   # PNG: already compressed
                         return self._send(200, BUILTIN_ICONS[name], "image/svg+xml", cache_s=86400)
                     return self._send(404, '{"error":"not found"}')
