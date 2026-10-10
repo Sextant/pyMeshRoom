@@ -30,6 +30,7 @@ See pyMeshRoom operating in the wild:
 | MQTT Augmentation | Read-only inbound MQTT observations can confirm deliveries and enrich map/activity data. | Off |
 | Virtual Repeater | A separate optional repeater identity sharing the room's KISS modem and TX scheduler. | Off |
 | Virtual Companion | A chat node on the room's radio that MeshCore apps connect to over TCP, like a WiFi companion. | Off |
+| Tenant Rooms | More rooms on the same radio, each with its own key, members, passwords and admin page. | None |
 
 ### The three optional subsystems
 
@@ -43,7 +44,7 @@ See pyMeshRoom operating in the wild:
 
 Read the installation guide below to build an instance, then enable only the optional components you actually need.
 
-**Jump to:** [install and first configuration](#first-configuration) · [MQTT Observer](#outbound-mqtt-observer) · [MQTT Augmentation](#inbound-mqtt-ingestion) · [Virtual Repeater](#optional-virtual-repeater) · [Virtual Companion](#optional-virtual-companion) · [dependencies](#dependencies)
+**Jump to:** [install and first configuration](#first-configuration) · [MQTT Observer](#outbound-mqtt-observer) · [MQTT Augmentation](#inbound-mqtt-ingestion) · [Virtual Repeater](#optional-virtual-repeater) · [Virtual Companion](#optional-virtual-companion) · [Tenant Rooms](#tenant-rooms) · [dependencies](#dependencies)
 
 See stats and what repeaters the room is well connected to
 <img width="1553" height="597" alt="image" src="https://github.com/user-attachments/assets/b9add1ee-5f80-4d57-b767-3be9e5889e07" />
@@ -410,6 +411,35 @@ The companion, the room and the Virtual Repeater share one radio, so traffic bet
 Its data — contacts, channels, settings and messages waiting for the app — is kept in `companion.db` in `data_dir`, separate from `room.db` and readable only by the pyMeshRoom user. It is created the first time the companion is enabled; deleting it (while pyMeshRoom is stopped) resets only the companion.
 
 **Security:** the companion protocol has no authentication. Anyone who can reach the port can read the companion's messages and send as it. Keep the port on a trusted network, never forward it from the internet, and use `companion_allow` to restrict it.
+
+## Tenant Rooms
+
+Host more rooms on the same radio. Each tenant room is a full MeshCore room server with its own identity, members,
+posts, bans and passwords, and its own web page for its admins. The main admin creates them from the **Tenant rooms**
+card: room name, path (the page is at `http://<server>/<path>/`), private key (optional: a random one is generated if
+it's left blank), join password, admin password (used from MeshCore apps) and a web UI password for the room's page.
+**Create** starts the room straight away and announces it with an advert. Each room in the list has an **Actions** menu:
+**Reset web UI password** (anyone logged in to that room's page is logged out) and **Delete room**, which asks for the
+main admin password and erases the room's members, posts, settings and key for good. Up to 100 tenant rooms.
+
+A tenant's page shows its own members (active and suspended), bans, the room chat and the same repeater map and
+neighbour data as the main page. Its admins can post to the room, send its advert (zero-hop or flood), resync, suggest
+routes, kick, ban and unban, all for their room only. The main admin can also act on any tenant's page.
+
+Nothing a tenant does reaches outside its room. Over RF, a tenant's admin can change its name, position and passwords,
+read settings and manage its members, but not the radio, the push timing, discovery or the service (no reboot). The
+radio's settings and everything else in the main config are shared and can only be changed by the main admin.
+
+How it fits together:
+
+* `tenant_rooms` in the config lists each room's name, path and public key, nothing else. Everything else, including
+  its private key and passwords, is in its own database, `tenants/<public key>.db` in `data_dir` (readable only by the
+  pyMeshRoom user). The web UI password is stored hashed.
+* Tenant rooms share the main room's map: heard repeaters, links and routes to repeaters, which only the main room
+  learns (tenants don't run discovery or traces).
+* All rooms share one radio and its airtime: they take turns pushing posts, and messages between rooms, the virtual
+  companion and the virtual repeater on this radio never go on the air.
+* Without any tenant rooms, nothing changes for an existing installation.
 
 ## Operations, upgrades, and rollback
 

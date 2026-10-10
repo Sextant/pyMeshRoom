@@ -163,6 +163,7 @@ DEFAULT_CONFIG = {
     "companion_auto_advert": False, #   advert on its own every companion_advert_interval_min
     "companion_advert_interval_min": 60,
     "companion_advert_flood": False,          # auto adverts: flood (whole mesh) instead of zero-hop
+    "tenant_rooms": [],             # tenant rooms: [{"name", "path", "public_key"}]; everything else is in tenants/{key}.db
 }
 
 
@@ -759,6 +760,7 @@ class Store:
         "bans": ("pubkey BLOB PRIMARY KEY", "name TEXT", "ts INT"),
         "probes": ("hash BLOB PRIMARY KEY", "data TEXT"),
         "obs_edges": ("a BLOB", "b BLOB", "w REAL", "t INT", "snr REAL", "PRIMARY KEY (a, b)"),
+        "settings": ("k TEXT PRIMARY KEY", "v TEXT"),     # (a tenant room's own settings)
     }
 
     def __init__(self, path):
@@ -1179,6 +1181,8 @@ class Member:
 # ============================================================================
 
 class RoomServer:
+    TENANT = False
+
     def __init__(self, cfg, modem, identity, store):
         self.cfg, self.modem, self.id, self.store = cfg, modem, identity, store
         self.self_hash = identity.pub_key[0]
@@ -1265,6 +1269,10 @@ class RoomServer:
         self.vr = None                    # VirtualRepeater while repeater_enabled
         self.vc = None                    # VirtualCompanion while companion_enabled (started by main: needs the event queue)
         self.web_vc_admin = {}
+        self.tenants = {}                 # public key -> TenantRoom (main room only)
+        self.bus = []                     # heap: tenants' packets, offered to the other nodes on this radio when due
+        self.push_gate, self.push_turn, self.push_owner = 0.0, 0, None   # one push at a time across all rooms (one radio)
+        self.web_tenants, self.web_tenant_rows = {}, []    # for the web thread: path -> TenantRoom, admin list
         self.consumed = False             # set while handling a packet that turned out to be for the room
         self.feed = None                  # ObserverFeed while MQTT augmentation is on         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.web_port_active = bool(cfg.web_port)
@@ -1388,6 +1396,9 @@ class RoomServer:
 
     # ------------------------------------------------------------------ clock / ids
 
+    def radio_stats(self):
+        return self.stats
+
     def unique_time(self):
         t = now_s()
         if t <= self.max_issued:
@@ -1413,7 +1424,7 @@ class RoomServer:
     # ------------------------------------------------------------------ TX queue
 
     def queue_tx(self, pkt, prio, delay=0.0, deferrable=False, relay=False, src=None):
-        if self.vc is not None and src != "vc":
+        if self.vc is not None and src is None:          # (tenants' and the companion's were offered already)
             if self.vc.claims(pkt):                         # for the companion on this radio: handed over, never on the air
                 if not relay:
                     self.seen_mark(pkt)
@@ -1577,6 +1588,9 @@ class RoomServer:
         self.rx_airtime_ms += self.airtime_ms(len(raw))
         self.stats["recv_flood" if pkt.is_flood else "recv_direct"] += 1
         consumed = self._room_rx(pkt)
+        for t in self.tenants.values():
+            if t.wants(pkt):
+                consumed = t._room_rx(pkt.copy()) or consumed
         if self.vc is not None:
             consumed = self.vc.on_rx(pkt.copy(), raw) or consumed
         if self.vr is not None:
@@ -1586,7 +1600,11 @@ class RoomServer:
         """A packet the virtual repeater is about to send on its last hop: the room gets it first, internally.
         True if it was for the room (then it isn't transmitted)."""
         pkt.snr, pkt.rssi = VIRTUAL_LINK_SNR, 0
-        return self._room_rx(pkt)
+        consumed = self._room_rx(pkt.copy())
+        for t in self.tenants.values():
+            if t.wants(pkt):
+                consumed = t._room_rx(pkt.copy()) or consumed
+        return consumed
 
     def _room_rx(self, pkt):
         """The room's own handling of a packet. Returns True if it was for the room (it decrypted as ours, or it is
@@ -2034,7 +2052,7 @@ class RoomServer:
     def handle_request(self, m, sender_ts, p):
         head = struct.pack("<I", sender_ts)
         if p[0] == REQ_GET_STATUS:
-            s = self.stats
+            s = self.radio_stats()
             up = int(time.monotonic() - self.boot)
             stats = struct.pack("<HHhhIIIIIIIIHhHHHH",
                                 self.batt_mv, min(len(self.txq), 0xFFFF), int(self.noise_floor), int(self.last_rssi),
@@ -3065,25 +3083,8 @@ class RoomServer:
     def companion_tx(self, pkt, prio):
         """A packet from the virtual companion. The room hears it first, internally (and the virtual repeater, for
         traces and discovery); it goes on the air unless it was only for them."""
-        rx = pkt.copy()
-        rx.snr, rx.rssi = VIRTUAL_LINK_SNR, 0
-        consumed = self._room_rx(rx)
-        t, p = pkt.ptype, pkt.payload
-        if t == PT_TRACE and pkt.is_direct and len(p) >= 9:
-            es = 1 << (p[8] & 3)
-            nxt = p[9 + pkt.path_len * es:9 + (pkt.path_len + 1) * es]
-            if nxt == self.id.pub_key[:es]:
-                consumed = True                             # its first hop is the room: relayed (or not) by _room_rx
-            elif self.vr is not None and nxt == self.vr.pub[:es]:
-                v = pkt.copy()
-                v.snr = VIRTUAL_LINK_SNR
-                self.vr.on_rx(v, False)
-                consumed = True
-        elif t == PT_CONTROL and self.vr is not None:
-            v = pkt.copy()
-            v.snr = VIRTUAL_LINK_SNR
-            self.vr.on_rx(v, consumed)                      # e.g. node discovery: the repeater next to it answers
-        if consumed and (pkt.is_flood or pkt.hop_count == 0 or t == PT_TRACE):
+        consumed = self.offer(pkt, self.vc)
+        if consumed and (pkt.is_flood or pkt.hop_count == 0 or pkt.ptype == PT_TRACE):
             self.vc.stats["internal_out"] += 1
             return
         self.queue_tx(pkt, prio, 0.0, src="vc")
@@ -3113,6 +3114,186 @@ class RoomServer:
         link = self.vc.link if self.vc is not None else None
         return dict(bind=self.cfg.companion_bind, allow=list(self.cfg.companion_allow or []),
                     client=link.peer if link is not None else None)
+
+    # ------------------------------------------------------------------ the other nodes on this radio
+
+    def offer(self, pkt, src):
+        """A packet from a node on this radio (a tenant room or the companion): every other node here hears it first,
+        internally (and the virtual repeater takes traces and discovery meant for it). True if it was for one of them;
+        then it doesn't go on the air."""
+        rx = pkt.copy()
+        rx.snr, rx.rssi = VIRTUAL_LINK_SNR, 0
+        consumed = False
+        if src is not self:
+            consumed = self._room_rx(rx.copy())
+        for t in list(self.tenants.values()):
+            if t is not src and t.wants(rx):
+                consumed = t._room_rx(rx.copy()) or consumed
+        vc = self.vc
+        if vc is not None and src is not vc:
+            if vc.claims(pkt):
+                consumed = True
+            vc.deliver(pkt.copy())
+        t, p = pkt.ptype, pkt.payload
+        if t == PT_TRACE and pkt.is_direct and len(p) >= 9:
+            es = 1 << (p[8] & 3)
+            nxt = p[9 + pkt.path_len * es:9 + (pkt.path_len + 1) * es]
+            if nxt == self.id.pub_key[:es] or any(nxt == x.id.pub_key[:es] for x in self.tenants.values() if x is not src):
+                consumed = True                             # its first hop is a room here: relayed (or not) by it
+            elif self.vr is not None and nxt == self.vr.pub[:es]:
+                v = pkt.copy()
+                v.snr = VIRTUAL_LINK_SNR
+                self.vr.on_rx(v, False)
+                consumed = True
+        elif t == PT_CONTROL and self.vr is not None:
+            v = pkt.copy()
+            v.snr = VIRTUAL_LINK_SNR
+            self.vr.on_rx(v, consumed)                      # e.g. node discovery: the repeater next to it answers
+        return consumed
+
+    def bus_send(self, src, pkt, prio, delay, deferrable):
+        self.txseq += 1
+        heapq.heappush(self.bus, (time.monotonic() + delay, self.txseq, src, pkt, prio, deferrable))
+
+    def service_bus(self):
+        """Tenant rooms' packets, when due: offered here first, then on the air unless they were only for us."""
+        now = time.monotonic()
+        while self.bus and self.bus[0][0] <= now:
+            _, _, src, pkt, prio, deferrable = heapq.heappop(self.bus)
+            if self.tenants.get(src.id.pub_key) is not src:
+                continue                                    # (the room was deleted)
+            if self.offer(pkt, src) and (pkt.is_flood or pkt.hop_count == 0 or pkt.ptype == PT_TRACE):
+                continue
+            self.queue_tx(pkt, prio, 0.0, deferrable, src=src)
+
+    def push_rooms(self):
+        """Every room on this radio shares its airtime: one push at a time, rooms taking turns."""
+        now = time.monotonic()
+        rooms = [self] + list(self.tenants.values())
+        owner = self.push_owner
+        gate_open = now >= self.push_gate or (owner is not None and owner.flood_gap_done(now))
+        start = self.push_turn % len(rooms)
+        for i in range(len(rooms)):
+            r = rooms[(start + i) % len(rooms)]
+            if r.push_tick(allow=gate_open):
+                gate_open = False
+                self.push_gate, self.push_owner = r.next_push, r
+                self.push_turn = (start + i + 1) % len(rooms)
+
+    # ------------------------------------------------------------------ tenant rooms
+
+    def tenant_db(self, key_hex):
+        return os.path.join(self.cfg.data_dir, TENANT_DIR, key_hex + ".db")
+
+    def tenants_load(self):
+        """Start the tenant rooms listed in the config (startup)."""
+        for e in list(self.cfg.tenant_rooms or []):
+            try:
+                pub = bytes.fromhex(str(e["public_key"]))
+                path = self.tenant_db(hexs(pub))
+                if not os.path.exists(path):
+                    log.error("tenant room %r: its database %s is missing - not started", e.get("name"), path)
+                    continue
+                t = TenantRoom(self, Store(path))
+                if t.id.pub_key != pub:
+                    log.error("tenant room %r: the key in %s doesn't match the config - not started", e.get("name"), path)
+                    t.store.close()
+                    continue
+                self.tenants[pub] = t
+                log.info("tenant room %r on /%s/, id %s, %d members", t.cfg.name, t.cfg.path, hexs(pub[:2]), len(t.members))
+            except (KeyError, ValueError, TypeError, sqlite3.Error) as ex:
+                log.error("tenant room %r: %s - not started", e.get("name") if isinstance(e, dict) else e, ex)
+        self.tenants_changed()
+
+    def tenants_changed(self):
+        self.web_tenants = {t.cfg.path: t for t in self.tenants.values()}
+        self.web_tenant_rows = [t.admin_row() for t in self.tenants.values()]
+        self.web_dirty = True
+
+    def tenant_create(self, spec):
+        if len(self.tenants) >= TENANT_MAX:
+            return log.error("tenant room %r not created: the limit is %d rooms", spec["name"], TENANT_MAX)
+        if spec["path"] in {t.cfg.path for t in self.tenants.values()}:
+            return log.error("tenant room %r not created: path /%s/ is taken", spec["name"], spec["path"])
+        taken = {self.id.pub_key, *self.tenants}
+        if self.vr is not None:
+            taken.add(self.vr.pub)
+        if self.vc is not None:
+            taken.add(self.vc.pub)
+        if spec["private_key"]:
+            key = bytes.fromhex(spec["private_key"])
+        else:
+            while True:                                     # a random identity (not a reserved or used hash)
+                key = os.urandom(32)
+                pub = RepeaterIdentity(key).pub_key
+                if pub[0] not in (0x00, 0xFF) and pub not in taken:
+                    break
+        ident = RepeaterIdentity(key)
+        if ident.pub_key in taken:
+            return log.error("tenant room %r not created: its key is already used here", spec["name"])
+        os.makedirs(os.path.join(self.cfg.data_dir, TENANT_DIR), mode=0o700, exist_ok=True)
+        path = self.tenant_db(hexs(ident.pub_key))
+        for f in (path, path + "-wal", path + "-shm"):      # (left over from an earlier room with this key)
+            if os.path.exists(f):
+                os.remove(f)
+        store = Store(path)
+        tcfg = TenantConfig(self.cfg, store)
+        for k in ("name", "path", "room_password", "admin_password", "web_password_hash"):
+            tcfg.set(k, spec[k])
+        tcfg.set("private_key", key.hex())
+        t = TenantRoom(self, store, tcfg)
+        t.next_zero_advert, t.next_flood_advert = time.monotonic() + 3, time.monotonic() + 10   # announce it now
+        self.tenants[ident.pub_key] = t
+        self.cfg.set("tenant_rooms", list(self.cfg.tenant_rooms or []) +
+                     [dict(name=spec["name"], path=spec["path"], public_key=hexs(ident.pub_key))])
+        log.info("tenant room %r created on /%s/, id %s", spec["name"], spec["path"], hexs(ident.pub_key[:2]))
+        self.tenants_changed()
+
+    def tenant_delete(self, pub):
+        """Remove a tenant room and erase everything it kept (members, posts, settings, key)."""
+        t = self.tenants.pop(pub, None)
+        if t is None:
+            return
+        t.store.close()
+        path = self.tenant_db(hexs(pub))
+        for f in (path, path + "-wal", path + "-shm"):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+        self.cfg.set("tenant_rooms", [e for e in (self.cfg.tenant_rooms or []) if str(e.get("public_key", "")).upper() != hexs(pub)])
+        if self.push_owner is t:
+            self.push_owner = None
+        log.info("tenant room %r deleted (%d members, %d posts erased)", t.cfg.name, len(t.members), len(t.posts))
+        self.tenants_changed()
+
+    def tenant_event(self, ev):
+        """t_create / t_delete / t_webpw from the main admin, t_act / t_say / t_advert from a tenant's page."""
+        kind = ev[0]
+        if kind == "t_create":
+            return self.tenant_create(ev[1])
+        t = self.tenants.get(bytes.fromhex(ev[1]))
+        if t is None:
+            return
+        if kind == "t_delete":
+            self.tenant_delete(t.id.pub_key)
+        elif kind == "t_webpw":
+            t.cfg.set("web_password_hash", ev[2])
+            log.info("tenant room %r: web UI password reset", t.cfg.name)
+        elif kind == "t_say":
+            t.room_say(ev[2])
+        elif kind == "t_advert":
+            t.dashboard_advert(ev[2])
+        elif kind == "t_act":
+            verb, pub = ev[2], ev[3]
+            if verb == "suggest":
+                t.suggest_route(pub, ev[4])
+            elif verb == "resync":
+                t.force_resync(pub)
+            elif verb in ("kick", "ban", "unban"):
+                getattr(t, verb)(pub)
+        t.web_dirty = True
+        t.next_web = 0.0
 
     def heard_from(self, m):
         """Any packet we can attribute to m: the 'Last heard' time (saved with the member)."""
@@ -3301,13 +3482,17 @@ class RoomServer:
 
     # ------------------------------------------------------------------ push loop
 
-    def push_tick(self):
+    def push_tick(self, allow=True):
+        """One step of the push round. allow=False (another room on this radio is pushing): only check ACK timeouts.
+        Returns True if it pushed."""
         now = time.monotonic()
         if not self.members:
-            return
+            return False
         if now < self.next_push and not self.flood_gap_done(now):
-            return
+            return False
         self.check_ack_timeouts()
+        if not allow:
+            return False
         if not self.round:
             self.maybe_trace()                              # end of a full round through the members
             # new round: members who take the fewest attempts first (new members neutral at 1.5),
@@ -3339,6 +3524,7 @@ class RoomServer:
             self.last_pushed = m.pub
             self.last_push_at = now
             self.last_push_flood = m.push_hops == 0xFF
+        return did_push
 
     def push_post(self, m, ts, author, text, wire_ts=None):
         if ts != m.push_post_ts:
@@ -3917,6 +4103,8 @@ class RoomServer:
                     "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}),
             mqtt=self.mqtt_state(), repeater=self.vr_state(), companion=self.vc_state())
         self.web_vc_admin = self.vc_admin_state()          # (served to admins only)
+        if self.tenants:
+            self.web_tenant_rows = [t.admin_row() for t in self.tenants.values()]
 
     def member_inroutes(self, m, n=5):
         """Other paths the member's floods took to reach us (member side first), most seen first, excluding the current."""
@@ -3980,9 +4168,16 @@ class RoomServer:
             self.check_trace_timeout()
         if not self.members and self.cfg.trace_neighbours:
             self.maybe_trace()                              # (no member rounds to hang it on)
-        self.push_tick()
+        if self.tenants:
+            self.push_rooms()
+        else:
+            self.push_tick()
         if self.vc is not None:
             self.vc.service()                               # packets between the companion and the room, when due
+        for t in list(self.tenants.values()):
+            t.run_once()
+        if self.bus:
+            self.service_bus()
         self.service_tx()
         self.periodic()
 
@@ -5872,6 +6067,280 @@ class VirtualCompanion:
     }
 
 # ============================================================================
+# Tenant rooms: more rooms on the same radio, each with its own key, members, posts, passwords and web page
+# ============================================================================
+
+TENANT_MAX = 100
+TENANT_DIR = "tenants"
+# settings a tenant room keeps for itself (in its own database); everything else comes from the main config, and a
+# tenant can't change it (no radio, timing or service settings: nothing that affects anyone outside the tenant)
+TENANT_KEYS = {"name", "path", "private_key", "lat", "lon", "admin_password", "room_password", "allow_read_only",
+               "web_password_hash", "welcome_new_members", "welcome_message", "welcome_advert_hint", "kick_message",
+               "ban_message", "advert_interval_min", "flood_advert_interval_h", "max_posts", "catchup_max"}
+TENANT_DEFAULTS = {"lat": 0.0, "lon": 0.0, "admin_password": "", "room_password": "", "allow_read_only": False,
+                   "web_password_hash": "", "advert_interval_min": 60, "flood_advert_interval_h": 24}
+TENANT_RESERVED_PATHS = {"api", "static", "icons", "index.html", "favicon.ico", "robots.txt", "tenants"}
+
+
+def hash_web_password(pw):
+    salt = os.urandom(16)
+    n = 100000
+    return "pbkdf2_sha256$%d$%s$%s" % (n, salt.hex(), hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, n).hex())
+
+
+def check_web_password(pw, stored):
+    try:
+        algo, n, salt, h = str(stored).split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        got = hashlib.pbkdf2_hmac("sha256", str(pw).encode(), bytes.fromhex(salt), int(n)).hex()
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(got, h)
+
+
+def tenant_spec(body, taken_paths=(), taken_keys=()):
+    """Dashboard 'create tenant room' form -> validated spec. The web password is hashed here (it never reaches the
+    main loop or the database in the clear). Raises ValueError with a readable message."""
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    name = str(body.get("name", "")).strip()
+    if not name or len(name.encode()) > 31:
+        raise ValueError("room name: 1 to 31 bytes")
+    path = str(body.get("path", "")).strip().strip("/").lower()
+    if not 1 <= len(path) <= 32 or not all(c in "abcdefghijklmnopqrstuvwxyz0123456789-_" for c in path):
+        raise ValueError("room path: 1 to 32 lowercase letters, digits, - or _")
+    if path in TENANT_RESERVED_PATHS or path in taken_paths:
+        raise ValueError("room path %r is already in use" % path)
+    key = str(body.get("private_key", "") or "").strip().lower()
+    if key:
+        if len(key) not in (64, 128) or any(c not in "0123456789abcdef" for c in key):
+            raise ValueError("private key must be 64 or 128 hexadecimal characters (or empty for a random one)")
+        pub = RepeaterIdentity(bytes.fromhex(key)).pub_key
+        if pub[0] in (0x00, 0xFF):
+            raise ValueError("that key's public key starts with %02X, which MeshCore reserves" % pub[0])
+        if pub in taken_keys:
+            raise ValueError("that key is already used by this server")
+    out = dict(name=name, path=path, private_key=key)
+    for j in ("room_password", "admin_password"):
+        v = str(body.get(j, "") or "")
+        if len(v.encode()) > 15:
+            raise ValueError("%s: at most 15 bytes (MeshCore's limit)" % j.replace("_", " "))
+        out[j] = v
+    if out["admin_password"] and out["admin_password"] == out["room_password"]:
+        raise ValueError("the admin password must differ from the join password")
+    wp = str(body.get("web_password", "") or "")
+    if len(wp) < 6:
+        raise ValueError("web UI password: at least 6 characters")
+    out["web_password_hash"] = hash_web_password(wp)
+    return out
+
+
+class TenantConfig:
+    """A tenant room's settings: its own (TENANT_KEYS, kept in its database) over the main config's. set() refuses
+    anything outside TENANT_KEYS, so nothing a tenant does (RF CLI included) can change the main room or the radio."""
+
+    def __init__(self, base, store):
+        self.__dict__["base"], self.__dict__["store"] = base, store
+        data = {}
+        for k, v in store.read("SELECT k, v FROM settings"):
+            try:
+                data[k] = json.loads(v)
+            except ValueError:
+                pass
+        self.__dict__["data"] = data
+
+    def __getattr__(self, k):
+        d = self.__dict__["data"]
+        if k in d:
+            return d[k]
+        if k in TENANT_DEFAULTS:
+            return TENANT_DEFAULTS[k]
+        return getattr(self.__dict__["base"], k)
+
+    def __setattr__(self, k, v):
+        self.set(k, v)
+
+    def set(self, k, v):
+        if k not in TENANT_KEYS:
+            raise ValueError("%s is a server setting: a tenant room can't change it" % k.replace("_", "."))
+        self.__dict__["data"][k] = v
+        self.__dict__["store"].execmany([("INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)", [(k, json.dumps(v))])])
+
+
+def _shared(name, writable=False):
+    """A TenantRoom attribute that is the main room's (the map, the radio's readings, the virtual repeater...).
+    Writes are ignored unless writable (RoomServer.__init__ assigns defaults that must not reach the main room)."""
+    def get(self):
+        return getattr(self.host, name)
+
+    def put(self, v):
+        if writable:
+            setattr(self.host, name, v)
+    return property(get, put)
+
+
+class TenantRoom(RoomServer):
+    """A room on the main room's radio: same room logic, its own key, members, posts, bans, passwords and settings
+    (tenants/{public key}.db). It shares the main room's map and routes to repeaters, and its transmissions go through
+    the main room (internal hand-over to the other nodes on this radio, then the one transmit queue). It never does
+    mesh-level work: no topology learning, discovery, traces, map building or radio housekeeping."""
+
+    TENANT = True
+    SHARED = ("radio", "noise_floor", "nf_min", "nf_max", "last_rssi", "last_snr", "batt_mv", "mcu_temp_c", "temp_supported",
+              "rroutes", "mrpts", "edges", "repeaters", "heard", "obs_edges", "probes", "neighbours", "names", "disk_names",
+              "vr", "vc", "observer", "feed", "txq", "tx_busy_until", "last_rx_mono", "rx_airtime_ms", "web_map",
+              "map_version", "minutes", "sys_samples", "mem_total_mb")
+    RADIO_STATS = ("recv", "sent", "airtime_ms", "recv_flood", "recv_direct", "sent_flood", "sent_direct", "errors",
+                   "flood_dups", "direct_dups", "traces")
+
+    def __init__(self, host, store, cfg=None):
+        self.host = host
+        cfg = cfg or TenantConfig(host.cfg, store)
+        ident = RepeaterIdentity(bytes.fromhex(str(cfg.private_key)))
+        super().__init__(cfg, host.modem, ident, store)
+        self.events_put = host.events_put
+        self.web_last_request = 0.0
+        self.web_state = {}
+        now = time.monotonic()
+        self.next_zero_advert = now + random.uniform(10, 300)    # (spread out: many rooms restarting together)
+        self.next_flood_advert = now + random.uniform(60, 1800)
+
+    path = property(lambda s: s.cfg.path)
+    key = property(lambda s: hexs(s.id.pub_key))
+
+    # ---------------------------------------------------------------- mesh-level work belongs to the main room
+    def repeater_apply(self):
+        pass
+
+    def observe_flood_path(self, pkt):
+        pass
+
+    def observe_trace(self, pkt):
+        pass
+
+    def on_control(self, pkt):
+        pass
+
+    def maybe_trace(self):
+        pass
+
+    def send_discovery(self):
+        pass
+
+    def learn_name(self, pub, ts, name):
+        pass                                                # (the main room keeps the shared name cache)
+
+    def radio_stats(self):
+        """This room's counters, with the radio's own (packets heard and sent, airtime) from the main room."""
+        s = dict(self.stats)
+        for k in self.RADIO_STATS:
+            s[k] = self.host.stats.get(k, 0)
+        return s
+
+    def hour_stats(self):
+        return self.host.hour_stats()
+
+    def sys_stats(self):
+        return self.host.sys_stats()
+
+    # ---------------------------------------------------------------- radio: through the main room
+    def queue_tx(self, pkt, prio, delay=0.0, deferrable=False, relay=False, src=None):
+        self.seen_mark(pkt)
+        self.host.bus_send(self, pkt, prio, delay, deferrable)
+
+    def wants(self, pkt):
+        """Could this packet concern this room? (Cheap filter: the main room offers every packet to every tenant.)"""
+        t, p = pkt.ptype, pkt.payload
+        if t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG, PT_ANON_REQ):
+            return bool(p) and p[0] == self.self_hash
+        if t in (PT_ACK, PT_MULTIPART):
+            return bool(self.notices) or any(m.pending_ack is not None or m.prev_acks != [None, None]
+                                             for m in self.members.values())
+        if t == PT_ADVERT:
+            return p[:32] in self.members
+        if t == PT_TRACE:
+            return pkt.is_direct and len(p) >= 9 and self.id.pub_key[:1 << (p[8] & 3)] in p[9:]
+        return False
+
+    def on_advert(self, pkt):
+        """A member's advert: they're on the air (the main room does names, positions and the map)."""
+        m = self.members.get(pkt.payload[:32])
+        if m is None or self.check_dup(pkt) or self.parse_advert(pkt) is None:
+            return
+        if pkt.is_flood:
+            self.member_flood(m, pkt)
+        self.heard_from(m)
+        if (m.given_up or m.push_failures > 0 or m.stuck_since) and m.pending_ack is None:
+            self.member_active(m, pkt)
+            if m.last_activity == 0:
+                m.last_activity = now_s()
+            self.mark_dirty()
+
+    def dashboard_advert(self, flood):
+        self.send_advert(flood)
+        log.info("tenant room %r: %s advert sent from its page", self.cfg.name, "flood" if flood else "zero-hop")
+
+    def handle_cli(self, cmd):
+        """The room CLI, without anything that reaches outside this room (the radio, timing, discovery, restarts)."""
+        c = cmd.strip()
+        if c in ("reboot", "restart", "discover") or c.startswith(("set path.hash", "set push.")):
+            return "Err - not available in a tenant room"
+        return super().handle_cli(c)
+
+    def run_once(self):
+        if self.notices:
+            self.service_notices()
+        self.periodic()
+
+    def periodic(self):
+        now = time.monotonic()
+        c = self.cfg
+        if c.advert_interval_min and now >= self.next_zero_advert:
+            self.send_advert(False)
+            self.next_zero_advert = now + float(c.advert_interval_min) * 60
+        if c.flood_advert_interval_h and now >= self.next_flood_advert:
+            self.send_advert(True)
+            self.next_flood_advert = now + float(c.flood_advert_interval_h) * 3600
+        if now >= self.next_aging:
+            for m in self.members.values():
+                self.prune_routes(m)
+            self.drop_private(None, older_than=now_s() - 7 * 86400)
+            self.next_aging = now + 3600
+        self.pace_ease()
+        if self.dirty and now >= self.next_flush:
+            self.flush()
+            self.next_flush = now + 30
+        if now - self.web_last_request < 20 and now >= self.next_web:
+            self.publish_web_state()
+            self.next_web = now + 1
+
+    def publish_web_state(self):
+        super().publish_web_state()
+        st = dict(self.web_state)
+        st["stats"] = dict(st["stats"], **{k: self.host.stats.get(k, 0) for k in self.RADIO_STATS})
+        st["room"] = dict(st["room"], tenant=True, path=self.cfg.path)
+        st["mqtt"], st["repeater"], st["companion"] = {}, {}, {}
+        self.web_state = st
+
+    def admin_row(self):
+        return dict(name=self.cfg.name, path=self.cfg.path, key=self.key, id=hexs(self.id.pub_key[:2]),
+                    members=sum(1 for m in self.members.values() if not m.given_up),
+                    suspended=sum(1 for m in self.members.values() if m.given_up),
+                    posts=sum(1 for p in self.posts if p[3] is None))
+
+    def close(self):
+        self.flush()
+        self.store.close()
+
+
+for _n in TenantRoom.SHARED:
+    setattr(TenantRoom, _n, _shared(_n))
+TenantRoom._rpt_idx = _shared("_rpt_idx", writable=True)          # (the repeater name index follows the shared map)
+TenantRoom._label_memo = _shared("_label_memo", writable=True)
+del _n
+
+# ============================================================================
 # Observer feed (MQTT augmentation): read-only, its own thread, filters before anything reaches the main loop
 # ============================================================================
 
@@ -6326,7 +6795,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
-#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#vccard{order:8}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
+#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#vccard{order:8}#tncard{order:8}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
 </style></head><body>
 <header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rvc" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
@@ -6390,6 +6859,18 @@ the companion is enabled. The companion protocol has no password: anyone who can
 as it, so keep it on your own network (never forward it from the internet) and list allowed addresses (e.g. 192.168.1.0/24) to
 narrow it further. Radio settings, the Bluetooth PIN, reboot and factory reset from the app are acknowledged and ignored.
 Messages between the companion and this room or its repeater never go on the air.</div></div>
+<div class="card" id="tncard" style="display:none"><h2>Tenant rooms <span class="hdesc">more rooms on this radio, each with its own page, members and passwords</span></h2>
+<div class="rprow"><label>Room name <input id="tn_name" maxlength="31" size="16"></label>
+<label>Path <span class="dim" id="tn_base"></span><input id="tn_path" maxlength="32" size="12" placeholder="e.g. hiking" autocomplete="off"></label>
+<label>Private key <input id="tn_key" type="password" autocomplete="new-password" size="22" placeholder="blank = random"></label></div>
+<div class="rprow"><label>Join password <input id="tn_join" type="password" autocomplete="new-password" maxlength="15" size="12" placeholder="blank = open room"></label>
+<label>Admin password <input id="tn_admin" type="password" autocomplete="new-password" maxlength="15" size="12" placeholder="blank = no RF admin"></label>
+<label>Web UI password <input id="tn_web" type="password" autocomplete="new-password" size="12" placeholder="6+ characters"></label>
+<button onclick="tnCreate(this)">Create</button><span id="tnmsg" class="small"></span></div>
+<div class="hint" style="margin-left:26px">If no private key is entered, one is generated randomly. Each room gets its own page at its path, where its
+admins (web UI password) see its members and the map, chat, advert, resync, suggest routes, kick and ban. The join and admin passwords are what
+people use from their MeshCore apps. Tenant rooms share this radio, its map and its airtime; nothing a tenant does reaches outside its room.</div>
+<table id="tnlist" style="margin-top:8px"></table></div>
 <div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the room's, and the virtual repeater's when it's on</span></h2><div class="advrow">
 <div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
 <div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
@@ -6422,6 +6903,8 @@ Messages between the companion and this room or its repeater never go on the air
 <div class="card" id="repeaterscard"><h2>Repeaters heard</h2><table id="rpts"></table></div>
 </main>
 <script>
+const TENANT=!!window.TENANT;if(TENANT){document.body.classList.add("tenant");
+ document.querySelector("#advcard .hdesc").textContent="this room's adverts"}
 const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 function ago(t){if(!t)return"never";let d=Math.max(0,Date.now()/1000-t);return d<60?Math.round(d)+"s":d<3600?Math.round(d/60)+"m":d<86400?(d/3600).toFixed(1)+"h":(d/86400).toFixed(1)+"d"}
 async function act(url,label){if(!confirm(label))return;const r=await fetch(url,{method:"POST"});if(r.status===401){await session();alert("Your admin session has expired: log in again.")}setTimeout(load,300)}
@@ -6431,7 +6914,7 @@ function score(m){if(m.delivery==null)return'<span class="dim">new</span>';const
  return `<span class="${c}">${m.delivery}%</span> <span class="dim small">${m.avg_attempts} tries &middot; ${m.deliveries}</span>`}
 function route(r){return r==null?'<span class="dim">unknown (flood)</span>':r.length?r.map(esc).join(" &rsaquo; "):'direct'}
 let EXP=new Set(),map=null,layer=null,RPTS=[],MEMBERS=[],LAST=null,ADMIN=false,LOGIN_ON=false;
-let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false,WELCOME_LOADED=false;let VCA={};
+let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false,WELCOME_LOADED=false;let VCA={},MAINADM=false,TN_ROWS=[];
 function bytesOf(t){return new TextEncoder().encode(t).length}
 function chatLeft(){const n=CHAT_MAX-bytesOf($("chatmsg").value);$("chatleft").textContent=n+" left";$("chatleft").className=n<0?"poor small":"dim small";$("chatsend").disabled=n<0}
 async function loadChat(reset){if(!ADMIN||CHAT_BUSY)return;CHAT_BUSY=true;
@@ -6460,6 +6943,28 @@ async function vcToggle(cb){   // turning it on saves the options with it; they 
  const o=cb.checked?{enabled:true,name:$("vc_name").value,port:+$("vc_port").value,allow:$("vc_allow").value,auto_advert:$("vc_auto").checked,
   advert_min:+$("vc_int").value,advert_flood:$("vc_flood").value==="1"}:{enabled:false};
  cb.disabled=true;const ok=await vcSet(o);cb.disabled=false;if(!ok)cb.checked=!cb.checked}
+async function loadTenants(){if(!MAINADM)return;try{const r=await fetch("api/tenants");if(!r.ok)return;const d=await r.json();TN_ROWS=d.rooms||[]}catch(e){return}
+ $("tn_base").textContent=location.host+"/";
+ const t=$("tnlist");if(!TN_ROWS.length){t.innerHTML='<tr><td class="dim">No tenant rooms yet.</td></tr>';return}
+ if(t.querySelector("select:focus"))return;
+ t.innerHTML="<tr><th>Room</th><th>Page</th><th>ID</th><th>Members</th><th>Suspended</th><th>Posts</th><th></th></tr>"+TN_ROWS.map(x=>
+  `<tr><td>${esc(x.name)}</td><td><a href="${encodeURI(x.path)}/" target="_blank">/${esc(x.path)}/</a></td><td class="mono4" title="${esc(x.key)}">${esc(x.id)}</td>`+
+  `<td>${x.members}</td><td>${x.suspended}</td><td>${x.posts}</td><td><select data-key="${esc(x.key)}" data-name="${esc(x.name)}" onchange="tnAction(this)">`+
+  `<option value="">Actions&hellip;</option><option value="pw">Reset web UI password</option><option value="del">Delete room</option></select></td></tr>`).join("")}
+async function tnPost(url,o){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
+ let m="";if(!r.ok){m="Failed";try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}return m}
+async function tnCreate(btn){const o={name:$("tn_name").value.trim(),path:$("tn_path").value.trim(),private_key:$("tn_key").value.trim(),
+ room_password:$("tn_join").value,admin_password:$("tn_admin").value,web_password:$("tn_web").value};
+ btn.disabled=true;const m=await tnPost("api/tenants",o);btn.disabled=false;
+ $("tnmsg").className=m?"poor small":"good small";$("tnmsg").textContent=m?" "+m:" created: /"+o.path.toLowerCase()+"/";
+ if(!m){["tn_name","tn_path","tn_key","tn_join","tn_admin","tn_web"].forEach(id=>$(id).value="");setTimeout(loadTenants,700)}}
+async function tnAction(sel){const k=sel.dataset.key,n=sel.dataset.name,a=sel.value;sel.value="";if(!a)return;let m;
+ if(a==="pw"){const pw=prompt("New web UI password for "+n+" (6+ characters). Anyone logged in to its page is logged out.");if(pw===null)return;
+  m=await tnPost("api/tenants/"+k+"/password",{web_password:pw});alert(m||"Web UI password for "+n+" reset.")}
+ else if(a==="del"){if(!confirm("Delete the tenant room "+n+"? Its members, posts, settings and key are erased for good."))return;
+  const pw=prompt("Your admin (web) password, to confirm deleting "+n+":");if(pw===null)return;
+  m=await tnPost("api/tenants/"+k+"/delete",{password:pw});alert(m||n+" deleted.")}
+ setTimeout(loadTenants,700)}
 async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  if(r.status===401){alert("Your admin session has expired: log in again.");session()}setTimeout(load,400)}
 async function mqCredentials(){const u=$("mq_user").value.trim(),p=$("mq_pass").value;if(!u||!p){$("mqcred").textContent="username and password are both required";$("mqcred").className="poor small";return}
@@ -6476,10 +6981,12 @@ async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chat
  if(r.ok){$("chatmsg").value="";chatLeft();setTimeout(()=>loadChat(false),700)}
  else{let e="Could not send";try{e=(await r.json()).error||e}catch(x){}if(r.status===401){e="Your admin session has expired: log in again.";session()}$("chaterr").textContent=e}}
 async function session(){try{const r=await (await fetch("api/session")).json();ADMIN=r.admin;LOGIN_ON=r.login_enabled}catch(e){}
- const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=ADMIN?"":"none";$("trafficcard").style.display=ADMIN?"":"none";$("welcomecard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);if(ADMIN&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
- $("mqcard").style.display=ADMIN?"":"none";
- $("rpcard").style.display=ADMIN?"":"none";
- $("vccard").style.display=ADMIN?"":"none";
+ MAINADM=ADMIN&&!TENANT;
+ const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=MAINADM?"":"none";$("trafficcard").style.display=MAINADM?"":"none";$("welcomecard").style.display=MAINADM?"":"none";if(ADMIN&&!was)loadChat(true);if(MAINADM&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
+ $("mqcard").style.display=MAINADM?"":"none";
+ $("rpcard").style.display=MAINADM?"":"none";
+ $("vccard").style.display=MAINADM?"":"none";
+ $("tncard").style.display=MAINADM?"":"none";if(MAINADM)loadTenants();
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
 let OBS_SERVERS=[];
 function renderObserverServers(){const t=$("observerservers");t.innerHTML="<tr><th>Name</th><th>Endpoint</th><th>Audience</th><th>Prefix</th><th>State</th><th></th></tr>"+OBS_SERVERS.map((s,i)=>`<tr><td>${esc(s.name)}</td><td>${esc(s.host)}:${s.port}${esc(s.ws_path)}</td><td>${esc(s.audience)}</td><td>${esc(s.topic_prefix)}</td><td>${s.enabled?"enabled":"off"}</td><td><button onclick="removeObserverServer(${i})">Delete</button></td></tr>`).join("")}
@@ -6621,7 +7128,7 @@ async function load(){
    `kept internal: ${Rp.internal} &middot; duplicates: ${Rp.dups} &middot; not relayed: ${Rp.drop_scope} scope, ${Rp.drop_hops} hop limit, ${Rp.drop_loop} loop, `+
    `${Rp.drop_airtime} airtime cap, ${Rp.drop_queue} queue full${Rp.relay?"":`, ${Rp.drop_off} while off`} &middot; adverts: ${Rp.adverts}`:""}
  const Vc=st.companion||{};
- if(ADMIN){try{const r=await fetch("api/companion");if(r.ok)VCA=await r.json()}catch(e){}}
+ if(MAINADM){try{const r=await fetch("api/companion");if(r.ok)VCA=await r.json()}catch(e){}}
  $("rvc").innerHTML=Vc.enabled?`<span class="dim">Companion</span> ${esc(Vc.name)} `+(Vc.client?`<span class="good">app connected</span>`:Vc.listening?'<span class="dim small">no app connected</span>':'<span class="poor">port not open</span>'):"";
  if(ADMIN){if(!$("vc_en").disabled)$("vc_en").checked=!!Vc.enabled;
   $("vcopts").classList.toggle("locked",!!Vc.enabled);$("vcopts").querySelectorAll("input,select,button").forEach(e=>e.disabled=!!Vc.enabled);
@@ -6651,7 +7158,7 @@ async function load(){
   `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_rf!=null?` &middot; <b class="${Hs.push_rf>=80?"good":Hs.push_rf>=50?"mid":"poor"}">${Hs.push_rf}%</b> delivered${(st.mqtt||{}).enabled?` <span class="dim small">(${Hs.push_ok}% per MQTT)</span>`:""}`:""}</span>`,
   `<span class="dim small">last ${Hs.minutes>=60?"hour":Hs.minutes+" min"}</span>`].join(""):'<span class="dim small">stats appear after the first minute</span>';
  $("rclock").textContent="up "+ago(Date.now()/1000-R.uptime).replace("s"," s")+(R.clock_ok?"":"  CLOCK NOT SYNCED");
- observerState(st.observer,R.key);if(ADMIN)loadObserverTraffic();
+ observerState(st.observer,R.key);if(MAINADM)loadObserverTraffic();
  const k=[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks],["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
  $("kpis").innerHTML=k.map(x=>`<div class="kpi"><span class="dim small">${x[0]}</span><b>${esc(x[1])}</b></div>`).join("");
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
@@ -6730,7 +7237,7 @@ $("sgpath").addEventListener("keydown",e=>{const it=acItems();
  else if((e.key==="Enter"||e.key==="Tab")&&ACI>=0&&$("aclist").style.display==="block"){acPick(it[ACI]);e.preventDefault()}
  else if(e.key==="Enter"){doSuggest()}else if(e.key==="Escape"){closeSuggest()}});
 $("chatmsg").addEventListener("input",chatLeft);$("chatmsg").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});chatLeft();
-setInterval(()=>loadChat(false),3000);
+setInterval(()=>loadChat(false),3000);setInterval(loadTenants,5000);
 session().then(()=>{load();loadMap()});setInterval(load,1000);setInterval(loadMap,30000);setInterval(session,60000);
 </script></body></html>"""
 
@@ -6795,6 +7302,13 @@ class WebUI:
             return ent
 
         snaps = {}                                          # name -> (dict object, raw json, gzipped)
+        # tenant rooms' pages: the same dashboard in tenant mode, their own logins (cookie scoped to /{path}/)
+        assert DASHBOARD_HTML.count("<script>\nconst TENANT=") == 1
+        thtml = DASHBOARD_HTML.replace("<script>\nconst TENANT=", "<script>window.TENANT=true</script><script>\nconst TENANT=")
+        tpage = (thtml.encode(), gzip.compress(thtml.encode(), 6))
+        tsessions = {}                                      # token -> (expiry, tenant key hex)
+        tsnaps = {}                                         # tenant key -> (state dict, raw, gzipped)
+        t_last_advert = {}
         viewers = {}                                        # client id -> (last seen, admin)
 
         def note_viewer(qs, admin):
@@ -6844,6 +7358,129 @@ class WebUI:
                         return False
                     return True
 
+            def _body(self):
+                try:
+                    return json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                except ValueError:
+                    return None
+
+            def _tenant_admin(self, t):
+                """A tenant room's page: its own login, or the main admin's."""
+                if self._is_admin():
+                    return True
+                for part in (self.headers.get("Cookie") or "").split(";"):
+                    k, _, v = part.strip().partition("=")
+                    if k == "mr_tenant":
+                        with slock:
+                            e = tsessions.get(v)
+                            if e is not None and e[0] >= time.monotonic() and e[1] == t.key:
+                                return True
+                return False
+
+            def _tenant(self, t, sub, post):
+                """Everything under /{path}/: the tenant's page and API, scoped to that room only."""
+                path = sub.split("?")[0]
+                key, base = t.key, "/%s/" % t.path
+                if not post:
+                    if path.startswith(("/static/", "/icons/")):
+                        self.path = sub                         # shared files
+                        return self._get()
+                    if path in ("/", "/index.html"):
+                        gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                        return self._send(200, tpage[1] if gz else tpage[0], "text/html; charset=utf-8", gz=gz)
+                    if path == "/api/session":
+                        return self._send(200, json.dumps({"admin": self._tenant_admin(t), "login_enabled": True}))
+                    if path == "/api/state":
+                        t.web_last_request = time.monotonic()   # (the main loop refreshes it while it's being viewed)
+                        deadline = time.monotonic() + 1.5
+                        while not t.web_state and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        st = t.web_state
+                        with clock_:
+                            hit = tsnaps.get(key)
+                            if hit is None or hit[0] is not st:
+                                raw = json.dumps(st, default=str, separators=(",", ":")).encode()
+                                hit = tsnaps[key] = (st, raw, gzip.compress(raw, 5))
+                        gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                        return self._send(200, hit[2] if gz else hit[1], gz=gz)
+                    if path == "/api/map":
+                        gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                        return self._send(200, snap_bytes("web_map", gz), gz=gz)
+                    if path == "/api/chat":
+                        if not self._tenant_admin(t):
+                            return self._send(401, '{"error":"log in first"}')
+                        since = 0
+                        for kv in sub.partition("?")[2].split("&"):
+                            k, _, v = kv.partition("=")
+                            if k == "since" and v.isdigit():
+                                since = int(v)
+                        msgs = [dict(ts=ts, who=t.chat_label(a), room=(a == t.id.pub_key), text=txt)
+                                for ts, a, txt, to in list(t.posts) if to is None and ts > since]
+                        return self._send(200, json.dumps({"messages": msgs, "max_bytes": MAX_POST_TEXT_LEN}))
+                    return self._send(404, '{"error":"not found"}')
+                parts = path.strip("/").split("/")
+                if parts == ["api", "login"]:
+                    body = self._body() or {}
+                    if not check_web_password(str(body.get("password", "")), t.cfg.web_password_hash):
+                        time.sleep(1.0)                         # slow down guessing
+                        return self._send(401, '{"error":"wrong password"}')
+                    tok = secrets.token_hex(24)
+                    with slock:
+                        now_m = time.monotonic()
+                        for k in [k for k, e in tsessions.items() if e[0] < now_m]:
+                            del tsessions[k]
+                        tsessions[tok] = (now_m + SESSION_S, key)
+                    return self._send(200, '{"ok":true}', cookie="mr_tenant=%s; HttpOnly; SameSite=Strict; Path=%s; Max-Age=%d" % (tok, base, SESSION_S))
+                if parts == ["api", "logout"]:
+                    with slock:
+                        for part in (self.headers.get("Cookie") or "").split(";"):
+                            k, _, v = part.strip().partition("=")
+                            if k == "mr_tenant":
+                                tsessions.pop(v, None)
+                    return self._send(200, '{"ok":true}', cookie="mr_tenant=; HttpOnly; SameSite=Strict; Path=%s; Max-Age=0" % base)
+                if not self._tenant_admin(t):                   # everything below changes things: this room's admins only
+                    return self._send(401, '{"error":"log in first"}')
+                if parts == ["api", "advert"]:
+                    body = self._body() or {}
+                    with slock:
+                        if time.monotonic() - t_last_advert.get(key, float("-inf")) < 10:
+                            return self._send(429, '{"error":"an advert was just sent: wait a few seconds"}')
+                        t_last_advert[key] = time.monotonic()
+                    events.put(("t_advert", key, bool(body.get("flood"))))
+                    return self._send(200, json.dumps({"ok": True, "flood": bool(body.get("flood")), "repeater": False}))
+                if parts == ["api", "chat"]:
+                    text = str((self._body() or {}).get("text", "")).strip()
+                    if not text:
+                        return self._send(400, '{"error":"empty message"}')
+                    if len(text.encode()) > MAX_POST_TEXT_LEN:
+                        return self._send(400, json.dumps({"error": "too long: %d bytes max" % MAX_POST_TEXT_LEN}))
+                    events.put(("t_say", key, text))
+                    return self._send(200, '{"ok":true}')
+                if len(parts) == 4 and parts[0] == "api" and (parts[1], parts[3]) in (
+                        ("members", "kick"), ("members", "ban"), ("members", "resync"), ("members", "route"), ("bans", "unban")):
+                    try:
+                        pub = bytes.fromhex(parts[2])
+                    except ValueError:
+                        return self._send(400, '{"error":"bad key"}')
+                    if len(pub) != 32:
+                        return self._send(400, '{"error":"bad key"}')
+                    if parts[3] == "route":
+                        try:
+                            reps = [(r.get("name") or "", r["hash"]) for r in (room.web_map or {}).get("repeaters", [])]
+                            hops = resolve_route(str((self._body() or {}).get("path", "")), reps)
+                        except ValueError as e:
+                            return self._send(400, json.dumps({"error": str(e)}))
+                        events.put(("t_act", key, "suggest", pub, hops))
+                        return self._send(200, json.dumps({"ok": True, "hops": [h.hex().upper() for h in hops]}))
+                    events.put(("t_act", key, parts[3], pub))   # applied to this room only, by the main loop
+                    return self._send(200, '{"ok":true}')
+                return self._send(404, '{"error":"not found"}')
+
+            def _tenant_of(self):
+                seg, _, rest = self.path.lstrip("/").partition("/")
+                t = room.web_tenants.get(seg.split("?")[0]) if seg else None
+                return t, rest
+
             def _send(self, code, body, ctype="application/json", cookie=None, gz=False, cache_s=0):
                 b = body if isinstance(body, bytes) else body.encode()
                 self.send_response(code)
@@ -6882,7 +7519,20 @@ class WebUI:
                     slots.release()
 
             def _get(self):
+                t, rest = self._tenant_of()
+                if t is not None:
+                    if "/" not in self.path.lstrip("/"):            # /path -> /path/ (the page uses relative URLs)
+                        self.send_response(301)
+                        self.send_header("Location", "/%s/" % t.path)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    return self._tenant(t, "/" + rest, False)
                 path = self.path.split("?")[0]
+                if path == "/api/tenants":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    return self._send(200, json.dumps({"rooms": room.web_tenant_rows, "max": TENANT_MAX}))
                 if path == "/api/session":
                     return self._send(200, json.dumps({"admin": self._is_admin(), "login_enabled": bool(cfg.web_password)}))
                 if path.startswith("/static/"):
@@ -6972,6 +7622,9 @@ class WebUI:
                 self._send(404, '{"error":"not found"}')
 
             def _post(self):
+                t, rest = self._tenant_of()
+                if t is not None:
+                    return self._tenant(t, "/" + rest, True)
                 parts = self.path.strip("/").split("/")
                 if parts == ["api", "login"]:
                     if not cfg.web_password:
@@ -6997,6 +7650,35 @@ class WebUI:
                     return self._send(200, '{"ok":true}', cookie="mr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 if not self._is_admin():                        # everything below changes things: admins only
                     return self._send(401, '{"error":"log in first"}')
+                if parts == ["api", "tenants"]:
+                    if len(room.web_tenants) >= TENANT_MAX:
+                        return self._send(409, json.dumps({"error": "the limit is %d tenant rooms" % TENANT_MAX}))
+                    keys = {x.id.pub_key for x in room.web_tenants.values()} | {room.id.pub_key}
+                    try:
+                        spec = tenant_spec(self._body(), set(room.web_tenants), keys)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e) or "bad request"}))
+                    events.put(("t_create", spec))                  # created by the main loop
+                    return self._send(200, json.dumps({"ok": True, "path": spec["path"]}))
+                if len(parts) == 4 and parts[:2] == ["api", "tenants"] and parts[3] in ("delete", "password"):
+                    key = parts[2].upper()
+                    if not any(x.key == key for x in room.web_tenants.values()):
+                        return self._send(404, '{"error":"no such tenant room"}')
+                    body = self._body() or {}
+                    if parts[3] == "delete":
+                        if not hmac.compare_digest(str(body.get("password", "")).encode(), str(cfg.web_password).encode()):
+                            time.sleep(1.0)
+                            return self._send(403, '{"error":"wrong admin password: the room was not deleted"}')
+                        events.put(("t_delete", key))
+                    else:
+                        pw = str(body.get("web_password", ""))
+                        if len(pw) < 6:
+                            return self._send(400, '{"error":"web UI password: at least 6 characters"}')
+                        events.put(("t_webpw", key, hash_web_password(pw)))
+                    with slock:                                 # either way, its logged-in sessions end now
+                        for k in [k for k, e in tsessions.items() if e[1] == key]:
+                            del tsessions[k]
+                    return self._send(200, '{"ok":true}')
                 if parts == ["api", "observer"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
@@ -7206,6 +7888,7 @@ def main():
     room.events_put = events.put
     room.events_q = events
     room.companion_apply()                                  # (its TCP port needs the event queue)
+    room.tenants_load()
     observer = None
 
     def start_observer():
@@ -7284,6 +7967,8 @@ def main():
             room.web_dirty = True
         elif kind in ("vc_cmd", "vc_conn", "vc_disc", "vc_cfg"):
             room.companion_event(ev)
+        elif kind.startswith("t_"):
+            room.tenant_event(ev)
         elif kind == "web_wake":
             room.web_dirty = True
             room.next_map = 0.0                             # first view after idle: the map part too
@@ -7348,6 +8033,8 @@ def main():
     room.flush_topology()
     if room.vc is not None:
         room.vc.close()                                     # saves its contacts, closes its TCP port
+    for t in room.tenants.values():
+        t.close()
     if observer:
         observer.close()
     store.close()                                           # waits for the writer thread to finish
