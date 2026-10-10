@@ -6313,7 +6313,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
-#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#vccard{order:8}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
+#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#vccard{order:8}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
 </style></head><body>
 <header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rvc" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
@@ -6360,16 +6360,16 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <div id="rpcounts" class="dim small" style="margin-left:26px"></div>
 </div>
 <div class="card" id="vccard" style="display:none"><h2>Virtual companion <span class="hdesc">a chat node on the room's radio that MeshCore apps connect to over the network</span></h2>
+<div class="mqrow"><label class="sw"><input type="checkbox" id="vc_en" onchange="vcToggle(this)"> <b>Virtual companion</b></label>
+<span id="vcstat" class="dim small"></span><span id="vcmsg" class="small"></span></div>
+<div id="vcopts"><div class="hint" id="vclockhint" style="margin-left:26px"></div>
 <div class="mqrow sub"><label>Import private key <input id="vc_key" type="password" autocomplete="new-password" placeholder="64 or 128 hex characters"></label><button onclick="vcImportKey()">Import key</button><span id="vckeymsg" class="dim small"></span></div>
-<div class="mqrow"><label class="sw"><input type="checkbox" id="vc_en" onchange="vcSet({enabled:this.checked})"> <b>Virtual companion</b></label>
-<span id="vcstat" class="dim small"></span></div>
 <div class="rprow"><label>Name <input id="vc_name" maxlength="31" size="16"></label>
 <label>TCP port <input id="vc_port" type="number" min="1" max="65535" style="width:6em"></label>
 <label>Allowed addresses <input id="vc_allow" size="26" placeholder="anyone who can reach the port"></label></div>
 <div class="rprow"><label class="sw"><input type="checkbox" id="vc_auto"> Auto advert</label>
 <label>every <input id="vc_int" type="number" min="1" max="10080" style="width:5em"> min</label>
-<label>as <select id="vc_flood"><option value="0">zero-hop</option><option value="1">flood</option></select></label>
-<button onclick="vcSave()">Save</button><span id="vcmsg" class="small"></span></div>
+<label>as <select id="vc_flood"><option value="0">zero-hop</option><option value="1">flood</option></select></label></div></div>
 <div id="vccounts" class="dim small" style="margin-left:26px"></div>
 <div class="mqnote">Connect a MeshCore app to this server's address and port as a WiFi/TCP companion. The port is open only while
 the companion is enabled. The companion protocol has no password: anyone who can reach the port can read its messages and send
@@ -6440,10 +6440,12 @@ function rpSave(){rpSet({name:$("rp_name").value,lat:$("rp_lat").value.trim(),lo
 async function vcSet(o){const r=await fetch("api/companion",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  let m="";if(!r.ok){m="Could not save";try{m=(await r.json()).error||m}catch(e){}}
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
- $("vcmsg").className=r.ok?"good small":"poor small";$("vcmsg").textContent=r.ok?"saved":m;delete SIG.vcform;setTimeout(load,400);return r.ok}
+ $("vcmsg").className=r.ok?"good small":"poor small";$("vcmsg").textContent=r.ok?"":" "+m;delete SIG.vcform;setTimeout(load,400);return r.ok}
 async function vcImportKey(){const k=$("vc_key").value.trim();if(!k)return;const ok=await vcSet({private_key:k});$("vc_key").value="";$("vckeymsg").textContent=ok?"key imported; companion remains disabled":"key was not imported"}
-function vcSave(){vcSet({name:$("vc_name").value,port:+$("vc_port").value,allow:$("vc_allow").value,auto_advert:$("vc_auto").checked,
- advert_min:+$("vc_int").value,advert_flood:$("vc_flood").value==="1"})}
+async function vcToggle(cb){   // turning it on saves the options with it; they stay locked until it's turned off again
+ const o=cb.checked?{enabled:true,name:$("vc_name").value,port:+$("vc_port").value,allow:$("vc_allow").value,auto_advert:$("vc_auto").checked,
+  advert_min:+$("vc_int").value,advert_flood:$("vc_flood").value==="1"}:{enabled:false};
+ cb.disabled=true;const ok=await vcSet(o);cb.disabled=false;if(!ok)cb.checked=!cb.checked}
 async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  if(r.status===401){alert("Your admin session has expired: log in again.");session()}setTimeout(load,400)}
 async function mqCredentials(){const u=$("mq_user").value.trim(),p=$("mq_pass").value;if(!u||!p){$("mqcred").textContent="username and password are both required";$("mqcred").className="poor small";return}
@@ -6607,7 +6609,10 @@ async function load(){
  const Vc=st.companion||{};
  if(ADMIN){try{const r=await fetch("api/companion");if(r.ok)VCA=await r.json()}catch(e){}}
  $("rvc").innerHTML=Vc.enabled?`<span class="dim">Companion</span> ${esc(Vc.name)} `+(Vc.client?`<span class="good">app connected</span>`:Vc.listening?'<span class="dim small">no app connected</span>':'<span class="poor">port not open</span>'):"";
- if(ADMIN){$("vc_en").checked=!!Vc.enabled;
+ if(ADMIN){if(!$("vc_en").disabled)$("vc_en").checked=!!Vc.enabled;
+  $("vcopts").classList.toggle("locked",!!Vc.enabled);$("vcopts").querySelectorAll("input,select,button").forEach(e=>e.disabled=!!Vc.enabled);
+  $("vclockhint").textContent=Vc.enabled?"Turn the companion off to change these settings (name and position can also be set from the app).":
+   "Settings are saved when you turn the companion on.";
   const f=document.activeElement,typing=f&&f.closest&&f.closest("#vccard")&&f.tagName!=="BUTTON"&&f.id!=="vc_en";
   if(!typing&&changed("vcform",[Vc.name,Vc.port,VCA.allow,Vc.auto_advert,Vc.advert_min,Vc.advert_flood])){
    $("vc_name").value=Vc.name||"";$("vc_port").value=Vc.port;$("vc_allow").value=(VCA.allow||[]).join(", ");$("vc_auto").checked=!!Vc.auto_advert;
@@ -7063,8 +7068,8 @@ class WebUI:
                 if parts == ["api", "companion"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
-                        if "private_key" in body and room.cfg.companion_enabled:
-                            return self._send(409, '{"error":"disable the virtual companion before importing a private key"}')
+                        if room.cfg.companion_enabled and set(body) - {"enabled"}:
+                            return self._send(409, '{"error":"turn the virtual companion off to change its settings"}')
                         ch = companion_changes(body)
                     except ValueError as e:
                         return self._send(400, json.dumps({"error": str(e) or "bad request"}))
