@@ -1142,6 +1142,7 @@ class Member:
         self.ack_timeout = 0.0
         self.push_failures = 0
         self.push_post_ts = 0
+        self.push_private = False         # the post being pushed is a private message (doesn't move sync_since)
         self.push_sent = 0.0
         self.push_hops = 0xFF
         self.prev_acks = [None, None]
@@ -2132,7 +2133,8 @@ class RoomServer:
             m.inflight = None
             m.prev_acks = [None, None]
             m.prev_entries = [None, None]
-            m.sync_since = m.push_post_ts
+            if not m.push_private:                          # (a private message is delivered out of order)
+                m.sync_since = m.push_post_ts
             self.drop_private(m.pub, m.push_post_ts)            # private message delivered: no longer needed
             m.push_failures = 0
             m.plan, m.plan_retry = None, False
@@ -2727,7 +2729,8 @@ class RoomServer:
                     acks[m.prev_acks[j]] = (m.prev_entries[j], False)
             m.obs_confirmed = dict(acks=acks, sent=m.push_sent, hops=m.push_hops, pace=m.pace_sample, timed=m.timed_sample,
                                    attempts=m.attempts_cur, until=time.monotonic() + 120)
-            m.sync_since = max(m.sync_since, m.push_post_ts)
+            if not m.push_private:
+                m.sync_since = max(m.sync_since, m.push_post_ts)
             self.drop_private(m.pub, m.push_post_ts)
             m.pending_ack, m.inflight, m.prev_acks, m.prev_entries = None, None, [None, None], [None, None]
             m.pace_sample = m.timed_sample = None
@@ -3316,19 +3319,28 @@ class RoomServer:
         did_push = False
         if m and self.push_eligible(m):
             t = now_s()
-            for ts, author, text, to in self.posts:
-                if t >= ts + POST_SYNC_DELAY_SECS and ts > m.sync_since and (to is None or to == m.pub) \
-                        and author[:4] != m.pub[:4]:
-                    self.push_post(m, ts, author, text)
-                    did_push = True
-                    break
+            mine = next((p for p in self.posts if p[3] == m.pub), None)
+            if mine is not None:
+                # private messages (the welcome DM) go first, before any catch-up history. They're stamped just before
+                # the first history post (so apps list them first too) and delivering one doesn't move sync_since
+                # (that would skip the history)
+                ts, author, text, _ = mine
+                first = next((p[0] for p in self.posts if p[3] is None and p[0] > m.sync_since and p[1][:4] != m.pub[:4]), None)
+                self.push_post(m, ts, author, text, wire_ts=min(ts, first - 1) if first else ts)
+                did_push = True
+            else:
+                for ts, author, text, to in self.posts:
+                    if t >= ts + POST_SYNC_DELAY_SECS and ts > m.sync_since and to is None and author[:4] != m.pub[:4]:
+                        self.push_post(m, ts, author, text)
+                        did_push = True
+                        break
         self.next_push = now + (self.gap_for(m.push_hops) if did_push else SYNC_SKIP_INTERVAL)
         if did_push:
             self.last_pushed = m.pub
             self.last_push_at = now
             self.last_push_flood = m.push_hops == 0xFF
 
-    def push_post(self, m, ts, author, text):
+    def push_post(self, m, ts, author, text, wire_ts=None):
         if ts != m.push_post_ts:
             m.prev_acks = [None, None]                      # different post: earlier attempts' ACKs no longer apply
             if not m.plan_retry or m.plan is None:
@@ -3346,10 +3358,11 @@ class RoomServer:
         m.pace_sample = (dict(ok=None, p=max(0.05, min(0.95, r_.rate(now_s(), self.rhalf()))), who=m.pub[:4])
                          if (online and first and not m.given_up and entry["plen"] is not None and r_ is not None) else None)
         m.attempts_cur += 1
-        data = struct.pack("<I", ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | random.randrange(4)]) \
+        data = struct.pack("<I", ts if wire_ts is None else wire_ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | random.randrange(4)]) \
             + author[:4] + text.encode()
         m.pending_ack = sha256(data, m.pub)[:4]
         m.push_post_ts = ts
+        m.push_private = any(p[0] == ts and p[3] is not None for p in self.posts)
         m.push_sent = time.monotonic()
         m.inflight = entry
         plen, path = entry["plen"], entry["path"]

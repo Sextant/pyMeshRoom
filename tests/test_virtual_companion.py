@@ -311,6 +311,36 @@ class CompanionRoomTests(unittest.TestCase):
         self.assertEqual(frame[4], 3)
         self.assertTrue(frame.endswith(b"Bob: hello channel"))
 
+    def test_welcome_dm_comes_before_the_history(self):
+        other = os.urandom(32)
+        now = int(time.time())
+        history = ["old post %d" % i for i in range(3)]
+        self.room.posts = [(now - 600 + i, other, t, None) for i, t in enumerate(history)]
+        room_pub = self.room.id.pub_key
+
+        def client():
+            c = RawClient(self.h.port)
+            c.call(bytes([1]) + bytes(7) + b"test", 5)
+            self.assertEqual(c.call(bytes([26]) + room_pub, 6, 1)[0], 6)
+            self.assertEqual(c.wait(0x85, 0x86)[0], 0x85)
+            got = []
+            deadline = time.monotonic() + 40
+            while len(got) < 1 + len(history) and time.monotonic() < deadline:
+                c.wait(0x83)
+                while True:
+                    f = c.call(bytes([10]), 16, 10)
+                    if f[0] == 10:
+                        break
+                    got.append((struct.unpack_from("<I", f, 12)[0], f[20:].decode()))
+            c.close()
+            return got
+        got = self.h.run_client(client, timeout=90)
+        texts = [t for _, t in got]
+        self.assertTrue(texts[0].startswith("Logged in to"), texts)       # the welcome first...
+        self.assertEqual(texts[1:], history)                             # ...then all of the history, in order
+        self.assertLess(got[0][0], got[1][0])                            # and stamped before it (apps sort by time)
+        self.assertFalse([p for p in self.room.posts if p[3] is not None])   # delivered private message dropped
+
     def test_a_new_connection_replaces_the_old_one(self):
         def client():
             first = RawClient(self.h.port)
