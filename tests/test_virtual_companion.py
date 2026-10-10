@@ -48,9 +48,9 @@ class FakeModem:
 class Harness:
     """A real RoomServer on a fake modem, with the companion listening on a free local port."""
 
-    def __init__(self, **cfg):
-        self.tmp = tempfile.TemporaryDirectory()
-        d = self.tmp.name
+    def __init__(self, data_dir=None, **cfg):
+        self.tmp = None if data_dir else tempfile.TemporaryDirectory()
+        d = data_dir or self.tmp.name
         self.events = queue.Queue()
         self.cfg = Config(os.path.join(d, "meshroom.json"))
         settings = dict(data_dir=d, companion_bind="127.0.0.1", companion_port=0, web_port=0, advert_interval_min=0,
@@ -64,6 +64,7 @@ class Harness:
         self.room.events_put = self.events.put
         self.room.events_q = self.events
         self.room.companion_apply()
+        self.room.tenants_load()
 
     @property
     def port(self):
@@ -87,6 +88,10 @@ class Harness:
                     self.room.on_txdone(ev[1])
                 elif kind == "say":
                     self.room.room_say(ev[1])
+                elif kind.startswith("t_"):
+                    self.room.tenant_event(ev)
+                elif kind == "rxraw":
+                    self.room.on_rx(ev[1], 6.0, -90)
                 try:
                     ev = self.events.get_nowait()
                 except queue.Empty:
@@ -112,11 +117,15 @@ class Harness:
             raise AssertionError("client did not finish")
         return box.get("result")
 
-    def close(self):
+    def close(self, keep=False):
         if self.room.vc is not None:
             self.room.vc.close()
+        for t in list(self.room.tenants.values()):
+            t.close()
+        self.room.flush()
         self.store.close()
-        self.tmp.cleanup()
+        if self.tmp is not None and not keep:
+            self.tmp.cleanup()
 
 
 class RawClient:
