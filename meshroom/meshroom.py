@@ -6364,6 +6364,7 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <span id="vcstat" class="dim small"></span><span id="vcmsg" class="small"></span></div>
 <div id="vcopts"><div class="hint" id="vclockhint" style="margin-left:26px"></div>
 <div class="mqrow sub"><label>Import private key <input id="vc_key" type="password" autocomplete="new-password" placeholder="64 or 128 hex characters"></label><button onclick="vcImportKey()">Import key</button><span id="vckeymsg" class="dim small"></span></div>
+<div class="hint" style="margin:-2px 0 6px 26px">Optional. If no private key is imported, one is generated randomly the first time the companion is turned on and kept in the config, so its identity stays the same across restarts.</div>
 <div class="rprow"><label>Name <input id="vc_name" maxlength="31" size="16"></label>
 <label>TCP port <input id="vc_port" type="number" min="1" max="65535" style="width:6em"></label>
 <label>Allowed addresses <input id="vc_allow" size="26" placeholder="anyone who can reach the port"></label></div>
