@@ -152,6 +152,17 @@ DEFAULT_CONFIG = {
     "repeater_regions": [],         #   region names ("#name" or "name"); unscoped floods are always relayed
     "repeater_airtime_pct": 10,     #   relays may use at most this share of airtime (100 = no cap)
     "repeater_loop_detect": "minimal",        # off / minimal / moderate / strict (the firmware's loop.detect)
+    "companion_enabled": False,     # virtual companion: a chat node on the room's radio that MeshCore apps connect to over TCP
+    "companion_name": "pyMeshRoom Companion",
+    "companion_key": "",            #   private key, hex: 32-byte seed or 64-byte MeshCore key ("" = make one, saved here)
+    "companion_port": 5000,         #   TCP port (as WiFi companion firmware); only open while the companion is enabled
+    "companion_bind": "0.0.0.0",    #   address the port listens on ("127.0.0.1" = this machine only)
+    "companion_allow": [],          #   IP addresses / networks allowed to connect ([] = anyone who can reach the port)
+    "companion_lat": 0.0,           #   its position (set from the app; shared in adverts only if the app says so)
+    "companion_lon": 0.0,
+    "companion_auto_advert": False, #   advert on its own every companion_advert_interval_min
+    "companion_advert_interval_min": 60,
+    "companion_advert_flood": False,          # auto adverts: flood (whole mesh) instead of zero-hop
 }
 
 
@@ -438,7 +449,7 @@ _ED_B = _ed_base()
 
 
 class RepeaterIdentity:
-    """The virtual repeater's own key, from the config: a 32-byte seed or a 64-byte MeshCore private key."""
+    """The virtual repeater's (or companion's) own key, from the config: a 32-byte seed or a 64-byte MeshCore private key."""
 
     def __init__(self, key):
         if len(key) == 32:
@@ -450,12 +461,17 @@ class RepeaterIdentity:
         self._a = int.from_bytes(key[:32], "little") & ((1 << 255) - 1)
         self._prefix = key[32:]
         self.pub_key = _ed_encode(_ed_mul(self._a, _ED_B))
+        self._x = X25519PrivateKey.from_private_bytes(key[:32])   # (the virtual companion's key exchange)
 
     def sign(self, msg):
         r = int.from_bytes(hashlib.sha512(self._prefix + msg).digest(), "little") % _ED_L
         big_r = _ed_encode(_ed_mul(r, _ED_B))
         h = int.from_bytes(hashlib.sha512(big_r + self.pub_key + msg).digest(), "little") % _ED_L
         return big_r + ((r + h * self._a) % _ED_L).to_bytes(32, "little")
+
+    def shared_secret(self, other_pub):
+        """ed25519_key_exchange: X25519 with the key's scalar and the peer's Ed25519 key converted (as LocalIdentity)."""
+        return self._x.exchange(X25519PublicKey.from_public_bytes(ed25519_pub_to_x25519(other_pub)))
 
 
 def transport_key(region):
@@ -1246,6 +1262,8 @@ class RoomServer:
         self.web_clients = (0, 0)         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.observer = None            # attached by main when explicitly enabled
         self.vr = None                    # VirtualRepeater while repeater_enabled
+        self.vc = None                    # VirtualCompanion while companion_enabled (started by main: needs the event queue)
+        self.web_vc_admin = {}
         self.consumed = False             # set while handling a packet that turned out to be for the room
         self.feed = None                  # ObserverFeed while MQTT augmentation is on         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.web_port_active = bool(cfg.web_port)
@@ -1393,7 +1411,16 @@ class RoomServer:
 
     # ------------------------------------------------------------------ TX queue
 
-    def queue_tx(self, pkt, prio, delay=0.0, deferrable=False, relay=False):
+    def queue_tx(self, pkt, prio, delay=0.0, deferrable=False, relay=False, src=None):
+        if self.vc is not None and src != "vc":
+            if self.vc.claims(pkt):                         # for the companion on this radio: handed over, never on the air
+                if not relay:
+                    self.seen_mark(pkt)
+                if self.vr is not None:
+                    self.vr.seen_mark(pkt)
+                self.vc.deliver(pkt.copy(), delay)
+                return
+            self.vc.deliver(pkt.copy(), delay)              # it hears everything this radio sends
         raw = pkt.encode()
         if not relay:
             self.seen_mark(pkt)
@@ -1549,6 +1576,8 @@ class RoomServer:
         self.rx_airtime_ms += self.airtime_ms(len(raw))
         self.stats["recv_flood" if pkt.is_flood else "recv_direct"] += 1
         consumed = self._room_rx(pkt)
+        if self.vc is not None:
+            consumed = self.vc.on_rx(pkt.copy(), raw) or consumed
         if self.vr is not None:
             self.vr.on_rx(pkt, consumed)
 
@@ -2988,6 +3017,100 @@ class RoomServer:
             out.update(self.vr.state(), key=hexs(self.vr.pub), id=hexs(self.vr.pub[:2]))
         return out
 
+    def companion_apply(self):
+        """Start, stop or update the virtual companion from the config (startup and every settings change). Its TCP
+        port is open only while it is enabled."""
+        c = self.cfg
+        if not c.companion_enabled:
+            if self.vc is not None:
+                self.vc.close()
+                log.info("virtual companion off (TCP port closed)")
+            self.vc = None
+            return
+        if not c.companion_key:                             # first start: a random identity, saved in the config
+            while True:
+                seed = os.urandom(32)
+                if RepeaterIdentity(seed).pub_key[0] not in (0x00, 0xFF):   # (reserved hashes)
+                    break
+            c.set("companion_key", seed.hex())
+        try:
+            ident = RepeaterIdentity(bytes.fromhex(str(c.companion_key)))
+        except ValueError as e:
+            log.error("companion_key: %s - the virtual companion stays off until the config has its key", e)
+            if self.vc is not None:
+                self.vc.close()
+            self.vc = None
+            return
+        if self.vc is None or self.vc.pub != ident.pub_key:
+            if self.vc is not None:
+                self.vc.close()
+            self.vc = VirtualCompanion(self, ident, CompanionStore(os.path.join(c.data_dir, "companion.db")))
+            log.info("virtual companion %r on, id %s", c.companion_name, hexs(ident.pub_key[:2]))
+            try:                                            # introduce the room (and repeater) and the companion to each other
+                self.vc.deliver(self.make_advert())
+                if self.vr is not None:
+                    lat, lon = self.vr.position()
+                    self.vc.deliver(make_advert(self.vr.id, ADV_TYPE_REPEATER, c.repeater_name, lat, lon))
+                adv = self.vc.make_self_advert()
+                adv.header = (adv.header & ~0x03) | ROUTE_DIRECT
+                adv.snr = VIRTUAL_LINK_SNR
+                self._room_rx(adv)
+            except Exception as e:
+                log.warning("virtual companion: introductions failed: %s", e)
+        self.vc.listen()
+
+    def companion_tx(self, pkt, prio):
+        """A packet from the virtual companion. The room hears it first, internally (and the virtual repeater, for
+        traces and discovery); it goes on the air unless it was only for them."""
+        rx = pkt.copy()
+        rx.snr, rx.rssi = VIRTUAL_LINK_SNR, 0
+        consumed = self._room_rx(rx)
+        t, p = pkt.ptype, pkt.payload
+        if t == PT_TRACE and pkt.is_direct and len(p) >= 9:
+            es = 1 << (p[8] & 3)
+            nxt = p[9 + pkt.path_len * es:9 + (pkt.path_len + 1) * es]
+            if nxt == self.id.pub_key[:es]:
+                consumed = True                             # its first hop is the room: relayed (or not) by _room_rx
+            elif self.vr is not None and nxt == self.vr.pub[:es]:
+                v = pkt.copy()
+                v.snr = VIRTUAL_LINK_SNR
+                self.vr.on_rx(v, False)
+                consumed = True
+        elif t == PT_CONTROL and self.vr is not None:
+            v = pkt.copy()
+            v.snr = VIRTUAL_LINK_SNR
+            self.vr.on_rx(v, consumed)                      # e.g. node discovery: the repeater next to it answers
+        if consumed and (pkt.is_flood or pkt.hop_count == 0 or t == PT_TRACE):
+            self.vc.stats["internal_out"] += 1
+            return
+        self.queue_tx(pkt, prio, 0.0, src="vc")
+
+    def companion_event(self, ev):
+        """vc_conn / vc_disc / vc_cmd from the TCP threads, and vc_cfg from the dashboard."""
+        if ev[0] == "vc_cfg":
+            for k, v in ev[1].items():
+                self.cfg.set(k, v)
+            self.companion_apply()
+        elif self.vc is not None:
+            self.vc.app_event(ev)
+        if ev[0] != "vc_cmd":
+            self.web_dirty = True                           # (not per command: an app syncing sends hundreds)
+
+    def vc_state(self):
+        """For everyone viewing the dashboard: no addresses (those are in vc_admin_state)."""
+        c = self.cfg
+        out = dict(enabled=self.vc is not None, name=c.companion_name, port=c.companion_port,
+                   auto_advert=bool(c.companion_auto_advert), advert_min=c.companion_advert_interval_min,
+                   advert_flood=bool(c.companion_advert_flood))
+        if self.vc is not None:
+            out.update(self.vc.state(), key=hexs(self.vc.pub), id=hexs(self.vc.pub[:2]))
+        return out
+
+    def vc_admin_state(self):
+        link = self.vc.link if self.vc is not None else None
+        return dict(bind=self.cfg.companion_bind, allow=list(self.cfg.companion_allow or []),
+                    client=link.peer if link is not None else None)
+
     def heard_from(self, m):
         """Any packet we can attribute to m: the 'Last heard' time (saved with the member)."""
         m.last_heard = now_s()
@@ -3489,6 +3612,8 @@ class RoomServer:
             self.next_flood_advert = now + self.cfg.flood_advert_interval_h * 3600
         if self.vr is not None:
             self.vr.periodic()
+        if self.vc is not None:
+            self.vc.periodic()
         if self.cfg.discovery_interval_min and now >= self.next_discovery:
             if not self.disc_due_since:
                 self.disc_due_since = now
@@ -3777,7 +3902,8 @@ class RoomServer:
                 uptime=0, last_rx=0, last_error="", brokers={
                     "gomesh": dict(enabled=bool(self.cfg.observer_gomesh), connected=False, last_publish=0, last_error=""),
                     "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}),
-            mqtt=self.mqtt_state(), repeater=self.vr_state())
+            mqtt=self.mqtt_state(), repeater=self.vr_state(), companion=self.vc_state())
+        self.web_vc_admin = self.vc_admin_state()          # (served to admins only)
 
     def member_inroutes(self, m, n=5):
         """Other paths the member's floods took to reach us (member side first), most seen first, excluding the current."""
@@ -3842,6 +3968,8 @@ class RoomServer:
         if not self.members and self.cfg.trace_neighbours:
             self.maybe_trace()                              # (no member rounds to hang it on)
         self.push_tick()
+        if self.vc is not None:
+            self.vc.service()                               # packets between the companion and the room, when due
         self.service_tx()
         self.periodic()
 
@@ -4174,6 +4302,1561 @@ class VirtualRepeater:
         relayed = sum(self.stats[k] for k in ("flood", "direct", "acks", "traces"))
         return dict(self.stats, relayed=relayed, per_min=round(len(recent) / (span / 60.0), 1),
                     airtime_used=round(100.0 * sum(x[1] for x in recent) / (span * 1000.0), 1))
+
+# ============================================================================
+# Virtual companion: a chat node on the room's radio that MeshCore apps reach over TCP
+# ============================================================================
+
+VC_FIRMWARE_VER_CODE = 10             # companion protocol level answered (v10: repeat flag + path hash mode in DEVICE_INFO)
+VC_MAX_CONTACTS = 350                 # as the firmware's larger builds
+VC_MAX_CHANNELS = 40
+VC_QUEUE_MAX = 64                     # messages waiting for the app (firmware: 16)
+VC_MAX_FRAME = 176                    # BaseSerialInterface MAX_FRAME_SIZE
+VC_MAX_TEXT_LEN = 160                 # BaseChatMesh MAX_TEXT_LEN
+VC_ACK_TABLE = 8
+VC_ADVERT_PATHS = 16
+VC_MAX_SIGN = 8 * 1024
+VC_PUBLIC_PSK = base64.b64decode("izOH6cXN6mrJ5e26oRXNcg==")
+PT_RAW_CUSTOM = 0x0F
+REQ_GET_TELEMETRY_DATA = 0x03
+
+# app -> companion commands (companion_radio MyMesh.cpp)
+CMD_APP_START, CMD_SEND_TXT_MSG, CMD_SEND_CHANNEL_TXT_MSG, CMD_GET_CONTACTS, CMD_GET_DEVICE_TIME = 1, 2, 3, 4, 5
+CMD_SET_DEVICE_TIME, CMD_SEND_SELF_ADVERT, CMD_SET_ADVERT_NAME, CMD_ADD_UPDATE_CONTACT = 6, 7, 8, 9
+CMD_SYNC_NEXT_MESSAGE, CMD_SET_RADIO_PARAMS, CMD_SET_RADIO_TX_POWER, CMD_RESET_PATH = 10, 11, 12, 13
+CMD_SET_ADVERT_LATLON, CMD_REMOVE_CONTACT, CMD_SHARE_CONTACT, CMD_EXPORT_CONTACT, CMD_IMPORT_CONTACT = 14, 15, 16, 17, 18
+CMD_REBOOT, CMD_GET_BATT_AND_STORAGE, CMD_SET_TUNING_PARAMS, CMD_DEVICE_QUERY = 19, 20, 21, 22
+CMD_EXPORT_PRIVATE_KEY, CMD_IMPORT_PRIVATE_KEY, CMD_SEND_RAW_DATA, CMD_SEND_LOGIN, CMD_SEND_STATUS_REQ = 23, 24, 25, 26, 27
+CMD_HAS_CONNECTION, CMD_LOGOUT, CMD_GET_CONTACT_BY_KEY, CMD_GET_CHANNEL, CMD_SET_CHANNEL = 28, 29, 30, 31, 32
+CMD_SIGN_START, CMD_SIGN_DATA, CMD_SIGN_FINISH, CMD_SEND_TRACE_PATH, CMD_SET_DEVICE_PIN = 33, 34, 35, 36, 37
+CMD_SET_OTHER_PARAMS, CMD_SEND_TELEMETRY_REQ, CMD_GET_CUSTOM_VARS, CMD_SET_CUSTOM_VAR = 38, 39, 40, 41
+CMD_GET_ADVERT_PATH, CMD_GET_TUNING_PARAMS = 42, 43
+CMD_SEND_BINARY_REQ, CMD_FACTORY_RESET, CMD_SEND_PATH_DISCOVERY_REQ = 50, 51, 52
+CMD_SET_FLOOD_SCOPE_KEY, CMD_SEND_CONTROL_DATA, CMD_GET_STATS, CMD_SEND_ANON_REQ = 54, 55, 56, 57
+CMD_SET_AUTOADD_CONFIG, CMD_GET_AUTOADD_CONFIG, CMD_GET_ALLOWED_REPEAT_FREQ, CMD_SET_PATH_HASH_MODE = 58, 59, 60, 61
+CMD_SEND_CHANNEL_DATA, CMD_SET_DEFAULT_FLOOD_SCOPE, CMD_GET_DEFAULT_FLOOD_SCOPE, CMD_SEND_RAW_PACKET = 62, 63, 64, 65
+CMD_RUN_CLI_COMMAND = 66
+
+# companion -> app replies
+RESP_OK, RESP_ERR, RESP_CONTACTS_START, RESP_CONTACT, RESP_END_OF_CONTACTS, RESP_SELF_INFO, RESP_SENT = 0, 1, 2, 3, 4, 5, 6
+RESP_CONTACT_MSG_RECV, RESP_CHANNEL_MSG_RECV, RESP_CURR_TIME, RESP_NO_MORE_MESSAGES, RESP_EXPORT_CONTACT = 7, 8, 9, 10, 11
+RESP_BATT_AND_STORAGE, RESP_DEVICE_INFO, RESP_PRIVATE_KEY, RESP_DISABLED = 12, 13, 14, 15
+RESP_CONTACT_MSG_RECV_V3, RESP_CHANNEL_MSG_RECV_V3, RESP_CHANNEL_INFO, RESP_SIGN_START, RESP_SIGNATURE = 16, 17, 18, 19, 20
+RESP_CUSTOM_VARS, RESP_ADVERT_PATH, RESP_TUNING_PARAMS, RESP_STATS, RESP_AUTOADD_CONFIG = 21, 22, 23, 24, 25
+RESP_ALLOWED_REPEAT_FREQ, RESP_CHANNEL_DATA_RECV, RESP_DEFAULT_FLOOD_SCOPE, RESP_CLI_REPLY = 26, 27, 28, 29
+
+# companion -> app pushes (sent at any time)
+PUSH_ADVERT, PUSH_PATH_UPDATED, PUSH_SEND_CONFIRMED, PUSH_MSG_WAITING, PUSH_RAW_DATA = 0x80, 0x81, 0x82, 0x83, 0x84
+PUSH_LOGIN_SUCCESS, PUSH_LOGIN_FAIL, PUSH_STATUS_RESPONSE, PUSH_LOG_RX_DATA, PUSH_TRACE_DATA = 0x85, 0x86, 0x87, 0x88, 0x89
+PUSH_NEW_ADVERT, PUSH_TELEMETRY_RESPONSE, PUSH_BINARY_RESPONSE, PUSH_PATH_DISCOVERY_RESPONSE = 0x8A, 0x8B, 0x8C, 0x8D
+PUSH_CONTROL_DATA, PUSH_CONTACT_DELETED, PUSH_CONTACTS_FULL = 0x8E, 0x8F, 0x90
+
+ERR_UNSUPPORTED_CMD, ERR_NOT_FOUND, ERR_TABLE_FULL, ERR_BAD_STATE, ERR_FILE_IO, ERR_ILLEGAL_ARG = 1, 2, 3, 4, 5, 6
+
+# settings an app may send that belong to the whole radio (or to hardware the companion doesn't have): acknowledged
+# so the app is happy, never applied
+VC_IGNORED = {CMD_SET_RADIO_PARAMS: "radio parameters", CMD_SET_RADIO_TX_POWER: "TX power",
+              CMD_SET_TUNING_PARAMS: "tuning parameters", CMD_SET_DEVICE_PIN: "Bluetooth PIN",
+              CMD_SET_PATH_HASH_MODE: "path hash mode", CMD_REBOOT: "reboot", CMD_FACTORY_RESET: "factory reset",
+              CMD_IMPORT_PRIVATE_KEY: "private key import", CMD_SET_DEVICE_TIME: "clock",
+              CMD_RUN_CLI_COMMAND: "CLI command"}
+
+
+def snr4(snr):
+    return struct.pack("b", max(-128, min(127, int(snr * 4))))
+
+
+def channel_hash(secret16):
+    return hashlib.sha256(secret16).digest()[0]
+
+
+def utf8_cut(b, n):
+    """At most n bytes of UTF-8, never ending mid-character."""
+    b = b[:n]
+    while b:
+        try:
+            b.decode()
+            return b
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return b
+
+
+def companion_changes(body):
+    """Dashboard companion settings -> {config key: value}, validated. Raises ValueError with a readable message."""
+    import ipaddress
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    ch = {}
+    for j, k in (("enabled", "companion_enabled"), ("auto_advert", "companion_auto_advert"),
+                 ("advert_flood", "companion_advert_flood")):
+        if j in body:
+            ch[k] = bool(body[j])
+    if "private_key" in body:
+        key = str(body["private_key"]).strip().lower()
+        if len(key) not in (64, 128) or any(c not in "0123456789abcdef" for c in key):
+            raise ValueError("private key must be 64 or 128 hexadecimal characters")
+        RepeaterIdentity(bytes.fromhex(key))                # never returned through dashboard state or logs
+        ch["companion_key"] = key
+    if "name" in body:
+        name = str(body["name"]).strip()
+        if not name or len(name.encode()) > 31:
+            raise ValueError("name: 1 to 31 bytes")
+        ch["companion_name"] = name
+    if "port" in body:
+        try:
+            port = int(body["port"])
+        except (TypeError, ValueError):
+            raise ValueError("port: not a number")
+        if not 1 <= port <= 65535:
+            raise ValueError("port: 1 to 65535")
+        ch["companion_port"] = port
+    if "advert_min" in body:
+        try:
+            v = int(body["advert_min"])
+        except (TypeError, ValueError):
+            raise ValueError("advert interval: not a number")
+        if not 1 <= v <= 10080:
+            raise ValueError("advert interval: 1 to 10080 minutes")
+        ch["companion_advert_interval_min"] = v
+    if "allow" in body:
+        allow = body["allow"]
+        if isinstance(allow, str):
+            allow = allow.replace(";", ",").split(",")
+        allow = [str(a).strip() for a in allow if str(a).strip()]
+        for a in allow:
+            try:
+                ipaddress.ip_network(a, strict=False)
+            except ValueError:
+                raise ValueError("allowed address %r: an IP address or network such as 192.168.1.0/24" % a)
+        ch["companion_allow"] = allow
+    return ch
+
+
+class VCContact:
+    __slots__ = ("pub", "type", "flags", "out_len", "out_path", "name", "adv_ts", "lat", "lon", "lastmod",
+                 "sync_since", "advert", "secret")
+
+    def __init__(self, pub):
+        self.pub = pub
+        self.type = self.flags = self.adv_ts = self.lat = self.lon = self.lastmod = self.sync_since = 0
+        self.out_len = None                                 # None = no known route (flood)
+        self.out_path = b""
+        self.name = ""
+        self.advert = b""                                   # last advert, raw (export / share)
+        self.secret = None
+
+    def frame(self, code):
+        """writeContactRespFrame."""
+        return bytes([code]) + self.pub + bytes([self.type, self.flags, 0xFF if self.out_len is None else self.out_len]) \
+            + self.out_path[:MAX_PATH_SIZE].ljust(MAX_PATH_SIZE, b"\0") + utf8_cut(self.name.encode(), 31).ljust(32, b"\0") \
+            + struct.pack("<IiiI", self.adv_ts & 0xFFFFFFFF, self.lat, self.lon, self.lastmod & 0xFFFFFFFF)
+
+
+class CompanionStore:
+    """companion.db: the virtual companion's contacts, channels, settings and the messages waiting for the app. Kept
+    apart from room.db: made the first time the companion is enabled, and deleting it resets only the companion."""
+
+    TABLES = {
+        "contacts": ("pubkey BLOB PRIMARY KEY", "type INT", "flags INT", "out_len INT", "out_path BLOB", "name TEXT",
+                     "adv_ts INT", "lat INT", "lon INT", "lastmod INT", "sync_since INT", "advert BLOB"),
+        "channels": ("idx INT PRIMARY KEY", "name TEXT", "secret BLOB"),
+        "prefs": ("k TEXT PRIMARY KEY", "v TEXT"),
+        "queue": ("id INTEGER PRIMARY KEY AUTOINCREMENT", "frame BLOB"),
+    }
+
+    def __init__(self, path):
+        self.path = path
+        if not os.path.exists(path):
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))   # holds private messages: owner-only from the start
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        self.db = sqlite3.connect(path)
+        for table, cols in self.TABLES.items():
+            self.db.execute("CREATE TABLE IF NOT EXISTS %s (%s)" % (table, ", ".join(cols)))
+        self.db.commit()
+
+    def contacts(self):
+        out = []
+        for r in self.db.execute("SELECT pubkey, type, flags, out_len, out_path, name, adv_ts, lat, lon, lastmod, sync_since, "
+                                 "advert FROM contacts ORDER BY rowid"):
+            c = VCContact(bytes(r[0]))
+            c.type, c.flags = r[1] or 0, r[2] or 0
+            c.out_len = r[3] if r[3] is not None and r[3] >= 0 and path_valid(r[3]) else None
+            c.out_path = bytes(r[4] or b"")
+            c.name, c.adv_ts, c.lat, c.lon, c.lastmod, c.sync_since = r[5] or "", r[6] or 0, r[7] or 0, r[8] or 0, r[9] or 0, r[10] or 0
+            c.advert = bytes(r[11] or b"")
+            out.append(c)
+        return out
+
+    def save_contacts(self, cs):
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO contacts (pubkey, type, flags, out_len, out_path, name, adv_ts, lat, lon, "
+                                "lastmod, sync_since, advert) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                [(c.pub, c.type, c.flags, -1 if c.out_len is None else c.out_len, c.out_path, c.name, c.adv_ts,
+                                  c.lat, c.lon, c.lastmod, c.sync_since, c.advert) for c in cs])
+
+    def delete_contact(self, pub):
+        with self.db:
+            self.db.execute("DELETE FROM contacts WHERE pubkey=?", (pub,))
+
+    def channels(self):
+        return {r[0]: (r[1] or "", bytes(r[2] or bytes(16))) for r in self.db.execute("SELECT idx, name, secret FROM channels")}
+
+    def save_channel(self, idx, name, secret):
+        with self.db:
+            if not name and not any(secret):
+                self.db.execute("DELETE FROM channels WHERE idx=?", (idx,))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO channels VALUES (?,?,?)", (idx, name, secret))
+
+    def prefs(self):
+        out = {}
+        for k, v in self.db.execute("SELECT k, v FROM prefs"):
+            try:
+                out[k] = json.loads(v)
+            except ValueError:
+                pass
+        return out
+
+    def save_prefs(self, prefs):
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO prefs VALUES (?,?)", [(k, json.dumps(v)) for k, v in prefs.items()])
+
+    def queued(self):
+        return [(r[0], bytes(r[1])) for r in self.db.execute("SELECT id, frame FROM queue ORDER BY id")]
+
+    def queue_add(self, frame):
+        with self.db:
+            return self.db.execute("INSERT INTO queue (frame) VALUES (?)", (frame,)).lastrowid
+
+    def queue_remove(self, qid):
+        with self.db:
+            self.db.execute("DELETE FROM queue WHERE id=?", (qid,))
+
+    def close(self):
+        try:
+            self.db.close()
+        except sqlite3.Error:
+            pass
+
+
+class CompanionLink:
+    """The companion's TCP port, as WiFi companion firmware: one app at a time (a new connection replaces the old one),
+    frames "<" + u16 length + payload in and ">" + u16 length + payload out. Accepting and reading run on their own
+    threads and hand each command to the main loop as an event; replies are written from the main loop."""
+
+    ids = iter(range(1, 1 << 62))                          # connection ids, unique across links (a port change)
+
+    def __init__(self, bind, port, put, allowed):
+        self.bind, self.port, self.put, self.allowed = bind, port, put, allowed
+        self.lock = threading.Lock()
+        self.client, self.peer, self.client_id = None, None, 0
+        self.backlog = {}                                   # connection id -> commands handed to the main loop, not yet handled
+        self.running = True
+        fam = socket.AF_INET6 if ":" in bind else socket.AF_INET
+        self.sock = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind((bind, port))
+            self.sock.listen(2)
+        except OSError:
+            self.sock.close()
+            raise
+        self.port = self.sock.getsockname()[1]              # (port 0 in tests: the one the OS picked)
+        threading.Thread(target=self._accept, name="companion-accept", daemon=True).start()
+
+    def connected(self):
+        return self.client is not None
+
+    def _accept(self):
+        while self.running:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError:
+                break
+            ip = addr[0]
+            if not self.allowed(ip):
+                log.warning("virtual companion: refused a connection from %s (not in companion_allow)", ip)
+                conn.close()
+                continue
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 3, 0))  # a stalled app can't block the room
+            except (OSError, struct.error):
+                pass
+            with self.lock:
+                old = self.client
+                cid = self.client_id = next(CompanionLink.ids)
+                self.client, self.peer = conn, ip
+            if old is not None:
+                self._close(old)
+            self.put(("vc_conn", cid, ip))
+            threading.Thread(target=self._read, args=(conn, cid), name="companion-read", daemon=True).start()
+
+    def _read(self, conn, cid):
+        buf = b""
+        try:
+            while self.running:
+                d = conn.recv(4096)
+                if not d:
+                    break
+                buf += d
+                while True:
+                    i = buf.find(b"<")
+                    if i < 0:
+                        buf = b""
+                        break
+                    buf = buf[i:]
+                    if len(buf) < 3:
+                        break
+                    n = struct.unpack_from("<H", buf, 1)[0]
+                    if not 0 < n <= VC_MAX_FRAME:
+                        buf = buf[1:]                       # not a frame start: resynchronise
+                        continue
+                    if len(buf) < 3 + n:
+                        break
+                    frame, buf = buf[3:3 + n], buf[3 + n:]
+                    while self.backlog.get(cid, 0) > 64 and self.running and self.client is conn:
+                        time.sleep(0.01)                    # an app flooding commands waits; the room doesn't
+                    with self.lock:
+                        self.backlog[cid] = self.backlog.get(cid, 0) + 1
+                    self.put(("vc_cmd", cid, frame))
+        except OSError:
+            pass
+        finally:
+            with self.lock:
+                if self.client is conn:
+                    self.client, self.peer = None, None
+                self.backlog.pop(cid, None)
+            self._close(conn)
+            self.put(("vc_disc", cid))
+
+    def done(self, cid):
+        """The main loop handled one of this connection's commands."""
+        with self.lock:
+            if self.backlog.get(cid):
+                self.backlog[cid] -= 1
+
+    @staticmethod
+    def _close(conn):
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        conn.close()
+
+    def send(self, frame):
+        conn = self.client
+        if conn is None:
+            return False
+        try:
+            conn.sendall(b">" + struct.pack("<H", len(frame)) + frame)
+            return True
+        except OSError:
+            with self.lock:
+                if self.client is conn:
+                    self.client, self.peer = None, None
+            self._close(conn)
+            return False
+
+    def stop(self):
+        self.running = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)            # wakes the blocked accept() (close alone leaves it listening)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        with self.lock:
+            conn, self.client, self.peer = self.client, None, None
+        if conn is not None:
+            self._close(conn)
+
+
+class VirtualCompanion:
+    """A MeshCore chat node (companion_radio firmware: MyMesh.cpp + BaseChatMesh.cpp) with its own key, sharing the
+    room's radio, that phone apps drive over TCP. It doesn't repeat. The room and the virtual repeater are on the same
+    radio, so traffic between them and the companion never goes on the air: what the room or repeater sends that is for
+    the companion is handed to it, what the companion sends hears the room first, and anything that was only for the
+    room isn't transmitted. Radio-wide settings from the app are acknowledged and ignored (VC_IGNORED)."""
+
+    PREFS = dict(manual_add=0, autoadd_config=0, autoadd_max_hops=0, telem_base=0, telem_loc=0, telem_env=0,
+                 advert_loc_policy=0, multi_acks=0, app_ver=3, scope_name="", scope_key="")
+
+    def __init__(self, room, ident, store):
+        self.room, self.id, self.pub, self.store = room, ident, ident.pub_key, store
+        self.contacts = collections.OrderedDict((c.pub, c) for c in store.contacts())
+        self.anon = {}                                      # transient contacts for requests to non-contacts (not kept)
+        self.channels = store.channels()                    # idx -> (name, 16-byte secret)
+        if not self.channels:
+            self.channels[0] = ("Public", VC_PUBLIC_PSK)
+            store.save_channel(0, "Public", VC_PUBLIC_PSK)
+        self.prefs = dict(self.PREFS)
+        self.prefs.update({k: v for k, v in store.prefs().items() if k in self.PREFS})
+        self.queue = store.queued()                         # [(row id, frame)], oldest first
+        self.seen = {}
+        self.inbox, self.outbox, self.seq = [], [], 0      # heaps: packets to/from the room, due when the radio would send
+        self.expected = collections.deque(maxlen=VC_ACK_TABLE)   # [ack, sent (monotonic), contact pub]
+        self.pending = dict(login=None, status=None, telemetry=None, req=None, discovery=None)
+        self.traces = {}                                    # tag -> expiry: our own traces (their results go to the app)
+        self.connections = {}                               # server pub -> keep-alive state (logins with keep-alive)
+        self.advert_paths = collections.OrderedDict()       # pub[:7] -> (recv ts, path_len, path)
+        self.send_scope, self.send_unscoped = None, False
+        self.sign_buf = None
+        self.last_unique = 0
+        self.link, self.link_error, self.link_addr = None, "", None
+        self.dirty = set()
+        self.next_flush = time.monotonic() + 15
+        self.next_advert = time.monotonic() + 10
+        self.ignored_logged = set()
+        self.stats = dict(rx=0, internal_in=0, internal_out=0, msgs_in=0, msgs_out=0, frames=0, ignored=0)
+
+    cfg = property(lambda s: s.room.cfg)
+
+    # ---------------------------------------------------------------- app link
+
+    def listen(self):
+        """Open (or move) the TCP port. Only called while the companion is enabled: the port is closed otherwise."""
+        want = (str(self.cfg.companion_bind or "0.0.0.0"), int(self.cfg.companion_port))
+        if self.link is not None and self.link_addr == want:
+            return
+        if self.link is not None:
+            self.link.stop()
+            self.link = None
+        put = getattr(self.room, "events_put", None) or (lambda ev: None)
+        try:
+            self.link = CompanionLink(want[0], want[1], put, self.allowed)
+            self.link_addr, self.link_error = want, ""
+            log.info("virtual companion: listening on %s:%d", want[0], self.link.port)
+        except OSError as e:
+            self.link_addr, self.link_error = None, str(e.strerror or e)
+            log.error("virtual companion: can't open TCP port %d on %s: %s", want[1], want[0], self.link_error)
+
+    def allowed(self, ip):
+        import ipaddress
+        nets = self.cfg.companion_allow or []
+        if isinstance(nets, str):                           # (hand-edited config: "a, b")
+            nets = [n.strip() for n in nets.split(",") if n.strip()]
+        if not nets:
+            return True
+        try:
+            a = ipaddress.ip_address(ip.split("%")[0])
+            if getattr(a, "ipv4_mapped", None):
+                a = a.ipv4_mapped
+            return any(a in ipaddress.ip_network(str(n), strict=False) for n in nets)
+        except ValueError:
+            return False
+
+    def close(self):
+        if self.link is not None:
+            self.link.stop()
+            self.link = None
+        self.flush()
+        self.store.close()
+
+    connected = property(lambda s: s.link is not None and s.link.connected())
+
+    def write(self, frame):
+        if self.link is not None:
+            self.link.send(frame[:VC_MAX_FRAME])
+
+    def ok(self):
+        self.write(bytes([RESP_OK]))
+
+    def err(self, code):
+        self.write(bytes([RESP_ERR, code]))
+
+    def app_event(self, ev):
+        kind, cid = ev[0], ev[1]
+        link = self.link
+        if link is not None and kind == "vc_cmd":
+            link.done(cid)
+        if link is None or cid != link.client_id:
+            return                                          # from a connection that has since been replaced
+        if kind == "vc_conn":
+            self.sign_buf = None
+            log.info("virtual companion: app connected from %s", ev[2])
+        elif kind == "vc_disc":
+            log.info("virtual companion: app disconnected")
+        elif kind == "vc_cmd":
+            self.on_frame(ev[2])
+
+    # ---------------------------------------------------------------- helpers
+
+    def unique_time(self):
+        self.last_unique = max(now_s(), self.last_unique + 1)
+        return self.last_unique
+
+    def secret(self, c):
+        if c.secret is None:
+            try:
+                c.secret = self.id.shared_secret(c.pub)
+            except ValueError:                              # not a usable public key: nothing decrypts with it
+                c.secret = bytes(32)
+        return c.secret
+
+    def find(self, prefix):
+        for tab in (self.contacts, self.anon):
+            for pub, c in tab.items():
+                if pub[:len(prefix)] == prefix:
+                    return c
+        return None
+
+    def contact(self, pub):
+        return self.contacts.get(pub) or self.anon.get(pub)
+
+    def touch(self, c):
+        if c.pub in self.contacts:
+            self.dirty.add(c.pub)
+
+    def save_prefs(self):
+        self.store.save_prefs(self.prefs)
+
+    def was_seen(self, pkt):
+        return pkt.packet_hash() in self.seen
+
+    def seen_mark(self, pkt):
+        self.seen[pkt.packet_hash()] = None
+        while len(self.seen) > 512:
+            self.seen.pop(next(iter(self.seen)))
+
+    def check_dup(self, pkt):
+        if self.was_seen(pkt):
+            return True
+        self.seen_mark(pkt)
+        return False
+
+    def flush(self):
+        if self.dirty:
+            self.store.save_contacts([self.contacts[k] for k in self.dirty if k in self.contacts])
+            self.dirty.clear()
+
+    def position(self):
+        if self.prefs["advert_loc_policy"] == 0:            # ADVERT_LOC_NONE (the app's "share position" setting)
+            return 0.0, 0.0
+        return float(self.cfg.companion_lat or 0), float(self.cfg.companion_lon or 0)
+
+    def make_self_advert(self):
+        lat, lon = self.position()
+        return make_advert(self.id, ADV_TYPE_CHAT, self.cfg.companion_name, lat, lon)
+
+    # ---------------------------------------------------------------- sending
+
+    def scope_key(self):
+        if self.send_unscoped:
+            return None
+        if self.send_scope:
+            return self.send_scope
+        return bytes.fromhex(self.prefs["scope_key"]) if self.prefs["scope_key"] else None
+
+    def send_flood(self, pkt, delay=0.0, scope=None):
+        key = self.scope_key() if scope is None else scope
+        pkt.path_len, pkt.path = int(self.cfg.path_hash_mode or 0) << 6, b""
+        if key:
+            pkt.header = (pkt.header & ~0x03) | ROUTE_TRANSPORT_FLOOD
+            pkt.transport_codes = (transport_code(key, pkt), 0)
+        else:
+            pkt.header = (pkt.header & ~0x03) | ROUTE_FLOOD
+        self._out(pkt, 2 if pkt.ptype == PT_PATH else 3 if pkt.ptype == PT_ADVERT else 1, delay)
+
+    def send_direct(self, pkt, path, plen, delay=0.0):
+        if self.room.vr is not None and plen & 63:
+            path, plen = self.room.vr.strip_first_hops(path, plen)   # our own repeater is this radio: skip it
+        pkt.header = (pkt.header & ~0x03) | ROUTE_DIRECT
+        pkt.path_len, pkt.path = plen, path[:path_bytes(plen)]
+        self._out(pkt, 1 if pkt.ptype == PT_PATH else 0, delay)
+
+    def send_zero_hop(self, pkt, delay=0.0):
+        pkt.header = (pkt.header & ~0x03) | ROUTE_DIRECT
+        pkt.path_len, pkt.path = 0, b""
+        self._out(pkt, 0, delay)
+
+    def send_to(self, c, pkt, delay=0.0):
+        if c.out_len is None:
+            self.send_flood(pkt, delay)
+        else:
+            self.send_direct(pkt, c.out_path, c.out_len, delay)
+
+    def _out(self, pkt, prio, delay):
+        self.seen_mark(pkt)
+        self.seq += 1
+        heapq.heappush(self.outbox, (time.monotonic() + delay, self.seq, pkt, prio))
+
+    def deliver(self, pkt, delay=0.0):
+        """Something the room or the virtual repeater is sending: this node hears it (internally), when it's sent."""
+        self.seq += 1
+        heapq.heappush(self.inbox, (time.monotonic() + delay, self.seq, pkt))
+
+    def service(self):
+        now = time.monotonic()
+        while self.inbox and self.inbox[0][0] <= now:
+            pkt = heapq.heappop(self.inbox)[2]
+            pkt.snr, pkt.rssi = VIRTUAL_LINK_SNR, 0
+            self.on_rx(pkt)
+        while self.outbox and self.outbox[0][0] <= now:
+            _, _, pkt, prio = heapq.heappop(self.outbox)
+            self.room.companion_tx(pkt, prio)
+
+    def est_timeout(self, pkt):
+        t = self.room.airtime_ms(pkt.raw_length())
+        if pkt.is_flood:
+            return int(500 + 16 * t)
+        return int(500 + (t * 6 + 250) * ((pkt.path_len & 63) + 1))
+
+    def sent_frame(self, pkt, tag):
+        return bytes([RESP_SENT, 1 if pkt.is_flood else 0]) + tag + struct.pack("<I", self.est_timeout(pkt))
+
+    def make_datagram(self, ptype, c, data):
+        return Packet(ptype, bytes([c.pub[0], self.pub[0]]) + encrypt_then_mac(self.secret(c), data))
+
+    def make_path_return(self, c, path, plen, extra_type=None, extra=b""):
+        if path_bytes(plen) + len(extra) + 5 > MAX_PACKET_PAYLOAD - 2 - CIPHER_BLOCK_SIZE:
+            return None
+        data = bytes([plen]) + path[:path_bytes(plen)]
+        data += bytes([extra_type]) + extra if extra else b"\xFF" + os.urandom(4)
+        return Packet(PT_PATH, bytes([c.pub[0], self.pub[0]]) + encrypt_then_mac(self.secret(c), data))
+
+    def send_advert(self, flood):
+        pkt = self.make_self_advert()
+        if flood:
+            key = bytes.fromhex(self.prefs["scope_key"]) if self.prefs["scope_key"] else None
+            self.send_flood(pkt, scope=key or b"")
+        else:
+            self.send_zero_hop(pkt)
+        log.info("virtual companion: sent %s advert", "flood" if flood else "zero-hop")
+
+    # ---------------------------------------------------------------- what the room hands over
+
+    def expects_ack(self, ack):
+        return any(e[0] == ack for e in self.expected) or any(cn["ack"] == ack for cn in self.connections.values())
+
+    def claims(self, pkt):
+        """Is this packet, about to be sent by the room or the virtual repeater, for this node? Then it's handed over
+        instead of going on the air. Decides without changing anything (the packet is processed when it's due)."""
+        t, p = pkt.ptype, pkt.payload
+        if t == PT_TRACE:
+            return pkt.is_direct and len(p) >= 9 and p[:4] in self.traces \
+                and (pkt.path_len << (p[8] & 3)) >= len(p) - 9
+        if pkt.is_direct and pkt.hop_count > 0:
+            return False
+        if t == PT_ACK:
+            return len(p) >= 4 and self.expects_ack(p[:4])
+        if t == PT_MULTIPART:
+            return len(p) >= 5 and (p[0] & 0x0F) == PT_ACK and self.expects_ack(p[1:5])
+        if t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG):
+            if len(p) <= 2 + CIPHER_MAC_SIZE or p[0] != self.pub[0]:
+                return False
+            return any(mac_then_decrypt(self.secret(c), p[2:]) is not None
+                       for tab in (self.contacts, self.anon) for c in tab.values() if c.pub[0] == p[1])
+        return False
+
+    # ---------------------------------------------------------------- receive (Mesh::onRecvPacket, no forwarding)
+
+    def on_rx(self, pkt, raw=None):
+        """A packet heard on the radio (raw given) or handed over internally. True if it was for this node (then the
+        virtual repeater doesn't relay it)."""
+        try:
+            if raw is not None:
+                self.stats["rx"] += 1
+                if self.connected and len(raw) + 3 <= VC_MAX_FRAME:
+                    self.write(bytes([PUSH_LOG_RX_DATA]) + snr4(pkt.snr) + struct.pack("b", max(-128, min(127, int(pkt.rssi)))) + raw)
+            else:
+                self.stats["internal_in"] += 1
+            return self._rx(pkt)
+        except Exception:
+            log.exception("virtual companion")
+            return False
+
+    def _rx(self, pkt):
+        t, p = pkt.ptype, pkt.payload
+        if pkt.is_direct and t == PT_TRACE:
+            return self.rx_trace(pkt)
+        if pkt.is_direct and t == PT_CONTROL and p[:1] and p[0] & 0x80:
+            if pkt.hop_count == 0:
+                self.write(bytes([PUSH_CONTROL_DATA]) + snr4(pkt.snr) + struct.pack("b", max(-128, min(127, int(pkt.rssi))))
+                           + bytes([pkt.path_len]) + p)
+            return False
+        if pkt.is_direct and pkt.hop_count > 0:
+            if t == PT_ACK and len(p) >= 4:
+                self.process_ack(p[:4])                     # an ACK on its way past us (firmware does this too)
+            return False
+        if t == PT_ACK:
+            return len(p) >= 4 and not self.check_dup(pkt) and self.process_ack(p[:4], pkt)
+        if t == PT_MULTIPART:
+            if len(p) >= 5 and (p[0] & 0x0F) == PT_ACK:
+                tmp = Packet(PT_ACK, p[1:])
+                tmp.header, tmp.path_len, tmp.path = pkt.header, pkt.path_len, pkt.path
+                return not self.check_dup(tmp) and self.process_ack(p[1:5], tmp)
+            return False
+        if t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG):
+            return self.rx_peer(pkt)
+        if t in (PT_GRP_TXT, PT_GRP_DATA):
+            self.rx_group(pkt)
+        elif t == PT_ADVERT:
+            self.rx_advert(pkt)
+        elif t == PT_RAW_CUSTOM and pkt.is_direct and not self.check_dup(pkt):
+            self.write(bytes([PUSH_RAW_DATA]) + snr4(pkt.snr) + struct.pack("b", max(-128, min(127, int(pkt.rssi)))) + b"\xFF" + p)
+        return False
+
+    def rx_trace(self, pkt):
+        p = pkt.payload
+        if len(p) < 9 or pkt.path_len >= MAX_PATH_SIZE:
+            return False
+        flags = p[8]
+        sz = flags & 3
+        hashes = p[9:]
+        if (pkt.path_len << sz) < len(hashes) or p[:4] not in self.traces:
+            return False                                    # not at its end yet, or not one of ours
+        del self.traces[p[:4]]
+        self.write(bytes([PUSH_TRACE_DATA, 0, len(hashes), flags]) + p[:8] + hashes + pkt.path[:len(hashes) >> sz] + snr4(pkt.snr))
+        return True
+
+    def rx_peer(self, pkt):
+        p = pkt.payload
+        if len(p) <= 2 + CIPHER_MAC_SIZE or self.check_dup(pkt) or p[0] != self.pub[0]:
+            return False
+        for c in [c for tab in (self.contacts, self.anon) for c in tab.values() if c.pub[0] == p[1]]:
+            data = mac_then_decrypt(self.secret(c), p[2:])
+            if data is None:
+                continue
+            self.mark_active(c)
+            if pkt.ptype == PT_PATH:
+                self.rx_path(pkt, c, data)
+            else:
+                self.rx_data(pkt, c, data)
+            return True
+        return False
+
+    def rx_path(self, pkt, c, data):
+        plen = data[0]
+        if not path_valid(plen):
+            return
+        k = 1 + path_bytes(plen)
+        path = bytes(data[1:k])
+        extra_type = data[k] & 0x0F if k < len(data) else 0xFF
+        extra = data[k + 1:]
+        if extra_type == PT_RESPONSE and len(extra) > 4 and extra[:4] == self.pending["discovery"]:
+            self.pending["discovery"] = None                # path discovery answered: report both ways, no reciprocal path
+            if path_valid(pkt.path_len):
+                self.write(bytes([PUSH_PATH_DISCOVERY_RESPONSE, 0]) + c.pub[:6] + bytes([plen]) + path
+                           + bytes([pkt.path_len]) + pkt.path[:path_bytes(pkt.path_len)])
+            return
+        c.out_len, c.out_path = plen, path
+        c.lastmod = now_s()
+        self.touch(c)
+        self.write(bytes([PUSH_PATH_UPDATED]) + c.pub)
+        if extra_type == PT_ACK and len(extra) >= 4:
+            self.process_ack(extra[:4])
+        elif extra_type == PT_RESPONSE and extra:
+            self.on_response(c, extra)
+        if pkt.is_flood:                                    # reciprocal path, sent direct on the path we were given
+            pr = self.make_path_return(c, pkt.path, pkt.path_len)
+            if pr:
+                self.send_direct(pr, path, plen, 0.5)
+
+    def rx_data(self, pkt, c, data):
+        t = pkt.ptype
+        if t == PT_TXT_MSG and len(data) > 5:
+            ts = struct.unpack_from("<I", data, 0)[0]
+            flags = data[4] >> 2
+            text = data[5:].split(b"\0", 1)[0]
+            if flags == TXT_TYPE_PLAIN:
+                c.lastmod = now_s()
+                self.touch(c)
+                self.queue_msg(c, TXT_TYPE_PLAIN, pkt, ts, b"", text)
+                tail = data[5 + len(text) + 1:5 + len(text) + 2] or b"\0"
+                self.reply_ack(pkt, c, sha256(data[:5 + len(text)], c.pub)[:4] + tail + os.urandom(1))
+            elif flags == TXT_TYPE_CLI_DATA:
+                self.queue_msg(c, TXT_TYPE_CLI_DATA, pkt, ts, b"", text)
+                if pkt.is_flood:
+                    pr = self.make_path_return(c, pkt.path, pkt.path_len)
+                    if pr:
+                        self.send_flood(pr)
+            elif flags == TXT_TYPE_SIGNED_PLAIN and len(data) > 9:
+                if ts > c.sync_since:
+                    c.sync_since = ts                       # room posts: where to resume after the next login
+                c.lastmod = now_s()
+                self.touch(c)
+                text = data[9:].split(b"\0", 1)[0]
+                self.queue_msg(c, TXT_TYPE_SIGNED_PLAIN, pkt, ts, data[5:9], text)
+                self.reply_ack(pkt, c, sha256(data[:9 + len(text)], self.pub)[:4])
+        elif t == PT_REQ and len(data) > 4:
+            reply = self.on_request(c, data[:4], data[4:])
+            if reply:
+                if pkt.is_flood:
+                    pr = self.make_path_return(c, pkt.path, pkt.path_len, PT_RESPONSE, reply)
+                    if pr:
+                        self.send_flood(pr, SERVER_RESPONSE_DELAY)
+                else:
+                    self.send_to(c, self.make_datagram(PT_RESPONSE, c, reply), SERVER_RESPONSE_DELAY)
+        elif t == PT_RESPONSE and data:
+            self.on_response(c, data)
+            if pkt.is_flood and c.out_len is not None:
+                self.return_path_retry(c, pkt)
+
+    def return_path_retry(self, c, pkt):
+        """They still flood though we have a route: they may have missed our path return, so send it again."""
+        pr = self.make_path_return(c, pkt.path, pkt.path_len)
+        if pr:
+            self.send_direct(pr, c.out_path, c.out_len, 3.0)
+
+    def reply_ack(self, pkt, c, ack):
+        if pkt.is_flood:                                    # tell them the path to us, carrying the ACK
+            pr = self.make_path_return(c, pkt.path, pkt.path_len, PT_ACK, ack)
+            if pr:
+                self.send_flood(pr, TXT_ACK_DELAY)
+        elif c.out_len is None:
+            self.send_flood(Packet(PT_ACK, ack), TXT_ACK_DELAY)
+        else:
+            d = TXT_ACK_DELAY
+            if self.prefs["multi_acks"]:
+                self.send_direct(Packet(PT_MULTIPART, bytes([(1 << 4) | PT_ACK]) + ack), c.out_path, c.out_len, d)
+                d += 0.3
+            self.send_direct(Packet(PT_ACK, ack), c.out_path, c.out_len, d)
+
+    def on_request(self, c, tag, req):
+        """Requests to us: telemetry only, as allowed by the app's telemetry settings (per-contact flags or all)."""
+        if req[0] != REQ_GET_TELEMETRY_DATA:
+            return None
+        cp = c.flags >> 1
+        perm = 0
+        for mode, bit in ((self.prefs["telem_base"], 1), (self.prefs["telem_loc"], 2)):
+            if mode == 2:
+                perm |= bit
+            elif mode == 1:
+                perm |= cp & bit
+        if len(req) > 1:
+            perm &= ~req[1]                                 # the requester's inverse mask
+        if not perm & 1:
+            return None
+        lpp = struct.pack(">BBH", 1, 116, int(self.room.batt_mv / 10))   # channel 1, voltage, 0.01 V
+        lat, lon = float(self.cfg.companion_lat or 0), float(self.cfg.companion_lon or 0)
+        if perm & 2 and (lat or lon):
+            lpp += bytes([1, 136]) + int(lat * 1e4).to_bytes(3, "big", signed=True) \
+                + int(lon * 1e4).to_bytes(3, "big", signed=True) + bytes(3)
+        return tag + lpp
+
+    def on_response(self, c, data):
+        tag = data[:4]
+        pl = self.pending
+        if pl["login"] is not None and c.pub[:4] == pl["login"]:
+            pl["login"] = None
+            if data[4:6] == b"OK":                          # legacy repeater login
+                f = bytes([PUSH_LOGIN_SUCCESS, 0]) + c.pub[:6]
+            elif len(data) > 4 and data[4] == RESP_SERVER_LOGIN_OK:
+                d = data.ljust(13, b"\0")
+                if d[5]:
+                    self.connections[c.pub] = dict(ka=d[5] * 16, next=time.monotonic() + d[5] * 16, ack=None, last=now_s())
+                f = bytes([PUSH_LOGIN_SUCCESS, d[6]]) + c.pub[:6] + tag + bytes([d[7], d[12]])
+            else:
+                f = bytes([PUSH_LOGIN_FAIL, 0]) + c.pub[:6]
+        elif len(data) > 4 and pl["status"] is not None and c.pub[:4] == pl["status"]:
+            pl["status"] = None
+            f = bytes([PUSH_STATUS_RESPONSE, 0]) + c.pub[:6] + data[4:]
+        elif len(data) > 4 and tag == pl["telemetry"]:
+            pl["telemetry"] = None
+            f = bytes([PUSH_TELEMETRY_RESPONSE, 0]) + c.pub[:6] + data[4:]
+        elif len(data) > 4 and tag == pl["req"]:
+            pl["req"] = None
+            f = bytes([PUSH_BINARY_RESPONSE, 0]) + tag + data[4:]
+        else:
+            return
+        self.write(f)
+
+    def process_ack(self, ack, pkt=None):
+        for e in self.expected:
+            if e[0] == ack:
+                self.write(bytes([PUSH_SEND_CONFIRMED]) + ack + struct.pack("<I", int((time.monotonic() - e[1]) * 1000)))
+                e[0] = None                                 # the same ACK can arrive more than once
+                c = self.contacts.get(e[2])
+                if pkt is not None and pkt.is_flood and c is not None and c.out_len is not None:
+                    self.return_path_retry(c, pkt)
+                return True
+        for cn in self.connections.values():
+            if cn["ack"] is not None and cn["ack"] == ack:
+                cn["ack"], cn["last"], cn["next"] = None, now_s(), time.monotonic() + cn["ka"]
+                return True
+        return False
+
+    def mark_active(self, c):
+        cn = self.connections.get(c.pub)
+        if cn is not None:
+            cn["last"], cn["next"] = now_s(), time.monotonic() + cn["ka"]
+
+    def rx_group(self, pkt):
+        p = pkt.payload
+        if len(p) <= 3 or self.check_dup(pkt):
+            return
+        for idx in sorted(self.channels):
+            name, key = self.channels[idx]
+            if not any(key) or channel_hash(key) != p[0]:
+                continue
+            data = mac_then_decrypt(key + bytes(16), p[1:])
+            if data is None:
+                continue
+            plen = pkt.path_len if pkt.is_flood else 0xFF
+            if pkt.ptype == PT_GRP_TXT:
+                if len(data) < 5 or data[4] >> 2:
+                    return
+                text = data[5:].split(b"\0", 1)[0]
+                f = bytes([RESP_CHANNEL_MSG_RECV_V3]) + snr4(pkt.snr) + bytes([0, 0, idx, plen, TXT_TYPE_PLAIN]) + data[:4] + text
+            else:
+                if len(data) < 3 or data[2] > len(data) - 3 or data[2] > VC_MAX_FRAME - 9:
+                    return
+                f = bytes([RESP_CHANNEL_DATA_RECV]) + snr4(pkt.snr) + bytes([0, 0, idx, plen]) + data[:3] + data[3:3 + data[2]]
+            self.enqueue(f)
+            return
+
+    def rx_advert(self, pkt):
+        p = pkt.payload
+        if len(p) < PUB_KEY_SIZE + 4 + SIGNATURE_SIZE or p[:32] == self.pub or self.check_dup(pkt):
+            return
+        a = RoomServer.parse_advert(pkt)
+        if a is None or not a["name"]:
+            return
+        pub = a["pub"]
+        c = self.contacts.get(pub)
+        if c is not None and a["ts"] <= c.adv_ts:
+            return                                          # replayed
+        self.anon.pop(pub, None)
+        if path_valid(pkt.path_len):
+            k7 = pub[:7]
+            self.advert_paths.pop(k7, None)
+            self.advert_paths[k7] = (now_s(), pkt.path_len, pkt.path[:path_bytes(pkt.path_len)])
+            while len(self.advert_paths) > VC_ADVERT_PATHS:
+                self.advert_paths.popitem(last=False)
+        saved = Packet()                                    # kept for export / share: flood route, no transport codes
+        saved.header = (pkt.header & ~0x03) | ROUTE_FLOOD
+        saved.path_len, saved.path, saved.payload = pkt.path_len, pkt.path, pkt.payload
+        if c is None:
+            new = VCContact(pub)
+            self.fill_from_advert(new, a, saved)
+            if not self.auto_add(a["type"]) or (self.prefs["autoadd_max_hops"] and pkt.hop_count >= self.prefs["autoadd_max_hops"]):
+                self.write(new.frame(PUSH_NEW_ADVERT))      # the app may add it
+                return
+            if not self.add_contact(new):
+                self.write(new.frame(PUSH_NEW_ADVERT))
+                self.write(bytes([PUSH_CONTACTS_FULL]))
+                return
+            c = new
+        else:
+            self.fill_from_advert(c, a, saved)
+        self.touch(c)
+        self.write(bytes([PUSH_ADVERT]) + pub)
+
+    @staticmethod
+    def fill_from_advert(c, a, saved):
+        c.name = a["name"]
+        c.type = a["type"]
+        if a["lat"] is not None:
+            c.lat, c.lon = int(round(a["lat"] * 1e6)), int(round(a["lon"] * 1e6))
+        c.adv_ts = a["ts"]
+        c.lastmod = now_s()
+        c.advert = saved.encode()
+
+    def auto_add(self, atype):
+        if not self.prefs["manual_add"] & 1:
+            return True
+        bit = {ADV_TYPE_CHAT: 2, ADV_TYPE_REPEATER: 4, ADV_TYPE_ROOM: 8, ADV_TYPE_SENSOR: 16}.get(atype)
+        return bool(bit and self.prefs["autoadd_config"] & bit)
+
+    def add_contact(self, c):
+        if len(self.contacts) >= VC_MAX_CONTACTS:
+            if not self.prefs["autoadd_config"] & 1:
+                return False
+            olds = [x for x in self.contacts.values() if not x.flags & 1]
+            if not olds:
+                return False
+            old = min(olds, key=lambda x: x.lastmod)        # overwrite the oldest non-favourite
+            self.remove_contact(old.pub)
+            self.write(bytes([PUSH_CONTACT_DELETED]) + old.pub)
+        self.contacts[c.pub] = c
+        self.touch(c)
+        return True
+
+    def remove_contact(self, pub):
+        self.contacts.pop(pub, None)
+        self.dirty.discard(pub)
+        self.connections.pop(pub, None)
+        self.store.delete_contact(pub)
+
+    # ---------------------------------------------------------------- messages for the app
+
+    def queue_msg(self, c, txt_type, pkt, ts, extra, text):
+        self.stats["msgs_in"] += 1
+        plen = pkt.path_len if pkt.is_flood else 0xFF
+        self.enqueue(bytes([RESP_CONTACT_MSG_RECV_V3]) + snr4(pkt.snr) + bytes([0, 0]) + c.pub[:6]
+                     + bytes([plen, txt_type]) + struct.pack("<I", ts) + extra + text)
+
+    def enqueue(self, frame):
+        """Kept (in companion.db) until the app fetches it. Stored in the v3 layout; older apps get it converted."""
+        frame = frame[:VC_MAX_FRAME]
+        if len(self.queue) >= VC_QUEUE_MAX:
+            drop = next((e for e in self.queue if e[1][0] in (RESP_CHANNEL_MSG_RECV_V3, RESP_CHANNEL_DATA_RECV)), self.queue[0])
+            self.queue.remove(drop)                         # full: the oldest channel message goes first
+            self.store.queue_remove(drop[0])
+        self.queue.append((self.store.queue_add(frame), frame))
+        if self.connected:
+            self.write(bytes([PUSH_MSG_WAITING]))
+
+    # ---------------------------------------------------------------- periodic
+
+    def periodic(self):
+        now = time.monotonic()
+        c = self.cfg
+        iv = float(c.companion_advert_interval_min or 0)
+        if c.companion_auto_advert and iv > 0 and now >= self.next_advert:
+            self.send_advert(bool(c.companion_advert_flood))
+            self.next_advert = now + iv * 60
+        elif not c.companion_auto_advert:
+            self.next_advert = now + 10                     # turned on: first advert soon after
+        for pub, cn in list(self.connections.items()):      # keep-alives to servers that asked for them (checkConnections)
+            if now_s() >= cn["last"] + cn["ka"] * 5 // 2:
+                del self.connections[pub]
+                continue
+            ct = self.contacts.get(pub)
+            if now < cn["next"] or ct is None or ct.out_len is None:
+                continue
+            data = struct.pack("<I", self.unique_time()) + bytes([REQ_KEEP_ALIVE]) + struct.pack("<I", ct.sync_since)
+            cn["ack"] = sha256(data, self.pub)[:4]
+            self.send_direct(self.make_datagram(PT_REQ, ct, data), ct.out_path, ct.out_len)
+            cn["next"] = now + cn["ka"]
+        for tag in [t for t, exp in self.traces.items() if exp < now]:
+            del self.traces[tag]
+        if now >= self.next_flush:
+            self.flush()
+            self.next_flush = now + 15
+
+    def state(self):
+        link = self.link
+        return dict(listening=link is not None, error=self.link_error, client=link is not None and link.connected(),
+                    listen_port=link.port if link is not None else None,
+                    contacts=len(self.contacts), channels=sum(1 for n, k in self.channels.values() if any(k)),
+                    queued=len(self.queue), **self.stats)
+
+    # ---------------------------------------------------------------- app commands (MyMesh::handleCmdFrame)
+
+    def on_frame(self, f):
+        self.stats["frames"] += 1
+        if not f:
+            return
+        cmd = f[0]
+        if cmd in VC_IGNORED:
+            self.stats["ignored"] += 1
+            if cmd not in self.ignored_logged:
+                self.ignored_logged.add(cmd)
+                log.info("virtual companion: the app sent a %s change - acknowledged and ignored (pyMeshRoom manages "
+                         "the radio)", VC_IGNORED[cmd])
+            if cmd == CMD_RUN_CLI_COMMAND:
+                return self.write(bytes([RESP_CLI_REPLY]) + b"OK")
+            return self.ok()
+        h = self.HANDLERS.get(cmd)
+        if h is None:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        try:
+            h(self, f)
+        except (IndexError, struct.error, ValueError):
+            self.err(ERR_ILLEGAL_ARG)
+
+    def c_device_query(self, f):
+        if len(f) < 2:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        if self.prefs["app_ver"] != f[1]:
+            self.prefs["app_ver"] = f[1]
+            self.save_prefs()
+        self.write(bytes([RESP_DEVICE_INFO, VC_FIRMWARE_VER_CODE, VC_MAX_CONTACTS // 2, VC_MAX_CHANNELS]) + struct.pack("<I", 0)
+                   + b"pyMeshRoom".ljust(12, b"\0") + b"pyMeshRoom virtual companion".ljust(40, b"\0")
+                   + FIRMWARE_VERSION.encode()[:19].ljust(20, b"\0") + bytes([0, int(self.cfg.path_hash_mode or 0)]))
+
+    def c_app_start(self, f):
+        if len(f) < 8:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        r = self.room
+        freq, bw, sf, cr = r.radio if r.radio else r.wanted_radio()
+        txp = r.cfg.radio_tx_power_dbm if r.cfg.radio_tx_power_dbm is not None else 22
+        pr = self.prefs
+        lat, lon = float(self.cfg.companion_lat or 0), float(self.cfg.companion_lon or 0)
+        self.write(bytes([RESP_SELF_INFO, ADV_TYPE_CHAT, int(txp) & 0xFF, 22]) + self.pub
+                   + struct.pack("<ii", int(lat * 1e6), int(lon * 1e6))
+                   + bytes([pr["multi_acks"], pr["advert_loc_policy"], (pr["telem_env"] << 4) | (pr["telem_loc"] << 2) | pr["telem_base"],
+                            pr["manual_add"]])
+                   + struct.pack("<IIBB", freq // 1000, bw, sf, cr) + utf8_cut(str(self.cfg.companion_name).encode(), 31))
+
+    def c_send_txt_msg(self, f):
+        if len(f) < 14:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        txt_type, attempt, ts = f[1], f[2], f[3:7]
+        c = self.find(f[7:13])
+        if c is None or txt_type not in (TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA):
+            return self.err(ERR_NOT_FOUND if c is None else ERR_UNSUPPORTED_CMD)
+        text = f[13:].split(b"\0", 1)[0]
+        if len(text) > VC_MAX_TEXT_LEN or (attempt > 3 and len(text) > VC_MAX_TEXT_LEN - 2):
+            return self.err(ERR_TABLE_FULL)
+        if txt_type == TXT_TYPE_CLI_DATA:                   # the node's clock, not the app's (replay protection)
+            data = struct.pack("<I", self.unique_time()) + bytes([(attempt & 3) | (TXT_TYPE_CLI_DATA << 2)]) + text
+            ack = bytes(4)
+        else:
+            data = ts + bytes([attempt & 3]) + text
+            ack = sha256(data, self.pub)[:4]
+            if attempt > 3:
+                data += b"\0" + bytes([attempt])            # the attempt number, hidden after the text
+        pkt = self.make_datagram(PT_TXT_MSG, c, data)
+        self.send_to(c, pkt)
+        if txt_type == TXT_TYPE_PLAIN:
+            self.expected.append([ack, time.monotonic(), c.pub])
+        self.stats["msgs_out"] += 1
+        self.write(self.sent_frame(pkt, ack))
+
+    def c_send_channel_txt_msg(self, f):
+        if len(f) < 7 or f[1] != TXT_TYPE_PLAIN:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        ch = self.channels.get(f[2])
+        if ch is None or not any(ch[1]):
+            return self.err(ERR_NOT_FOUND)
+        prefix = (str(self.cfg.companion_name) + ": ").encode()
+        text = f[7:].split(b"\0", 1)[0][:max(0, VC_MAX_TEXT_LEN - len(prefix))]
+        key = ch[1]
+        self.send_flood(Packet(PT_GRP_TXT, bytes([channel_hash(key)]) + encrypt_then_mac(key + bytes(16), f[3:7] + b"\0" + prefix + text)))
+        self.stats["msgs_out"] += 1
+        self.ok()
+
+    def c_send_channel_data(self, f):
+        if len(f) < 4:
+            return self.err(ERR_ILLEGAL_ARG)
+        idx, plen, i = f[1], f[2], 3
+        if plen != 0xFF and not path_valid(plen):
+            return self.err(ERR_ILLEGAL_ARG)
+        path = b""
+        if plen != 0xFF:
+            path = f[i:i + path_bytes(plen)]
+            i += path_bytes(plen)
+        dtype = f[i:i + 2]
+        payload = f[i + 2:]
+        ch = self.channels.get(idx)
+        if ch is None or not any(ch[1]):
+            return self.err(ERR_NOT_FOUND)
+        if len(dtype) < 2 or dtype == b"\0\0" or len(payload) > VC_MAX_FRAME - 9:
+            return self.err(ERR_ILLEGAL_ARG)
+        key = ch[1]
+        pkt = Packet(PT_GRP_DATA, bytes([channel_hash(key)]) + encrypt_then_mac(key + bytes(16), dtype + bytes([len(payload)]) + payload))
+        if plen == 0xFF:
+            self.send_flood(pkt)
+        else:
+            self.send_direct(pkt, path, plen)
+        self.ok()
+
+    def c_get_contacts(self, f):
+        since = struct.unpack_from("<I", f, 1)[0] if len(f) >= 5 else 0
+        self.write(bytes([RESP_CONTACTS_START]) + struct.pack("<I", len(self.contacts)))
+        latest = 0
+        for c in list(self.contacts.values()):
+            if c.lastmod > since:
+                self.write(c.frame(RESP_CONTACT))
+                latest = max(latest, c.lastmod)
+        self.write(bytes([RESP_END_OF_CONTACTS]) + struct.pack("<I", latest))
+
+    def c_set_advert_name(self, f):
+        if len(f) < 2:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        name = utf8_cut(f[1:].split(b"\0", 1)[0], 31).decode(errors="ignore").strip()
+        if not name:
+            return self.err(ERR_ILLEGAL_ARG)
+        self.cfg.set("companion_name", name)
+        self.ok()
+
+    def c_set_advert_latlon(self, f):
+        if len(f) < 9:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        lat, lon = struct.unpack_from("<ii", f, 1)
+        if not (-90e6 <= lat <= 90e6 and -180e6 <= lon <= 180e6):
+            return self.err(ERR_ILLEGAL_ARG)
+        self.cfg.set("companion_lat", lat / 1e6)
+        self.cfg.set("companion_lon", lon / 1e6)
+        self.ok()
+
+    def c_get_device_time(self, f):
+        self.write(bytes([RESP_CURR_TIME]) + struct.pack("<I", now_s()))
+
+    def c_send_self_advert(self, f):
+        self.send_advert(len(f) >= 2 and f[1] == 1)
+        self.ok()
+
+    def c_reset_path(self, f):
+        c = self.contacts.get(f[1:33]) if len(f) >= 33 else None
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        c.out_len, c.out_path = None, b""
+        self.touch(c)
+        self.ok()
+
+    def c_add_update_contact(self, f):
+        if len(f) < 36:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        pub = bytes(f[1:33])
+        d = f.ljust(148, b"\0")
+        c = self.contacts.get(pub)
+        new = c is None
+        if new:
+            c = self.anon.pop(pub, None) or VCContact(pub)
+            c.sync_since = 0
+        c.type, c.flags = d[33], d[34]
+        plen = d[35]
+        c.out_len = None if plen == 0xFF or not path_valid(plen) else plen
+        c.out_path = bytes(d[36:36 + path_bytes(plen)]) if c.out_len is not None else b""
+        c.name = d[100:132].split(b"\0", 1)[0].decode(errors="replace")
+        c.adv_ts = struct.unpack_from("<I", d, 132)[0]
+        if len(f) >= 144:
+            c.lat, c.lon = struct.unpack_from("<ii", d, 136)
+        c.lastmod = struct.unpack_from("<I", d, 144)[0] if len(f) >= 148 else now_s()
+        if new and not self.add_contact(c):
+            return self.err(ERR_TABLE_FULL)
+        self.touch(c)
+        self.ok()
+
+    def c_remove_contact(self, f):
+        pub = bytes(f[1:33])
+        if pub not in self.contacts:
+            return self.err(ERR_NOT_FOUND)
+        self.remove_contact(pub)
+        self.ok()
+
+    def c_share_contact(self, f):
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        pkt = Packet.parse(c.advert) if c.advert else None
+        if pkt is None:
+            return self.err(ERR_TABLE_FULL)
+        pkt.header = (pkt.header & ~0x03) | ROUTE_TRANSPORT_DIRECT
+        pkt.transport_codes = (0, 0)                        # { 0, 0 }: "send this nowhere" (repeaters don't relay it)
+        pkt.path_len, pkt.path = 0, b""
+        self._out(pkt, 0, 0.0)
+        self.ok()
+
+    def c_get_contact_by_key(self, f):
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        self.write(c.frame(RESP_CONTACT))
+
+    def c_export_contact(self, f):
+        if len(f) < 1 + PUB_KEY_SIZE:
+            pkt = self.make_self_advert()
+            pkt.header = (pkt.header & ~0x03) | ROUTE_FLOOD
+            return self.write(bytes([RESP_EXPORT_CONTACT]) + pkt.encode())
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None or not c.advert:
+            return self.err(ERR_NOT_FOUND)
+        self.write(bytes([RESP_EXPORT_CONTACT]) + c.advert)
+
+    def c_import_contact(self, f):
+        pkt = Packet.parse(bytes(f[1:])) if len(f) > 2 + 32 + 64 else None
+        if pkt is None or pkt.ptype != PT_ADVERT:
+            return self.err(ERR_ILLEGAL_ARG)
+        pkt.header = (pkt.header & ~0x03) | ROUTE_FLOOD    # as if received flood-mode
+        self.seen.pop(pkt.packet_hash(), None)
+        self.rx_advert(pkt)
+        self.ok()
+
+    def c_sync_next_message(self, f):
+        if not self.queue:
+            return self.write(bytes([RESP_NO_MORE_MESSAGES]))
+        qid, frame = self.queue.pop(0)
+        self.store.queue_remove(qid)
+        if self.prefs["app_ver"] < 3 and frame[0] in (RESP_CONTACT_MSG_RECV_V3, RESP_CHANNEL_MSG_RECV_V3):
+            frame = bytes([RESP_CONTACT_MSG_RECV if frame[0] == RESP_CONTACT_MSG_RECV_V3 else RESP_CHANNEL_MSG_RECV]) + frame[4:]
+        self.write(frame)
+
+    def c_get_tuning_params(self, f):
+        self.write(bytes([RESP_TUNING_PARAMS]) + struct.pack("<II", 0, 1000))
+
+    def c_set_other_params(self, f):
+        if len(f) < 2:
+            return self.err(ERR_ILLEGAL_ARG)
+        pr = self.prefs
+        pr["manual_add"] = f[1]
+        if len(f) >= 3:
+            pr["telem_base"], pr["telem_loc"], pr["telem_env"] = f[2] & 3, (f[2] >> 2) & 3, (f[2] >> 4) & 3
+        if len(f) >= 4:
+            pr["advert_loc_policy"] = f[3]
+        if len(f) >= 5:
+            pr["multi_acks"] = f[4]
+        self.save_prefs()
+        self.ok()
+
+    def c_get_batt_and_storage(self, f):
+        try:
+            used = os.path.getsize(self.store.path) // 1024
+            import shutil
+            total = (shutil.disk_usage(os.path.dirname(os.path.abspath(self.store.path))).free // 1024) + used
+        except OSError:
+            used = total = 0
+        self.write(bytes([RESP_BATT_AND_STORAGE]) + struct.pack("<HII", self.room.batt_mv & 0xFFFF, min(used, 0xFFFFFFFF),
+                                                                 min(total, 0xFFFFFFFF)))
+
+    def c_export_private_key(self, f):
+        self.write(bytes([RESP_DISABLED]))                  # as default firmware: the key never leaves the server
+
+    def _request(self, c, data, flood=False):
+        pkt = self.make_datagram(PT_REQ, c, data)
+        if flood:
+            self.send_flood(pkt)
+        else:
+            self.send_to(c, pkt)
+        return pkt
+
+    def c_send_login(self, f):
+        if len(f) < 1 + PUB_KEY_SIZE:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        pw = f[33:].split(b"\0", 1)[0][:15]
+        data = struct.pack("<I", self.unique_time()) + (struct.pack("<I", c.sync_since) if c.type == ADV_TYPE_ROOM else b"") + pw
+        pkt = Packet(PT_ANON_REQ, bytes([c.pub[0]]) + self.pub + encrypt_then_mac(self.secret(c), data))
+        self.send_to(c, pkt)
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["login"] = c.pub[:4]
+        self.write(self.sent_frame(pkt, c.pub[:4]))
+
+    def c_send_anon_req(self, f):
+        if len(f) <= 1 + PUB_KEY_SIZE:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        pub = bytes(f[1:33])
+        c = self.contact(pub)
+        if c is None:                                       # firmware v13: requests to non-contacts, zero-hop direct
+            c = self.anon[pub] = VCContact(pub)
+            c.out_len, c.lastmod = 0, now_s()
+            while len(self.anon) > 8:
+                self.anon.pop(next(iter(self.anon)))
+        tag = struct.pack("<I", self.unique_time())
+        pkt = Packet(PT_ANON_REQ, bytes([c.pub[0]]) + self.pub + encrypt_then_mac(self.secret(c), tag + f[33:]))
+        self.send_to(c, pkt)
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["req"] = tag
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_send_status_req(self, f):
+        c = self.contacts.get(bytes(f[1:33])) if len(f) >= 33 else None
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        tag = struct.pack("<I", self.unique_time())
+        pkt = self._request(c, tag + bytes([REQ_GET_STATUS]) + bytes(4) + os.urandom(4))
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["status"] = c.pub[:4]                  # (legacy matching, as firmware)
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_send_path_discovery_req(self, f):
+        if len(f) < 2 + PUB_KEY_SIZE or f[1] != 0:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        c = self.contacts.get(bytes(f[2:34]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        tag = struct.pack("<I", self.unique_time())         # a flooded request for base telemetry
+        pkt = self._request(c, tag + bytes([REQ_GET_TELEMETRY_DATA, 0xFE, 0, 0, 0]) + os.urandom(4), flood=True)
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["discovery"] = tag
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_send_telemetry_req(self, f):
+        if len(f) == 4:                                     # our own telemetry
+            lpp = struct.pack(">BBH", 1, 116, int(self.room.batt_mv / 10))
+            return self.write(bytes([PUSH_TELEMETRY_RESPONSE, 0]) + self.pub[:6] + lpp)
+        c = self.contacts.get(bytes(f[4:36])) if len(f) >= 4 + PUB_KEY_SIZE else None
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        tag = struct.pack("<I", self.unique_time())
+        pkt = self._request(c, tag + bytes([REQ_GET_TELEMETRY_DATA]) + bytes(4) + os.urandom(4))
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["telemetry"] = tag
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_send_binary_req(self, f):
+        if len(f) < 2 + PUB_KEY_SIZE:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        if len(f) - 33 > MAX_PACKET_PAYLOAD - 16:
+            return self.err(ERR_TABLE_FULL)
+        tag = struct.pack("<I", self.unique_time())
+        pkt = self._request(c, tag + bytes(f[33:]))
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["req"] = tag
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_has_connection(self, f):
+        if bytes(f[1:33]) in self.connections:
+            return self.ok()
+        self.err(ERR_NOT_FOUND)
+
+    def c_logout(self, f):
+        self.connections.pop(bytes(f[1:33]), None)
+        self.ok()
+
+    def c_get_channel(self, f):
+        if len(f) < 2 or f[1] >= VC_MAX_CHANNELS:
+            return self.err(ERR_NOT_FOUND)
+        name, key = self.channels.get(f[1], ("", bytes(16)))
+        self.write(bytes([RESP_CHANNEL_INFO, f[1]]) + utf8_cut(name.encode(), 31).ljust(32, b"\0") + key)
+
+    def c_set_channel(self, f):
+        if len(f) >= 2 + 32 + 32:
+            return self.err(ERR_UNSUPPORTED_CMD)            # 256-bit channel keys: not supported (as firmware)
+        if len(f) < 2 + 32 + 16:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        idx = f[1]
+        if idx >= VC_MAX_CHANNELS:
+            return self.err(ERR_NOT_FOUND)
+        name = utf8_cut(f[2:34].split(b"\0", 1)[0], 31).decode(errors="replace")
+        key = bytes(f[34:50])
+        if name or any(key):
+            self.channels[idx] = (name, key)
+        else:
+            self.channels.pop(idx, None)
+        self.store.save_channel(idx, name, key)
+        self.ok()
+
+    def c_sign_start(self, f):
+        self.sign_buf = bytearray()
+        self.write(bytes([RESP_SIGN_START, 0]) + struct.pack("<I", VC_MAX_SIGN))
+
+    def c_sign_data(self, f):
+        if self.sign_buf is None:
+            return self.err(ERR_BAD_STATE)
+        if len(self.sign_buf) + len(f) - 1 > VC_MAX_SIGN:
+            return self.err(ERR_TABLE_FULL)
+        self.sign_buf += f[1:]
+        self.ok()
+
+    def c_sign_finish(self, f):
+        if self.sign_buf is None:
+            return self.err(ERR_BAD_STATE)
+        sig = self.id.sign(bytes(self.sign_buf))
+        self.sign_buf = None
+        self.write(bytes([RESP_SIGNATURE]) + sig)
+
+    def c_send_trace_path(self, f):
+        n = len(f) - 10
+        if n <= 0 or n >= MAX_PACKET_PAYLOAD - 5:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        flags = f[9]
+        sz = flags & 3
+        if sz == 3 or (n >> sz) > MAX_PATH_SIZE or n % (1 << sz):
+            return self.err(ERR_ILLEGAL_ARG)
+        tag = bytes(f[1:5])
+        pkt = Packet(PT_TRACE, bytes(f[1:10]) + bytes(f[10:]))   # the route rides in the payload; path_len counts SNRs
+        pkt.header = (pkt.header & ~0x03) | ROUTE_DIRECT
+        self.traces[tag] = time.monotonic() + 120
+        self._out(pkt, 5, 0.0)
+        t = self.room.airtime_ms(pkt.raw_length())
+        self.write(bytes([RESP_SENT, 0]) + tag + struct.pack("<I", int(500 + (t * 6 + 250) * ((n >> sz) + 1))))
+
+    def c_get_custom_vars(self, f):
+        self.write(bytes([RESP_CUSTOM_VARS]))
+
+    def c_set_custom_var(self, f):
+        self.err(ERR_ILLEGAL_ARG)
+
+    def c_get_advert_path(self, f):
+        if len(f) < PUB_KEY_SIZE + 2:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        e = self.advert_paths.get(bytes(f[2:9]))
+        if e is None:
+            return self.err(ERR_NOT_FOUND)
+        self.write(bytes([RESP_ADVERT_PATH]) + struct.pack("<I", e[0]) + bytes([e[1]]) + e[2])
+
+    def c_get_stats(self, f):
+        if len(f) < 2:
+            return self.err(ERR_ILLEGAL_ARG)
+        r, s = self.room, self.room.stats
+        if f[1] == 0:
+            out = struct.pack("<HIHB", r.batt_mv & 0xFFFF, int(time.monotonic() - r.boot), 0, min(len(r.txq), 255))
+        elif f[1] == 1:
+            out = struct.pack("<hbbII", int(r.noise_floor), max(-128, min(127, int(r.last_rssi))),
+                              max(-128, min(127, int(r.last_snr * 4))), s["airtime_ms"] // 1000, r.rx_airtime_ms // 1000)
+        elif f[1] == 2:
+            out = struct.pack("<7I", *(s[k] & 0xFFFFFFFF for k in ("recv", "sent", "sent_flood", "sent_direct",
+                                                                   "recv_flood", "recv_direct", "errors")))
+        else:
+            return self.err(ERR_ILLEGAL_ARG)
+        self.write(bytes([RESP_STATS, f[1]]) + out)
+
+    def c_set_flood_scope_key(self, f):
+        if len(f) < 2 or f[1] not in (0, 1):
+            return self.err(ERR_UNSUPPORTED_CMD)
+        if f[1] == 1:
+            self.send_unscoped = True
+        else:
+            self.send_scope = bytes(f[2:18]) if len(f) >= 18 else None
+            self.send_unscoped = False
+        self.ok()
+
+    def c_set_default_flood_scope(self, f):
+        if len(f) >= 1 + 31 + 16:
+            name = f[1:32].split(b"\0", 1)[0]
+            if not 0 < len(name) < 31:
+                return self.err(ERR_ILLEGAL_ARG)
+            self.prefs["scope_name"], self.prefs["scope_key"] = name.decode(errors="replace"), bytes(f[32:48]).hex()
+        else:
+            self.prefs["scope_name"], self.prefs["scope_key"] = "", ""
+        self.save_prefs()
+        self.ok()
+
+    def c_get_default_flood_scope(self, f):
+        if self.prefs["scope_name"]:
+            return self.write(bytes([RESP_DEFAULT_FLOOD_SCOPE]) + self.prefs["scope_name"].encode()[:30].ljust(31, b"\0")
+                              + bytes.fromhex(self.prefs["scope_key"]))
+        self.write(bytes([RESP_DEFAULT_FLOOD_SCOPE]))
+
+    def c_send_control_data(self, f):
+        if len(f) < 2 or not f[1] & 0x80:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        self.send_zero_hop(Packet(PT_CONTROL, bytes(f[1:])))
+        self.ok()
+
+    def c_set_autoadd_config(self, f):
+        if len(f) < 2:
+            return self.err(ERR_ILLEGAL_ARG)
+        self.prefs["autoadd_config"] = f[1]
+        if len(f) >= 3:
+            self.prefs["autoadd_max_hops"] = min(f[2], 64)
+        self.save_prefs()
+        self.ok()
+
+    def c_get_autoadd_config(self, f):
+        self.write(bytes([RESP_AUTOADD_CONFIG, self.prefs["autoadd_config"], self.prefs["autoadd_max_hops"]]))
+
+    def c_get_allowed_repeat_freq(self, f):
+        self.write(bytes([RESP_ALLOWED_REPEAT_FREQ]))       # none: the companion never repeats
+
+    HANDLERS = {
+        CMD_DEVICE_QUERY: c_device_query, CMD_APP_START: c_app_start, CMD_SEND_TXT_MSG: c_send_txt_msg,
+        CMD_SEND_CHANNEL_TXT_MSG: c_send_channel_txt_msg, CMD_SEND_CHANNEL_DATA: c_send_channel_data,
+        CMD_GET_CONTACTS: c_get_contacts, CMD_SET_ADVERT_NAME: c_set_advert_name, CMD_SET_ADVERT_LATLON: c_set_advert_latlon,
+        CMD_GET_DEVICE_TIME: c_get_device_time, CMD_SEND_SELF_ADVERT: c_send_self_advert, CMD_RESET_PATH: c_reset_path,
+        CMD_ADD_UPDATE_CONTACT: c_add_update_contact, CMD_REMOVE_CONTACT: c_remove_contact, CMD_SHARE_CONTACT: c_share_contact,
+        CMD_GET_CONTACT_BY_KEY: c_get_contact_by_key, CMD_EXPORT_CONTACT: c_export_contact, CMD_IMPORT_CONTACT: c_import_contact,
+        CMD_SYNC_NEXT_MESSAGE: c_sync_next_message, CMD_GET_TUNING_PARAMS: c_get_tuning_params,
+        CMD_SET_OTHER_PARAMS: c_set_other_params, CMD_GET_BATT_AND_STORAGE: c_get_batt_and_storage,
+        CMD_EXPORT_PRIVATE_KEY: c_export_private_key, CMD_SEND_LOGIN: c_send_login, CMD_SEND_ANON_REQ: c_send_anon_req,
+        CMD_SEND_STATUS_REQ: c_send_status_req, CMD_SEND_PATH_DISCOVERY_REQ: c_send_path_discovery_req,
+        CMD_SEND_TELEMETRY_REQ: c_send_telemetry_req, CMD_SEND_BINARY_REQ: c_send_binary_req,
+        CMD_HAS_CONNECTION: c_has_connection, CMD_LOGOUT: c_logout, CMD_GET_CHANNEL: c_get_channel,
+        CMD_SET_CHANNEL: c_set_channel, CMD_SIGN_START: c_sign_start, CMD_SIGN_DATA: c_sign_data,
+        CMD_SIGN_FINISH: c_sign_finish, CMD_SEND_TRACE_PATH: c_send_trace_path, CMD_GET_CUSTOM_VARS: c_get_custom_vars,
+        CMD_SET_CUSTOM_VAR: c_set_custom_var, CMD_GET_ADVERT_PATH: c_get_advert_path, CMD_GET_STATS: c_get_stats,
+        CMD_SET_FLOOD_SCOPE_KEY: c_set_flood_scope_key, CMD_SET_DEFAULT_FLOOD_SCOPE: c_set_default_flood_scope,
+        CMD_GET_DEFAULT_FLOOD_SCOPE: c_get_default_flood_scope, CMD_SEND_CONTROL_DATA: c_send_control_data,
+        CMD_SET_AUTOADD_CONFIG: c_set_autoadd_config, CMD_GET_AUTOADD_CONFIG: c_get_autoadd_config,
+        CMD_GET_ALLOWED_REPEAT_FREQ: c_get_allowed_repeat_freq,
+    }
 
 # ============================================================================
 # Observer feed (MQTT augmentation): read-only, its own thread, filters before anything reaches the main loop
@@ -4630,9 +6313,9 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
-#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
+#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#vccard{order:8}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
 </style></head><body>
-<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
+<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rvc" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
 <div id="hstats" class="hstats"></div></header>
 <div id="suggestbox" class="modal"><div class="mbox wide"><h3 id="sgtitle">Suggest a route</h3>
@@ -4676,6 +6359,23 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <button onclick="rpSave()">Save</button><span id="rpmsg" class="small"></span></div>
 <div id="rpcounts" class="dim small" style="margin-left:26px"></div>
 </div>
+<div class="card" id="vccard" style="display:none"><h2>Virtual companion <span class="hdesc">a chat node on the room's radio that MeshCore apps connect to over the network</span></h2>
+<div class="mqrow sub"><label>Import private key <input id="vc_key" type="password" autocomplete="new-password" placeholder="64 or 128 hex characters"></label><button onclick="vcImportKey()">Import key</button><span id="vckeymsg" class="dim small"></span></div>
+<div class="mqrow"><label class="sw"><input type="checkbox" id="vc_en" onchange="vcSet({enabled:this.checked})"> <b>Virtual companion</b></label>
+<span id="vcstat" class="dim small"></span></div>
+<div class="rprow"><label>Name <input id="vc_name" maxlength="31" size="16"></label>
+<label>TCP port <input id="vc_port" type="number" min="1" max="65535" style="width:6em"></label>
+<label>Allowed addresses <input id="vc_allow" size="26" placeholder="anyone who can reach the port"></label></div>
+<div class="rprow"><label class="sw"><input type="checkbox" id="vc_auto"> Auto advert</label>
+<label>every <input id="vc_int" type="number" min="1" max="10080" style="width:5em"> min</label>
+<label>as <select id="vc_flood"><option value="0">zero-hop</option><option value="1">flood</option></select></label>
+<button onclick="vcSave()">Save</button><span id="vcmsg" class="small"></span></div>
+<div id="vccounts" class="dim small" style="margin-left:26px"></div>
+<div class="mqnote">Connect a MeshCore app to this server's address and port as a WiFi/TCP companion. The port is open only while
+the companion is enabled. The companion protocol has no password: anyone who can reach the port can read its messages and send
+as it, so keep it on your own network (never forward it from the internet) and list allowed addresses (e.g. 192.168.1.0/24) to
+narrow it further. Radio settings, the Bluetooth PIN, reboot and factory reset from the app are acknowledged and ignored.
+Messages between the companion and this room or its repeater never go on the air.</div></div>
 <div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the room's, and the virtual repeater's when it's on</span></h2><div class="advrow">
 <div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
 <div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
@@ -4717,7 +6417,7 @@ function score(m){if(m.delivery==null)return'<span class="dim">new</span>';const
  return `<span class="${c}">${m.delivery}%</span> <span class="dim small">${m.avg_attempts} tries &middot; ${m.deliveries}</span>`}
 function route(r){return r==null?'<span class="dim">unknown (flood)</span>':r.length?r.map(esc).join(" &rsaquo; "):'direct'}
 let EXP=new Set(),map=null,layer=null,RPTS=[],MEMBERS=[],LAST=null,ADMIN=false,LOGIN_ON=false;
-let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false,WELCOME_LOADED=false;
+let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false,WELCOME_LOADED=false;let VCA={};
 function bytesOf(t){return new TextEncoder().encode(t).length}
 function chatLeft(){const n=CHAT_MAX-bytesOf($("chatmsg").value);$("chatleft").textContent=n+" left";$("chatleft").className=n<0?"poor small":"dim small";$("chatsend").disabled=n<0}
 async function loadChat(reset){if(!ADMIN||CHAT_BUSY)return;CHAT_BUSY=true;
@@ -4737,6 +6437,13 @@ async function rpSet(o){const r=await fetch("api/repeater",{method:"POST",header
 async function rpImportKey(){const k=$("rp_key").value.trim();if(!k)return;const ok=await rpSet({private_key:k});$("rp_key").value="";$("rpkeymsg").textContent=ok?"key imported; repeater remains disabled":"key was not imported"}
 function rpSave(){rpSet({name:$("rp_name").value,lat:$("rp_lat").value.trim(),lon:$("rp_lon").value.trim(),scope_mode:$("rp_mode").value,regions:$("rp_regions").value,
  airtime_cap:+$("rp_air").value,loop_detect:$("rp_loop").value,advert_min:+$("rp_adv").value,flood_advert_h:+$("rp_fadv").value})}
+async function vcSet(o){const r=await fetch("api/companion",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
+ let m="";if(!r.ok){m="Could not save";try{m=(await r.json()).error||m}catch(e){}}
+ if(r.status===401){m="Your admin session has expired: log in again.";session()}
+ $("vcmsg").className=r.ok?"good small":"poor small";$("vcmsg").textContent=r.ok?"saved":m;delete SIG.vcform;setTimeout(load,400);return r.ok}
+async function vcImportKey(){const k=$("vc_key").value.trim();if(!k)return;const ok=await vcSet({private_key:k});$("vc_key").value="";$("vckeymsg").textContent=ok?"key imported; companion remains disabled":"key was not imported"}
+function vcSave(){vcSet({name:$("vc_name").value,port:+$("vc_port").value,allow:$("vc_allow").value,auto_advert:$("vc_auto").checked,
+ advert_min:+$("vc_int").value,advert_flood:$("vc_flood").value==="1"})}
 async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  if(r.status===401){alert("Your admin session has expired: log in again.");session()}setTimeout(load,400)}
 async function mqCredentials(){const u=$("mq_user").value.trim(),p=$("mq_pass").value;if(!u||!p){$("mqcred").textContent="username and password are both required";$("mqcred").className="poor small";return}
@@ -4756,6 +6463,7 @@ async function session(){try{const r=await (await fetch("api/session")).json();A
  const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=ADMIN?"":"none";$("trafficcard").style.display=ADMIN?"":"none";$("welcomecard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);if(ADMIN&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
  $("mqcard").style.display=ADMIN?"":"none";
  $("rpcard").style.display=ADMIN?"":"none";
+ $("vccard").style.display=ADMIN?"":"none";
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
 let OBS_SERVERS=[];
 function renderObserverServers(){const t=$("observerservers");t.innerHTML="<tr><th>Name</th><th>Endpoint</th><th>Audience</th><th>Prefix</th><th>State</th><th></th></tr>"+OBS_SERVERS.map((s,i)=>`<tr><td>${esc(s.name)}</td><td>${esc(s.host)}:${s.port}${esc(s.ws_path)}</td><td>${esc(s.audience)}</td><td>${esc(s.topic_prefix)}</td><td>${s.enabled?"enabled":"off"}</td><td><button onclick="removeObserverServer(${i})">Delete</button></td></tr>`).join("")}
@@ -4896,6 +6604,18 @@ async function load(){
   $("rpcounts").innerHTML=Rp.enabled?`relayed: ${Rp.flood} flood, ${Rp.direct} direct, ${Rp.acks} ACKs, ${Rp.traces} traces &middot; discovery answers: ${Rp.discovery} &middot; `+
    `kept internal: ${Rp.internal} &middot; duplicates: ${Rp.dups} &middot; not relayed: ${Rp.drop_scope} scope, ${Rp.drop_hops} hop limit, ${Rp.drop_loop} loop, `+
    `${Rp.drop_airtime} airtime cap, ${Rp.drop_queue} queue full${Rp.relay?"":`, ${Rp.drop_off} while off`} &middot; adverts: ${Rp.adverts}`:""}
+ const Vc=st.companion||{};
+ if(ADMIN){try{const r=await fetch("api/companion");if(r.ok)VCA=await r.json()}catch(e){}}
+ $("rvc").innerHTML=Vc.enabled?`<span class="dim">Companion</span> ${esc(Vc.name)} `+(Vc.client?`<span class="good">app connected</span>`:Vc.listening?'<span class="dim small">no app connected</span>':'<span class="poor">port not open</span>'):"";
+ if(ADMIN){$("vc_en").checked=!!Vc.enabled;
+  const f=document.activeElement,typing=f&&f.closest&&f.closest("#vccard")&&f.tagName!=="BUTTON"&&f.id!=="vc_en";
+  if(!typing&&changed("vcform",[Vc.name,Vc.port,VCA.allow,Vc.auto_advert,Vc.advert_min,Vc.advert_flood])){
+   $("vc_name").value=Vc.name||"";$("vc_port").value=Vc.port;$("vc_allow").value=(VCA.allow||[]).join(", ");$("vc_auto").checked=!!Vc.auto_advert;
+   $("vc_int").value=Vc.advert_min;$("vc_flood").value=Vc.advert_flood?"1":"0"}
+  $("vcstat").innerHTML=Vc.enabled?(Vc.listening?`listening on port ${esc(Vc.listen_port)}`:`<span class="poor">port ${esc(Vc.port)} not open: ${esc(Vc.error)}</span>`)+
+   ` &middot; id ${esc(Vc.id)} &middot; key ${esc((Vc.key||"").slice(0,16))}&hellip; &middot; `+(Vc.client?`<span class="good">app connected</span>${VCA.client?" from "+esc(VCA.client):""}`:"no app connected"):"off (port closed)";
+  $("vccounts").innerHTML=Vc.enabled?`${Vc.contacts} contacts &middot; ${Vc.channels} channels &middot; ${Vc.queued} message(s) waiting for the app &middot; `+
+   `messages received ${Vc.msgs_in}, sent ${Vc.msgs_out} &middot; kept off the air: ${Vc.internal_in} in, ${Vc.internal_out} out &middot; app settings ignored: ${Vc.ignored}`:""}
  const Wb=st.web||{};
  $("rweb").innerHTML=`<span class="dim">Web</span> ${Wb.viewers||0} viewer${Wb.viewers==1?"":"s"}${Wb.admins?` <span class="dim small">(${Wb.admins} admin)</span>`:""}`;
  if(st.map_version!==MAPVER)loadMap();                       // the map's shape changed (e.g. a new repeater): fetch now
@@ -5217,6 +6937,10 @@ class WebUI:
                     msgs = [dict(ts=ts, who=room.chat_label(a), room=(a == room.id.pub_key), text=txt)
                             for ts, a, txt, to in posts if to is None and ts > since]
                     return self._send(200, json.dumps({"messages": msgs, "max_bytes": MAX_POST_TEXT_LEN}))
+                if path == "/api/companion":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    return self._send(200, json.dumps(room.web_vc_admin))
                 if path == "/api/welcome":
                     if not self._is_admin():
                         return self._send(401, '{"error":"log in first"}')
@@ -5336,6 +7060,18 @@ class WebUI:
                         return self._send(400, '{"error":"nothing to change"}')
                     events.put(("rpt_cfg", ch))                     # applied (and saved) by the main loop
                     return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
+                if parts == ["api", "companion"]:
+                    try:
+                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        if "private_key" in body and room.cfg.companion_enabled:
+                            return self._send(409, '{"error":"disable the virtual companion before importing a private key"}')
+                        ch = companion_changes(body)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e) or "bad request"}))
+                    if not ch:
+                        return self._send(400, '{"error":"nothing to change"}')
+                    events.put(("vc_cfg", ch))                      # applied (and saved) by the main loop
+                    return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "advert"]:
                     try:
                         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
@@ -5450,6 +7186,7 @@ def main():
     room = RoomServer(cfg, modem, identity, store)
     room.events_put = events.put
     room.events_q = events
+    room.companion_apply()                                  # (its TCP port needs the event queue)
     observer = None
 
     def start_observer():
@@ -5526,6 +7263,8 @@ def main():
                 room.cfg.set(k, v)
             room.repeater_apply()
             room.web_dirty = True
+        elif kind in ("vc_cmd", "vc_conn", "vc_disc", "vc_cfg"):
+            room.companion_event(ev)
         elif kind == "web_wake":
             room.web_dirty = True
             room.next_map = 0.0                             # first view after idle: the map part too
@@ -5588,6 +7327,8 @@ def main():
         room.feed.stop()                                    # stop inbound producer before serial/state teardown
     room.flush()
     room.flush_topology()
+    if room.vc is not None:
+        room.vc.close()                                     # saves its contacts, closes its TCP port
     if observer:
         observer.close()
     store.close()                                           # waits for the writer thread to finish
