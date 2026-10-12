@@ -111,6 +111,24 @@
     "repeater_loop_detect": "minimal"
   },
 
+  "tenants": {
+    "_note": "Tenant rooms: more rooms on this radio, created and deleted from the dashboard (admin). Each entry is only {name, path, public_key}; the room's key, passwords, members and posts are in data_dir/tenants/<public key>.db.",
+    "tenant_rooms": []
+  },
+
+  "companion": {
+    "_note": "Virtual companion: a chat node on the room's radio that MeshCore apps connect to over TCP, like a WiFi companion radio. Its port is open only while companion_enabled is true. The companion protocol has no password: never forward the port from the internet; companion_allow lists the addresses/networks allowed to connect (empty = anyone who can reach it). companion_key \"\" = a new identity is generated and saved here on first start. Radio settings, Bluetooth PIN, reboot and factory reset sent by the app are acknowledged and ignored. Its contacts and messages are kept in companion.db in data_dir. All of this can be changed from the dashboard (admin).",
+    "companion_enabled": false,
+    "companion_name": "pyMeshRoom Companion",
+    "companion_key": "",
+    "companion_port": 5000,
+    "companion_bind": "0.0.0.0",
+    "companion_allow": [],
+    "companion_auto_advert": false,
+    "companion_advert_interval_min": 60,
+    "companion_advert_flood": false
+  },
+
   "dashboard": {
     "web_port": 8081,
     "web_bind": "0.0.0.0",
