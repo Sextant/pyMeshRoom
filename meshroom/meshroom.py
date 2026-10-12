@@ -55,7 +55,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 4.8"
+FIRMWARE_VERSION = "meshroom-py 4.9"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -263,18 +263,31 @@ POST_SYNC_DELAY_SECS = 6
 MAX_POST_TEXT_LEN = 160 - 9
 SYNC_SKIP_INTERVAL = 0.15
 
-PUSH_ATTEMPTS = 4                 # current route x2, best other route, flood
+PLAN_ROUTES = 4                   # attempt plan: the top routes, then PLAN_FLOODS floods
+PLAN_FLOODS = 2
 ROUTES_PER_MEMBER = 3
 ROUTE_DROP_FAILS = 2
 ROUTE_HALFLIFE_H = 24
 ROUTE_MAX_AGE_D = 7
-FLOOD_ACK_MIN = 25.0
-RETRY_BEFORE_SUSPEND_S = 60      # one retry (best route + flood) a minute after a plan fails, then suspension
+FLOOD_ACK_S = 30.0               # wait for a flood's ACK
+DIRECT_ACK_MAX_S = 60.0          # cap on a direct attempt's wait (firmware formula, see ack_wait)
+LATE_ACK_S = 120                 # an attempt's ACK still credits its route this long after its own timeout
+PACE_MAX_HOPS = 2                # only pushes over routes this short count toward the shared pace (local congestion)
+RETRY_BEFORE_SUSPEND_S = 60      # one retry (best route + floods) a minute after a plan fails, then suspension
 SUSPENDED_PROBE_S = 6 * 3600     # while suspended: a single flood this often, in case they listen but never transmit
 MAX_NEIGHBOURS = 50
 NAME_CACHE_MAX = 1000
 
 SLOT_FLOOD = "flood"
+
+
+def ack_wait(plen, airtime_ms):
+    """Seconds to wait for an ACK. Direct: the firmware's own timeout (SEND_TIMEOUT_BASE_MILLIS 500 +
+    (DIRECT_SEND_PERHOP_FACTOR 6 x airtime + DIRECT_SEND_PERHOP_EXTRA_MILLIS 250) per leg, hops + 1 legs), capped.
+    Flood (plen None): FLOOD_ACK_S."""
+    if plen is None:
+        return FLOOD_ACK_S
+    return min((500 + (airtime_ms * 6 + 250) * ((plen & 63) + 1)) / 1000.0, DIRECT_ACK_MAX_S)
 
 
 def path_bytes(path_len):
@@ -1145,14 +1158,15 @@ class Member:
         self.push_failures = 0
         self.push_post_ts = 0
         self.push_private = False         # the post being pushed is a private message (doesn't move sync_since)
+        self.push_delivered = False       # the post being pushed was delivered (its other attempts' ACKs only credit routes)
         self.push_sent = 0.0
         self.push_hops = 0xFF
-        self.prev_acks = [None, None]
+        self.attempt_no = 0               # attempts on the current post so far: picks the attempt bits (0..3, in turn)
+        self.ack_map = {}                 # expected ACK -> its attempt (see push_post), kept LATE_ACK_S past its timeout
         self.routes = []                  # ProvenRoute list
         self.plan = None                  # attempt plan for the post being delivered
-        self.plan_retry = False           # plan is a backoff retry (best route, then flood)
+        self.plan_retry = False           # plan is a backoff retry (best route, then floods)
         self.inflight = None              # plan entry of the attempt in flight
-        self.prev_entries = [None, None]  # plan entries of earlier attempts, parallel to prev_acks
         self.backoff = 0
         self.retry_at = 0.0
         self.stuck_since = 0.0
@@ -1165,7 +1179,6 @@ class Member:
         self.obs_confirmed = None         # a push an observer confirmed first: its RF ACK is still credited (2 min)
         self.suspended_at = 0             # when they were suspended (wall clock)
         self.pace_sample = None           # the push in flight counts toward the shared pace: {"p": expected, "ok": ...}
-        self.timed_sample = None          # its sample if it timed out (a late ACK turns it back into a success)
         self.attempts_avg = None          # recency-weighted attempts per delivered post (1.0 = always first try)
         self.deliveries = 0
         self.attempts_cur = 0             # attempts on the post being delivered
@@ -1823,11 +1836,10 @@ class RoomServer:
         airtime = self.airtime_ms(pkt.raw_length() + (path_bytes(n["plen"]) if n["plen"] is not None else 0))
         if n["plen"] is not None and n["tries"] < 2:
             self.send_direct(pkt, n["path"], n["plen"])
-            hops = n["plen"] & 63
-            wait = max(4.0 + 2.0 * (hops + 1), (500 + (airtime * 6 + 250) * (hops + 1)) / 1000.0)
+            wait = ack_wait(n["plen"], airtime)
         else:
             self.send_flood(pkt)
-            wait = max(FLOOD_ACK_MIN, (500 + 32 * airtime) / 1000.0)
+            wait = ack_wait(None, airtime)
         n["tries"] += 1
         n["next_at"] = time.monotonic() + wait
         log.info("sent to %s (attempt %d of 3): %s", n["label"], n["tries"], n["text"])
@@ -2027,10 +2039,7 @@ class RoomServer:
             force_since = struct.unpack_from("<I", data, 5)[0] if len(data) >= 9 else 0
             if force_since:
                 m.sync_since = force_since
-            if m.pending_ack:                               # keep the abandoned attempt's ACK
-                m.prev_acks = [m.pending_ack, m.prev_acks[0]]
-                m.prev_entries = [m.inflight, m.prev_entries[0]]
-            m.pending_ack = None
+            m.pending_ack = None                            # (the abandoned attempt's ACK still counts: ack_map)
             m.inflight = None
             if m.out_path_len is not None:
                 body = data[:9] if len(data) >= 9 else data[:5] + bytes(4)
@@ -2109,48 +2118,52 @@ class RoomServer:
                 self.notices.remove(n)
                 log.info("%s received: %s", n["label"], n["text"])
                 return True
+        now = time.monotonic()
         for m in self.members.values():
-            late = None
-            match = m.pending_ack is not None and ack == m.pending_ack
-            if not match:
-                for j in (0, 1):
-                    if m.prev_acks[j] is not None and ack == m.prev_acks[j]:
-                        match, late = True, j
-                        break
-            if not match:
-                oc = m.obs_confirmed
-                if oc and time.monotonic() < oc["until"] and ack in oc["acks"]:
-                    self.rf_after_observer(m, ack)
-                    return True
+            rec = m.ack_map.get(ack)
+            if rec is not None and now >= rec["until"]:
+                rec = None
+            cur = m.pending_ack is not None and ack == m.pending_ack
+            if not cur and rec is None:
                 continue
+            if rec is not None and rec["credited"]:
+                return True                                 # this attempt's ACK again: already counted
+            oc = m.obs_confirmed
+            if oc and now < oc["until"] and ack in oc["acks"]:
+                self.rf_after_observer(m, ack)
+                return True
+            if not cur and (rec["post"] != m.push_post_ts or m.push_delivered):
+                self.late_credit(m, rec)                    # another attempt of a post already delivered
+                return True
             self.heard_from(m)                              # their ACK: heard from them
             lat_ms = None
-            if late is None and m.push_sent:
-                lat_ms = int((time.monotonic() - m.push_sent) * 1000)
+            if cur and m.push_sent:
+                lat_ms = int((now - m.push_sent) * 1000)
                 b = 5 if m.push_hops == 0xFF else min(m.push_hops, 4)
                 self.lat_sum[b] += lat_ms
                 self.lat_cnt[b] += 1
-            self.stats["late_acks" if late is not None else "acks"] += 1
-            entry = m.prev_entries[late] if late is not None else m.inflight
+            self.stats["acks" if cur else "late_acks"] += 1
+            if rec is not None:
+                rec["credited"] = True
+            entry = m.inflight if cur else rec["entry"]
             self.attempt_result(m, entry, True, lat_ms)
-            if late is None and m.pace_sample is not None:
+            if cur and m.pace_sample is not None:
                 m.pace_sample["ok"] = True
                 self.pace_outcome(m.pace_sample)
-            elif late is not None and m.timed_sample is not None:
-                m.timed_sample["ok"] = True                 # a late ACK: that "timeout" was delivered after all
-            m.pace_sample = m.timed_sample = None
-            if late is None and m.pub == self.last_pushed and self.last_push_flood:
-                self.next_push = min(self.next_push, time.monotonic() + 0.5)   # flood ACK back: the wave is done
+            elif not cur and rec["timed"] is not None:
+                rec["timed"]["ok"] = True                   # a late ACK: that "timeout" was delivered after all
+            m.pace_sample = None
+            if cur and m.pub == self.last_pushed and self.last_push_flood:
+                self.next_push = min(self.next_push, now + 0.5)   # flood ACK back: the wave is done
             if m.attempts_cur:
                 self.delivery_sample(m, m.attempts_cur)
                 m.deliveries += 1
                 m.attempts_cur = 0
             self.stats["delivered"] += 1
             m.obs_confirmed = None
-            m.pending_ack = None
+            m.pending_ack = None                            # (the other attempts' ACKs still credit their routes)
             m.inflight = None
-            m.prev_acks = [None, None]
-            m.prev_entries = [None, None]
+            m.push_delivered = True
             if not m.push_private:                          # (a private message is delivered out of order)
                 m.sync_since = m.push_post_ts
             self.drop_private(m.pub, m.push_post_ts)            # private message delivered: no longer needed
@@ -2162,6 +2175,17 @@ class RoomServer:
             self.mark_dirty()
             return True
         return False
+
+    def late_credit(self, m, rec):
+        """The ACK of an earlier attempt of a post that was already delivered: that route delivered too. Route credit
+        (and its pace sample, if it timed out) only; the delivery itself was already counted."""
+        rec["credited"] = True
+        self.heard_from(m)
+        self.stats["late_acks"] += 1
+        self.attempt_result(m, rec["entry"], True)
+        if rec["timed"] is not None:
+            rec["timed"]["ok"] = True
+        self.mark_dirty()
 
     # ------------------------------------------------------------------ routes: proven (per member)
 
@@ -2688,26 +2712,15 @@ class RoomServer:
         return plan
 
     def _build_plan(self, m, retry=False):
-        """Attempts for one post: best route, best built route (if different), best again,
-        next distinct route, flood. Straight to flood if nothing scores at least 35%."""
-        flood = dict(plen=None, path=None, score=0.0, proven=None, built=None)
+        """Attempts for one post: the top PLAN_ROUTES distinct routes (the rest only if they score at least 20%),
+        then PLAN_FLOODS floods. Straight to the floods if nothing scores at least 35%. Retry: best route, floods."""
+        floods = [dict(plen=None, path=None, score=0.0, proven=None, built=None) for _ in range(PLAN_FLOODS)]
         cands = self.candidates(m)
         if not cands or cands[0]["score"] < 0.35:
-            return [flood]
-        best = cands[0]
+            return floods
         if retry:
-            return [best, flood]
-        plan = [best]
-        second = next((c for c in cands[1:] if c["built"] == "shortcut"), None) \
-            or next((c for c in cands[1:] if c["built"] is not None), None) or (cands[1] if len(cands) > 1 else None)
-        if second is not None and second["score"] >= 0.2:
-            plan.append(second)
-        plan.append(best)
-        nxt = next((c for c in cands[1:] if c is not second and c["score"] >= 0.2), None)
-        if nxt is not None:
-            plan.append(nxt)
-        plan.append(flood)
-        return plan
+            return [cands[0]] + floods
+        return [cands[0]] + [c for c in cands[1:] if c["score"] >= 0.2][:PLAN_ROUTES - 1] + floods
 
     # ------------------------------------------------------------------ observer feed (MQTT augmentation)
 
@@ -2733,25 +2746,27 @@ class RoomServer:
                 self.notices.remove(n)
                 self.stats["obs_acks"] += 1
                 return True
+        now = time.monotonic()
         for m in self.members.values():
             cur = m.pending_ack is not None and ack == m.pending_ack
-            late = any(a is not None and ack == a for a in m.prev_acks)
+            rec = m.ack_map.get(ack)
+            late = (rec is not None and now < rec["until"] and rec["post"] == m.push_post_ts and m.push_post_ts
+                    and not m.push_delivered)
             if not (cur or late):
                 continue
             # keep every attempt of this post: its RF ACK may still arrive, and RF stays the source of route credit
-            acks = {}
+            acks = {a: (r["entry"], False) for a, r in m.ack_map.items()
+                    if r["post"] == m.push_post_ts and now < r["until"] and not r["credited"]}
             if m.pending_ack is not None:
                 acks[m.pending_ack] = (m.inflight, True)
-            for j in (0, 1):
-                if m.prev_acks[j] is not None:
-                    acks[m.prev_acks[j]] = (m.prev_entries[j], False)
-            m.obs_confirmed = dict(acks=acks, sent=m.push_sent, hops=m.push_hops, pace=m.pace_sample, timed=m.timed_sample,
-                                   attempts=m.attempts_cur, until=time.monotonic() + 120)
+            m.obs_confirmed = dict(acks=acks, sent=m.push_sent, hops=m.push_hops, pace=m.pace_sample,
+                                   attempts=m.attempts_cur, until=now + 120)
+            m.push_delivered = True
             if not m.push_private:
                 m.sync_since = max(m.sync_since, m.push_post_ts)
             self.drop_private(m.pub, m.push_post_ts)
-            m.pending_ack, m.inflight, m.prev_acks, m.prev_entries = None, None, [None, None], [None, None]
-            m.pace_sample = m.timed_sample = None
+            m.pending_ack, m.inflight = None, None
+            m.pace_sample = None
             m.push_failures, m.plan, m.plan_retry = 0, None, False
             m.backoff, m.retry_at, m.stuck_since, m.attempts_cur = 0, 0.0, 0.0, 0
             self.stats["obs_acks"] += 1
@@ -2767,6 +2782,9 @@ class RoomServer:
         delivery score, pace, last heard). The delivery itself was already counted."""
         oc = m.obs_confirmed
         entry, latest = oc["acks"][ack]
+        rec = m.ack_map.get(ack)
+        if rec is not None:
+            rec["credited"] = True
         self.heard_from(m)
         lat_ms = int((time.monotonic() - oc["sent"]) * 1000) if latest and oc["sent"] else None
         self.stats["acks" if latest else "late_acks"] += 1
@@ -2775,8 +2793,8 @@ class RoomServer:
         if latest and oc["pace"] is not None:
             oc["pace"]["ok"] = True
             self.pace_outcome(oc["pace"])
-        elif not latest and oc["timed"] is not None:
-            oc["timed"]["ok"] = True
+        elif not latest and rec is not None and rec["timed"] is not None:
+            rec["timed"]["ok"] = True
         if oc["attempts"]:
             self.delivery_sample(m, oc["attempts"])
             m.deliveries += 1
@@ -3374,7 +3392,7 @@ class RoomServer:
         self.pace_hist.append(sample)
         lo, hi = self.cfg.push_pace_min_ms / 1000.0, self.cfg.push_pace_max_ms / 1000.0
         n = len(self.pace_hist)
-        if n < 12 or len({x["who"] for x in self.pace_hist}) < 3:
+        if n < 12 or len({x["who"] for x in self.pace_hist}) < 2:
             return                                          # not enough evidence (and no single member can swing it)
         delivered = sum(1 for x in self.pace_hist if x["ok"])
         expected = sum(x["p"] for x in self.pace_hist)
@@ -3449,19 +3467,22 @@ class RoomServer:
     def check_ack_timeouts(self):
         now = time.monotonic()
         for m in self.members.values():
+            if m.ack_map:
+                for a in [a for a, r in m.ack_map.items() if now >= r["until"]]:
+                    del m.ack_map[a]
             if m.pending_ack is None or now < m.ack_timeout:
                 continue
             entry = m.inflight
+            rec = m.ack_map.get(m.pending_ack)              # (its late ACK still counts until rec["until"])
             m.push_failures += 1
-            m.prev_acks = [m.pending_ack, m.prev_acks[0]]   # late ACKs still count
-            m.prev_entries = [entry, m.prev_entries[0]]
             m.pending_ack = None
             m.inflight = None
             self.stats["timeouts"] += 1
             self.attempt_result(m, entry, False)
             if m.pace_sample is not None:
                 m.pace_sample["ok"] = False
-                m.timed_sample = m.pace_sample              # kept: a late ACK can still correct it
+                if rec is not None:
+                    rec["timed"] = m.pace_sample            # kept: a late ACK can still correct it
                 self.pace_outcome(m.pace_sample)
                 m.pace_sample = None
             if m.plan is not None and m.push_failures >= len(m.plan):
@@ -3528,24 +3549,28 @@ class RoomServer:
 
     def push_post(self, m, ts, author, text, wire_ts=None):
         if ts != m.push_post_ts:
-            m.prev_acks = [None, None]                      # different post: earlier attempts' ACKs no longer apply
+            m.attempt_no = 0                                # different post: attempt bits start again at 0
+            m.push_delivered = False
             if not m.plan_retry or m.plan is None:
                 m.plan, m.push_failures = None, 0
         if m.given_up:                                      # suspended probe: a single flood
             m.plan, m.plan_retry, m.push_failures = [dict(plen=None, path=None, score=0.0, proven=None, built=None)], True, 0
         elif m.plan is None:
             m.plan, m.plan_retry, m.push_failures = self.build_plan(m), False, 0
-        elif m.push_failures >= len(m.plan):                # the one retry: best route, then flood
+        elif m.push_failures >= len(m.plan):                # the one retry: best route, then floods
             m.plan, m.plan_retry, m.push_failures = self.build_plan(m, retry=True), True, 0
         entry = m.plan[m.push_failures]
         r_ = entry.get("proven")
         online = now_s() - max(m.last_heard or 0, m.last_activity or 0) < 900
         first = m.push_failures == 0 and not m.plan_retry
+        local = entry["plen"] is not None and path_hops(entry["plen"]) <= PACE_MAX_HOPS
         m.pace_sample = (dict(ok=None, p=max(0.05, min(0.95, r_.rate(now_s(), self.rhalf()))), who=m.pub[:4])
-                         if (online and first and not m.given_up and entry["plen"] is not None and r_ is not None) else None)
+                         if (online and first and not m.given_up and local and r_ is not None) else None)
         m.attempts_cur += 1
-        data = struct.pack("<I", ts if wire_ts is None else wire_ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | random.randrange(4)]) \
+        # the attempt bits count 0, 1, 2, 3, 0...: each of a post's 4 possible ACKs names its latest attempt
+        data = struct.pack("<I", ts if wire_ts is None else wire_ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | (m.attempt_no & 3)]) \
             + author[:4] + text.encode()
+        m.attempt_no += 1
         m.pending_ack = sha256(data, m.pub)[:4]
         m.push_post_ts = ts
         m.push_private = any(p[0] == ts and p[3] is not None for p in self.posts)
@@ -3555,17 +3580,16 @@ class RoomServer:
         m.push_hops = path_hops(plen)
         pkt = self.make_datagram(PT_TXT_MSG, m.pub, self.secret_for(m), data)
         airtime = self.airtime_ms(pkt.raw_length() + (path_bytes(plen) if plen is not None else 0))
+        wait = ack_wait(plen, airtime)
         if plen is None:
             self.send_flood(pkt, deferrable=True)
-            m.ack_timeout = time.monotonic() + max(12.0, FLOOD_ACK_MIN, (500 + 32 * airtime) / 1000.0)
         else:
             self.send_direct(pkt, path, plen, deferrable=True)
-            hops = plen & 63
-            formula = max(4.0 + 2.0 * (hops + 1), (500 + (airtime * 6 + 250) * (hops + 1)) / 1000.0)
             r = entry["proven"]
             if r is not None and r.lat_n >= 3:              # learned from this route's own ACK times
-                formula = min(max(3.0, r.lat * 2.5 / 1000.0 + 1.5), formula * 1.5)
-            m.ack_timeout = time.monotonic() + formula
+                wait = min(max(3.0, r.lat * 2.5 / 1000.0 + 1.5), wait * 1.5)
+        m.ack_timeout = time.monotonic() + wait
+        m.ack_map[m.pending_ack] = dict(entry=entry, post=ts, until=m.ack_timeout + LATE_ACK_S, timed=None, credited=False)
         self.stats["pushes"] += 1
         log.debug("push %s -> %s attempt %d/%d via %s", ts, m.key6, m.push_failures + 1, len(m.plan),
                   "flood" if plen is None else "%d hops" % (plen & 63))
@@ -4066,13 +4090,18 @@ class RoomServer:
         for m in self.members.values():
             nm = self.names.get(m.pub[:8])
             in_backoff = m.plan is not None and m.push_failures >= len(m.plan) and time.monotonic() < m.retry_at
+            outstanding = self.unsynced_count(m)
+            # synced: nothing to send; queued: posts waiting, none tried yet; sent: first attempt out; retry: the
+            # latest attempt on this post is retry number tries - 1 (in flight, or waiting its turn)
+            tries = m.attempt_no if m.push_post_ts and not m.push_delivered else 0
+            push = ("suspended" if m.given_up else "backoff" if in_backoff else "retry" if tries > 1
+                    else "sent" if tries == 1 else "queued" if outstanding else "synced")
             members.append(dict(
                 pub=hexs(m.pub), key=m.key6, name=nm[1] if nm else "",
                 delivery=self.delivery_score(m), avg_attempts=None if m.attempts_avg is None else round(m.attempts_avg, 2),
                 deliveries=m.deliveries, role={PERM_ADMIN: "admin", PERM_GUEST: "guest"}.get(m.role, "member"),
-                last_activity=m.last_activity, last_heard=max(m.last_heard or 0, m.last_activity or 0), sync_since=m.sync_since, outstanding=self.unsynced_count(m),
-                push="suspended" if m.given_up else "waiting" if m.pending_ack else "backoff" if in_backoff
-                     else "retrying" if m.push_failures else "idle",
+                last_activity=m.last_activity, last_heard=max(m.last_heard or 0, m.last_activity or 0), sync_since=m.sync_since, outstanding=outstanding,
+                push=push, retries=max(0, tries - 1),
                 retry_in=int(m.retry_at - time.monotonic()) if in_backoff else 0,
                 route=self.path_names(m.out_path_len, m.out_path), route_hex=self.path_hex(m.out_path_len, m.out_path),
                 in_route_hex=self.path_hex(m.in_path_len, m.in_path) if m.in_ts else None, suspended_at=m.suspended_at,
@@ -6255,7 +6284,7 @@ class TenantRoom(RoomServer):
         if t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG, PT_ANON_REQ):
             return bool(p) and p[0] == self.self_hash
         if t in (PT_ACK, PT_MULTIPART):
-            return bool(self.notices) or any(m.pending_ack is not None or m.prev_acks != [None, None]
+            return bool(self.notices) or any(m.pending_ack is not None or m.ack_map
                                              for m in self.members.values())
         if t == PT_ADVERT:
             return p[:32] in self.members
@@ -6751,7 +6780,7 @@ header h1{font-size:18px;margin:0}.dim{color:var(--dim)}main{padding:14px 18px;d
 .card h2{font-size:14px;margin:0 0 8px;color:var(--acc);text-transform:uppercase;letter-spacing:.04em}
 table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:top}
 th{color:var(--dim);font-weight:500}.tag{padding:1px 6px;border-radius:4px;font-size:12px}
-.idle{background:#24382c;color:var(--ok)}.waiting,.retrying{background:#3a3220;color:var(--warn)}.backoff,.gave_up,.suspended{background:#3d2424;color:var(--bad)}
+.synced{background:#24382c;color:var(--ok)}.queued,.sent{background:#1f3042;color:var(--acc)}.retry{background:#3a3220;color:var(--warn)}.backoff,.gave_up,.suspended{background:#3d2424;color:var(--bad)}
 button{background:#2a313b;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:2px 10px;cursor:pointer}
 .mapwrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
 @media (max-width:900px){.mapwrap{grid-template-columns:1fr}}
@@ -7164,7 +7193,8 @@ async function load(){
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
  const memSig=JSON.stringify(st.members)+"|"+ADMIN+"|"+[...EXP].join(",");
  if(changed("members",memSig)){
- const ACTS=(m,i)=>ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff/suspension, retry now via best routes, then flood${m.outstanding?"":" (nothing outstanding)"}" onclick="event.stopPropagation();resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="event.stopPropagation();openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" onclick="event.stopPropagation();act('api/members/${m.pub}/kick','Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again.')">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" onclick="event.stopPropagation();act('api/members/${m.pub}/ban','Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely.')">${IC("ban")}</button></td>`:"";
+ const PUSH_TIP={synced:"Up to date: nothing to send",queued:"Posts waiting; nothing sent yet",sent:"First attempt sent",retry:"Retrying: count of retries sent for this post",backoff:"Every attempt failed: one more try (best route, then floods) when the timer ends",suspended:"No ACKs: paused until we hear from them (a flood probe every 6 h)"};
+ const ACTS=(m,i)=>ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff/suspension, retry now via best routes, then floods${m.outstanding?"":" (nothing outstanding)"}" onclick="event.stopPropagation();resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="event.stopPropagation();openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" onclick="event.stopPropagation();act('api/members/${m.pub}/kick','Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again.')">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" onclick="event.stopPropagation();act('api/members/${m.pub}/ban','Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely.')">${IC("ban")}</button></td>`:"";
  const IDC=(m,caret)=>`<td class="idcell">${caret}<b>${esc(m.name)||'<span class="dim">unknown</span>'}</b><br><span class="dim mono4">${m.key.slice(0,4)}</span><br><span class="small">${m.role}</span></td>`;
  const HX=h=>h==null?'<span class="dim">unknown</span>':h.length?h.join(" &rsaquo; "):"direct";
  const NM=p=>p==null?'<span class="dim">unknown</span>':p.length?p.map(esc).join(" &rsaquo; "):"direct";
@@ -7177,7 +7207,7 @@ async function load(){
               :[...others.slice(0,2).map(r=>row("TX","tx",`<span class="hexr">${HX(r.hex)}</span> <span class="dim">${r.rate}%</span>`)),...(m.in_routes||[]).slice(0,2).map(r=>row("RX","rx",`<span class="hexr">${HX(r.hex)}</span> <span class="dim">${r.share}%</span>`))].join("");
    const near=ex?m.near.map(n=>esc(n.rpt)+` <span class="dim">${n.share}%</span>`).join("<br>"):m.near.slice(0,4).map(n=>`<span class="hexr">${n.hex}</span> <span class="dim">${n.share}%</span>`).join("<br>");
    return `<tr class="mrow${ex?" exp":""}" data-k="${m.key}">${ACTS(m,i)}${IDC(m,`<span class="caret">${ex?"&#9662;":"&#9656;"}</span>`)}<td>${score(m)}</td><td>${ago(m.last_heard)}</td><td>${ago(m.sync_since)}</td><td>${m.outstanding}</td>
-   <td><span class="tag ${m.push}">${m.push}${m.retry_in?" "+Math.ceil(m.retry_in/60)+"m":""}</span></td>
+   <td><span class="tag ${m.push}" title="${PUSH_TIP[m.push]||""}">${m.push==="retry"?"retry \u00d7"+m.retries:m.push}${m.retry_in?" "+Math.ceil(m.retry_in/60)+"m":""}</span></td>
    <td class="small ${ex?"rcell":""}">${cur}</td><td class="small ${ex?"rcell":""}">${oth||'<span class="dim">-</span>'}</td><td class="small">${near||'<span class="dim">-</span>'}</td></tr>`}).join("")
   :`<tr><td class="dim">no active members</td></tr>`);
  document.querySelectorAll("#members tr.mrow").forEach(tr=>tr.onclick=()=>{const k=tr.dataset.k;EXP.has(k)?EXP.delete(k):EXP.add(k);SIG.members="";load()});

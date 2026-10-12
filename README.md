@@ -90,7 +90,7 @@ Core functionality fixed:
    * Time via linux host (NTP)
    * A map of the mesh, learned from every packet heard (2/3-byte IDs only), so the room can build routes it was never told
    * Multiple routes per member with recency-weighted success rates, trying alternates before flood fallback
-   * A planned attempt order: best route, alternate, best again, next, flood; then backoff and give-up, instead of fixed retries
+   * A planned attempt order: the top 4 routes, then 2 floods; one retry a minute later (best route, then 2 floods), then suspension, instead of fixed retries
    * Newcomers reached direct on the first push: the companion directory knows where they are before they join by passively monitoring the mesh
    * Route shortcuts: unneeded hops are skipped when the room reaches a repeater directly, confirmed both ways
    * Adaptive push gaps sized from each route's measured ACK time; the ACK itselfends the wait, and flood gaps end once the rebroadcast wave passes
