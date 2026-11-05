@@ -8874,7 +8874,7 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name
 <link rel="stylesheet" href="static/leaflet.css">
 <script src="static/leaflet.js"></script>
 <style>
-:root{--link:#8fd0ff;--bg:#111418;--card:#1a1f26;--line:#2a313b;--fg:#d8dee6;--dim:#8a94a3;--acc:#5cb3ff;--ok:#4caf7a;--warn:#e0a83e;--bad:#e05a5a}
+:root{--link:#2f7fc4;--bg:#111418;--card:#1a1f26;--line:#2a313b;--fg:#d8dee6;--dim:#8a94a3;--acc:#5cb3ff;--ok:#4caf7a;--warn:#e0a83e;--bad:#e05a5a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
 header{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:18px;align-items:baseline}
 header h1{font-size:18px;margin:0}.dim{color:var(--dim)}main{padding:14px 18px;display:grid;gap:14px}
@@ -9586,12 +9586,12 @@ function drawBestMap(){
  }
  if(bestlayer)bestlayer.remove(); bestlayer=L.layerGroup().addTo(bestmap);
  const name=h=>{const x=pts.find(p=>p.h===h);return x?esc(x.name):h};
- links.forEach(e=>L.polyline([pos[e.a],pos[e.b]],{color:link,weight:1.5,opacity:.7,dashArray:e.obs?"4 4":null})
+ links.forEach(e=>L.polyline([pos[e.a],pos[e.b]],{color:link,weight:2,opacity:.9,dashArray:e.obs?"4 4":null})
   .bindTooltip(`${name(e.a)} &harr; ${name(e.b)}${e.obs?"<br><i>via observers</i>":""}`).addTo(bestlayer));
  if(room)pts.forEach(x=>L.polyline([room,x.p],{color:x.c,weight:3,opacity:.85}).bindTooltip(`${esc(x.name)}: ${x.rel}`).addTo(bestlayer));
  pts.forEach(x=>L.circleMarker(x.p,{radius:7,color:"#0d1014",weight:1.5,fillColor:x.c,fillOpacity:1})
   .bindTooltip(`${esc(x.name)}<br>reliability ${x.rel}`).addTo(bestlayer));
- if(room)L.circleMarker(room,{radius:8,color:"#0d1014",weight:1.5,fillColor:"#ffffff",fillOpacity:1}).bindTooltip(esc(R.name)+" (room)").addTo(bestlayer);
+ if(room)L.circleMarker(room,{radius:8,color:"#d8dee6",weight:2,fillColor:"#1a1f26",fillOpacity:1}).bindTooltip(esc(R.name)+" (room)").addTo(bestlayer);
  const all=pts.map(x=>x.p).concat(room?[room]:[]);
  bestmap.fitBounds(all,{padding:[24,24],maxZoom:13});
  setTimeout(()=>bestmap.invalidateSize(),0);
