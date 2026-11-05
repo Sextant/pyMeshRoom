@@ -4662,14 +4662,15 @@ class RoomServer:
                 few=round(traces, 1) < 5,
                 in_last=st["in_last"], in_avg=None if st["in_avg"] is None else round(st["in_avg"], 1),
                 out_last=st["out_last"], out_avg=None if st["out_avg"] is None else round(st["out_avg"], 1),
-                rtt=None if st["rtt"] is None else int(st["rtt"]), last_ok=st["last_ok"])))
+                rtt=None if st["rtt"] is None else int(st["rtt"]), last_ok=st["last_ok"],
+                last_test=st["tr_t"] if st["tr_n"] > 0 else st["last_ok"])))     # last trace (or discovery reply)
         rows.sort(key=lambda r: r[0])
         out = [r[1] for r in rows[:n - (self.vr is not None)]]
         if self.vr is not None:                             # our own repeater: the same radio, a perfect link
             snr = VIRTUAL_LINK_SNR
             out.insert(0, dict(name="%s (virtual)" % self.rpt_label(self.vr.pub[:2]), hash=hexs(self.vr.pub[:2]), loss=0.0,
                                traces=0, few=False, in_last=snr, in_avg=snr, out_last=snr, out_avg=snr, rtt=None,
-                               last_ok=now_s(), virtual=True))
+                               last_ok=now_s(), last_test=None, virtual=True))
         return out
 
     @staticmethod
@@ -8873,7 +8874,7 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name
 <link rel="stylesheet" href="static/leaflet.css">
 <script src="static/leaflet.js"></script>
 <style>
-:root{--bg:#111418;--card:#1a1f26;--line:#2a313b;--fg:#d8dee6;--dim:#8a94a3;--acc:#5cb3ff;--ok:#4caf7a;--warn:#e0a83e;--bad:#e05a5a}
+:root{--link:#8fd0ff;--bg:#111418;--card:#1a1f26;--line:#2a313b;--fg:#d8dee6;--dim:#8a94a3;--acc:#5cb3ff;--ok:#4caf7a;--warn:#e0a83e;--bad:#e05a5a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
 header{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:18px;align-items:baseline}
 header h1{font-size:18px;margin:0}.dim{color:var(--dim)}main{padding:14px 18px;display:grid;gap:14px}
@@ -8930,7 +8931,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .aclist div.on,.aclist div:hover{background:#243447}.hint{color:var(--dim);font-size:12px;margin:6px 0}#sgprev{font-size:12px;margin-top:6px;min-height:16px}#members td{vertical-align:middle}
 #tip{position:fixed;z-index:2000;display:none;max-width:460px;background:#0d1014;border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;pointer-events:none;box-shadow:0 4px 18px #0008}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
-#rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
+#rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.reldot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle;background:currentColor}.bestwrap{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start}#bestmapbox{flex:0 1 420px;min-width:260px}#bestmap{height:320px;border-radius:6px;background:#0d1014}.besttab{flex:1 1 360px;min-width:0;overflow-x:auto}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
 .host #memberscard,.host #suspendedcard,.host #banscard,.host #chatcard{display:none!important}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#kpicard{order:0}#bestcard{order:1}#aircard{order:2}#roomcard{order:3}#chatcard{order:4}#memberscard{order:5}#suspendedcard{order:6}#banscard{order:7}#tncard{order:8}#rpcard{order:9}#vccard{order:10}#kaascard{order:11}#webcard{order:12}#welcomecard{order:13}#mqcard{order:14}#observercard{order:15}#trafficcard{order:16}#mapcard{order:17}#repeaterscard{order:18}
 .card input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]),.card select,.card textarea{padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg);font:inherit}.card input:focus,.card select:focus,.card textarea:focus{outline:none;border-color:var(--acc)}.advbtns{display:inline-flex;gap:6px;align-items:center;margin-left:10px}.advbtns .act:disabled{opacity:.35;cursor:not-allowed}
@@ -9077,7 +9078,8 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="chatin"><input id="chatmsg" maxlength="400" placeholder="Message everyone in the room (sent as the room)" autocomplete="off">
 <span id="chatleft" class="dim small"></span><button id="chatsend" onclick="sendChat()">Send</button></div>
 <div id="chaterr" class="poor small"></div></div>
-<div class="card" id="bestcard"><h2>Best neighbour repeaters <span class="dim small">(by trace reliability)</span></h2><table id="toplinks"></table></div>
+<div class="card" id="bestcard"><h2>Best neighbour repeaters <span class="dim small">(by trace reliability)</span></h2>
+<div class="bestwrap"><div id="bestmapbox"><div id="bestmap"></div><div id="bestmapnote" class="dim small"></div></div><div class="besttab"><table id="toplinks"></table></div></div></div>
 <div class="card" id="memberscard"><h2>Members <span class="hdesc">Room members &middot; tap a row for details</span></h2><table id="members"></table></div>
 <div class="card" id="suspendedcard"><h2>Suspended <span class="hdesc">Inactive members, will be returned to member list when they are heard on the mesh</span></h2><table id="suspended"></table></div>
 <div class="card" id="banscard"><h2>Banned <span class="hdesc">Room members who FAFO'd</span></h2><table id="bans"></table></div>
@@ -9430,7 +9432,7 @@ async function loadMap(){
  MAPSIG=sig;
  $("rpts").innerHTML="<tr><th>Repeater</th><th>Activity</th><th>Last seen</th><th>Heard directly</th><th>SNR (direct)</th><th>Position</th><th>Best routes from room</th></tr>"+
   MP.repeaters.map((r,i)=>`<tr data-i="${i}"><td>${esc(r.name)||'<span class="dim">?</span>'} <span class="dim">${r.hash}</span></td><td>${r.activity}</td><td>${ago(r.last)}</td><td>${r.last_direct?ago(r.last_direct):"-"}</td><td>${r.snr??"-"}</td><td class="small">${r.lat!=null?r.lat.toFixed(4)+", "+r.lon.toFixed(4):'<span class="dim">none sent</span>'}</td><td class="small">${r.routes.length?r.routes.map(x=>route(x.path)+` <span class="dim">${x.conf}%</span>`).join("<br>"):"-"}</td></tr>`).join("");
- RPTS=MP.repeaters; LAST=MP; MAPSHAPE=shapeChanged;
+ RPTS=MP.repeaters; LAST=MP; MAPSHAPE=shapeChanged; drawBestMap();
  document.querySelectorAll("#rpts tr[data-i]").forEach(tr=>{const r=RPTS[+tr.dataset.i];tr.onclick=()=>select(r.hash)});
  if(SEL)select(SEL); else if(shapeChanged||!map)drawMap(MP);
 }
@@ -9540,17 +9542,59 @@ async function load(){
   :'<tr><td class="dim">nobody</td></tr>';
  }
  if(changed("toplinks",{t:st.top_links,d:st.discovery_min})){
- const TL=st.top_links||[], sn2=(a,b)=>`${a==null?"-":(a>0?"+":"")+a}<span class="dim"> / ${b==null?"-":(b>0?"+":"")+b}</span>`;
- $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Reliability</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
-  TL.map(r=>{const c=r.loss==null?"dim":r.loss<=20?"good":r.loss<=40?"mid":"poor";   // reliability 80%+ / 60%+ / below
-   return `<tr><td>${esc(r.name)}</td><td>${r.virtual?'<span class="good">100%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${(100-r.loss).toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
-   `<td>${sn2(r.in_last,r.in_avg)}</td><td>${sn2(r.out_last,r.out_avg)}</td><td>${r.rtt!=null?r.rtt+" ms":"-"}</td><td>${r.last_ok?ago(r.last_ok)+" ago":"never"}</td></tr>`}).join("")
+ const TL=st.top_links||[], sn=a=>a==null?"-":(a>0?"+":"")+a;
+ BEST=TL;
+ $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Reliability</th><th>SNR in/out avg</th><th>Last test</th></tr>"+
+  TL.map(r=>{const c=relClass(r);
+   return `<tr><td><span class="reldot ${c}"></span>${esc(r.name)}</td><td>${r.virtual?'<span class="good">100%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${(100-r.loss).toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
+   `<td>${sn(r.in_avg)}<span class="dim"> / </span>${sn(r.out_avg)}</td><td>${r.last_test?ago(r.last_test)+" ago":r.virtual?'<span class="dim">-</span>':"never"}</td></tr>`}).join("")
   :`<tr><td class="dim">no neighbours yet: the room discovers its direct repeaters every ${st.discovery_min||15} minutes</td></tr>`;
+ drawBestMap();
  }
  MEMBERS=st.members;
  const bans=st.bans||[];
  if(changed("bans",{b:bans,a:ADMIN}))
  $("bans").innerHTML=bans.length?"<tr><th>Name</th><th>Key</th><th>Banned</th><th></th></tr>"+bans.map(b=>`<tr><td>${esc(b.name)||'<span class="dim">unknown</span>'}</td><td class="dim">${b.key}</td><td>${ago(b.ts)} ago</td><td>${ADMIN?`<button data-u="api/bans/${b.pub}/unban" data-m="Unban ${esc(b.name||b.key)}? They will be able to log in again." onclick="act(this.dataset.u,this.dataset.m)">Unban</button>`:""}</td></tr>`).join(""):'<tr><td class="dim">nobody</td></tr>';
+}
+// Reliability class for a best-neighbour row: green 80%+, yellow 70%+, red below (grey: not traced yet).
+function relClass(r){return r.virtual?"good":r.loss==null?"dim":r.loss<=20?"good":r.loss<=30?"mid":"poor"}
+// Best neighbours mini map: each neighbour a dot, joined to the room by a line, both in its reliability colour;
+// links between neighbours that are known to hear each other in light blue.
+let BEST=[],bestmap=null,bestlayer=null,BESTSIG="";
+function drawBestMap(){
+ const box=$("bestmapbox"),note=$("bestmapnote");
+ if(typeof L==="undefined"){box.style.display="none";return}
+ if(!LAST||!LAST.repeaters)return;                              // map data not loaded yet: loadMap() calls back
+ const pos={};LAST.repeaters.forEach(r=>{if(r.on_map!==false&&r.lat!=null&&(r.lat||r.lon))pos[r.hash]=[r.lat,r.lon]});
+ const R=LAST.room,room=(R.lat||R.lon)?[R.lat,R.lon]:null;
+ const css=getComputedStyle(document.documentElement),col={good:css.getPropertyValue("--ok").trim(),mid:css.getPropertyValue("--warn").trim(),
+  poor:css.getPropertyValue("--bad").trim(),dim:css.getPropertyValue("--dim").trim()},link=css.getPropertyValue("--link").trim();
+ const pts=BEST.filter(r=>pos[r.hash]).map(r=>({h:r.hash,p:pos[r.hash],c:col[relClass(r)],name:r.name,
+  rel:r.virtual?"same radio":r.loss==null?"not traced yet":(100-r.loss).toFixed(1)+"%"}));
+ const inBest=new Set(pts.map(x=>x.h));
+ const links=(LAST.edges||[]).filter(e=>e.a&&e.b&&e.a!==e.b&&inBest.has(e.a)&&inBest.has(e.b));
+ const missing=BEST.length-pts.length;
+ note.textContent=!pts.length?(BEST.length?"No positions known for these repeaters yet.":""):missing?`${missing} without a known position not shown.`:"";
+ if(!pts.length){$("bestmap").style.display="none";return}
+ $("bestmap").style.display="";
+ const sig=JSON.stringify([room,pts.map(x=>[x.h,x.p,x.c]),links.map(e=>[e.a,e.b,e.obs])]);
+ if(sig===BESTSIG&&bestmap)return; BESTSIG=sig;
+ if(!bestmap){
+  bestmap=L.map("bestmap",{zoomControl:true,attributionControl:true}).setView(pts[0].p,11);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribution:"&copy; OpenStreetMap",
+   referrerPolicy:"strict-origin-when-cross-origin"}).addTo(bestmap);
+ }
+ if(bestlayer)bestlayer.remove(); bestlayer=L.layerGroup().addTo(bestmap);
+ const name=h=>{const x=pts.find(p=>p.h===h);return x?esc(x.name):h};
+ links.forEach(e=>L.polyline([pos[e.a],pos[e.b]],{color:link,weight:1.5,opacity:.7,dashArray:e.obs?"4 4":null})
+  .bindTooltip(`${name(e.a)} &harr; ${name(e.b)}${e.obs?"<br><i>via observers</i>":""}`).addTo(bestlayer));
+ if(room)pts.forEach(x=>L.polyline([room,x.p],{color:x.c,weight:3,opacity:.85}).bindTooltip(`${esc(x.name)}: ${x.rel}`).addTo(bestlayer));
+ pts.forEach(x=>L.circleMarker(x.p,{radius:7,color:"#0d1014",weight:1.5,fillColor:x.c,fillOpacity:1})
+  .bindTooltip(`${esc(x.name)}<br>reliability ${x.rel}`).addTo(bestlayer));
+ if(room)L.circleMarker(room,{radius:8,color:"#0d1014",weight:1.5,fillColor:"#ffffff",fillOpacity:1}).bindTooltip(esc(R.name)+" (room)").addTo(bestlayer);
+ const all=pts.map(x=>x.p).concat(room?[room]:[]);
+ bestmap.fitBounds(all,{padding:[24,24],maxZoom:13});
+ setTimeout(()=>bestmap.invalidateSize(),0);
 }
 function drawMap(st){
  if(typeof L==="undefined"){$("mapnote").textContent="Map needs internet access (Leaflet / OpenStreetMap). Tables above still work.";return}
