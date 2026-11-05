@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "meshroom"))
-from meshroom import ObserverFeed, PT_ACK, Packet, mqtt_changes
+from meshroom import ObserverFeed, PT_ACK, Packet, mqtt_changes, topic_regions
 
 
 class IngestionTests(unittest.TestCase):
@@ -44,6 +44,30 @@ class IngestionTests(unittest.TestCase):
         feed._on_message("meshcore/SJC/b/packets", json.dumps({"raw": two.hex()}).encode(), False)
         self.assertEqual(feed.pop(), ("obs", "ack", b"ABCD"))
         self.assertEqual(feed.dropped, 1)
+
+    def test_topic_regions(self):
+        self.assertEqual(topic_regions(["meshcore/SJC/+/packets", "meshcore/sfo/#"]), {"SJC", "SFO"})
+        self.assertIsNone(topic_regions(["meshcore/#"]))                       # every region: no filtering
+        self.assertIsNone(topic_regions([]))
+        self.assertIsNone(topic_regions(["meshcore/SJC/+/packets", "private/#"]))   # custom filters: left alone
+
+    def test_other_regions_are_ignored_when_regions_are_set(self):
+        feed = self.feed(queue_max=10)
+        feed.room.cfg.mqtt_topics = ["meshcore/SJC/+/packets", "meshcore/MRY/+/packets"]
+        msg = lambda b: json.dumps({"raw": Packet(PT_ACK, b).encode().hex()}).encode()
+        feed._on_message("meshcore/SFO/obs1/packets", msg(b"AAAA"), False)      # another region: dropped
+        feed._on_message("meshcore/SJC/obs2/packets", msg(b"BBBB"), False)
+        feed._on_message("meshcore/mry/obs3/packets", msg(b"CCCC"), False)      # case doesn't matter
+        self.assertEqual(feed.diag["other_region"], 1)
+        self.assertEqual([feed.pop(), feed.pop(), feed.pop()],
+                         [("obs", "ack", b"BBBB"), ("obs", "ack", b"CCCC"), None])
+
+    def test_every_region_when_no_regions_are_set(self):
+        feed = self.feed(queue_max=10)
+        feed.room.cfg.mqtt_topics = ["meshcore/#"]
+        feed._on_message("meshcore/SFO/obs1/packets", json.dumps({"raw": self.ack_raw().hex()}).encode(), False)
+        self.assertEqual(feed.diag["other_region"], 0)
+        self.assertEqual(feed.depth(), 1)
 
     def test_retained_packet_is_not_ingested(self):
         feed = self.feed()

@@ -532,6 +532,9 @@ def now_s():
     return int(time.time())
 
 
+MAP_MAX_AGE_S = 72 * 3600             # repeaters not heard for this long are left off the map
+
+
 # ============================================================================
 # Crypto (AES-128-ECB + truncated HMAC-SHA256, exactly as MeshCore Utils.cpp)
 # ============================================================================
@@ -4538,16 +4541,17 @@ class RoomServer:
         def has_pos(h):
             hit = self.rpt_lookup(h)
             return bool(hit and hit[1].get("lat") is not None and (hit[1].get("lat") or hit[1].get("lon")))
-        positioned = {h for h in self.heard if has_pos(h)}
+        positioned = {h for h in self.heard if has_pos(h) and t - (self.heard[h]["last"] or 0) <= MAP_MAX_AGE_S}
         act = {h: fade(d["w"], d["t"], t, 6 * 3600.0) for h, d in self.heard.items()}
         shown = sorted(self.heard, key=lambda h: -act[h])[:200]
-        shown += [h for h in positioned if h not in set(shown)]         # everything that can go on the map
+        shown += [h for h in positioned if h not in set(shown)]         # everything that can go on the map (heard in 72 h)
         rpts = []
         for h in shown:
             d = self.heard[h]
             hit = self.rpt_lookup(h)
             info_pub, info = hit if hit else (None, None)
             rpts.append(dict(hash=hexs(h), name=(info or {}).get("name") or "", lat=(info or {}).get("lat"), lon=(info or {}).get("lon"),
+                             on_map=h in positioned,
                              key=hexs(info_pub) if info_pub else None, last_advert=(info or {}).get("last_advert"),
                              last=d["last"], last_direct=d["last_direct"], activity=round(act[h], 1),
                              disc=d.get("disc") or 0, out_snr=None if d.get("out_snr") is None else round(d["out_snr"], 1),
@@ -4564,7 +4568,7 @@ class RoomServer:
                   for (a, b), e in self.obs_edges.items()
                   if (a, b) not in self.edges and a in positioned and b in positioned and fade(e[0], e[1], t, th) >= 0.5]
         # the map's *shape* (positions + drawable links): its version only changes when the drawing would
-        shape = repr((sorted((r["hash"], r["lat"], r["lon"]) for r in rpts if r["lat"] is not None),
+        shape = repr((sorted((r["hash"], r["lat"], r["lon"]) for r in rpts if r["on_map"]),
                       sorted((e["a"], e["b"]) for e in edges), self.cfg.lat, self.cfg.lon))
         if shape != self.map_shape:
             self.map_shape = shape
@@ -7228,6 +7232,18 @@ class MiniMQTT:
 
 
 
+TOPIC_REGION_RE = re.compile(r"^meshcore/([A-Za-z0-9]+)/(\+/packets|#)$")
+
+
+def topic_regions(topics):
+    """The region codes a set of topic filters stands for (upper case), or None when they aren't plain
+    per-region filters (e.g. meshcore/# or a custom filter), in which case nothing is filtered by region."""
+    found = [TOPIC_REGION_RE.match(str(t).strip()) for t in (topics or [])]
+    if not found or not all(found):
+        return None
+    return frozenset(m.group(1).upper() for m in found)
+
+
 class ObserverFeed:
     """Listens to the observer network over MQTT (LetsMesh format: meshcore/<region>/<observer>/packets, JSON with
     the raw packet in hex). Keeps only ACKs and packets addressed to the room (destination byte), drops duplicates
@@ -7245,7 +7261,7 @@ class ObserverFeed:
         self.recent = collections.deque()                    # (time, relevant) for the rate shown in the header
         self.diag = collections.Counter({                    # received and intentionally ignored MQTT observations
             "received": 0, "accepted": 0, "retained": 0, "non_packet_topic": 0,
-            "malformed": 0, "self_origin": 0, "duplicate": 0})
+            "malformed": 0, "self_origin": 0, "duplicate": 0, "other_region": 0})
         self.subscriptions = {}                               # topic -> pending/granted/denied, set by broker SUBACK
         self.subscription_error = ""
         self.ingress = queue.Queue(maxsize=max(10, int(room.cfg.mqtt_queue_max)))
@@ -7348,6 +7364,12 @@ class ObserverFeed:
         if retain or not topic.endswith("/packets"):
             self.diag["retained" if retain else "non_packet_topic"] += 1
             return                                          # retained = an old packet replayed; status messages: not needed
+        regions = topic_regions(getattr(self.room.cfg, "mqtt_topics", None))
+        if regions is not None:
+            parts = topic.split("/")
+            if len(parts) < 2 or parts[1].upper() not in regions:
+                self.diag["other_region"] += 1
+                return                                      # only the regions asked for, even if a broker sends more
         try:
             obj = json.loads(payload)
             raw = bytes.fromhex(obj["raw"])
@@ -8910,7 +8932,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
-.host #memberscard,.host #suspendedcard,.host #banscard,.host #chatcard{display:none!important}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#kpicard{order:1}#aircard{order:2}#roomcard{order:3}#chatcard{order:4}#memberscard{order:5}#suspendedcard{order:6}#banscard{order:7}#tncard{order:8}#rpcard{order:9}#vccard{order:10}#kaascard{order:11}#webcard{order:12}#mapcard{order:13}#bestcard{order:14}#repeaterscard{order:15}#welcomecard{order:16}#mqcard{order:17}#observercard{order:18}#trafficcard{order:19}
+.host #memberscard,.host #suspendedcard,.host #banscard,.host #chatcard{display:none!important}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#kpicard{order:1}#aircard{order:2}#roomcard{order:3}#chatcard{order:4}#memberscard{order:5}#suspendedcard{order:6}#banscard{order:7}#tncard{order:8}#rpcard{order:9}#vccard{order:10}#kaascard{order:11}#webcard{order:12}#repeaterscard{order:13}#welcomecard{order:14}#mqcard{order:15}#observercard{order:16}#trafficcard{order:17}#mapcard{order:18}#bestcard{order:19}
 .card input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]),.card select,.card textarea{padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg);font:inherit}.card input:focus,.card select:focus,.card textarea:focus{outline:none;border-color:var(--acc)}.advbtns{display:inline-flex;gap:6px;align-items:center;margin-left:10px}.advbtns .act:disabled{opacity:.35;cursor:not-allowed}
 </style></head><body>
 <header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rvc" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
@@ -9520,7 +9542,7 @@ async function load(){
  if(changed("toplinks",{t:st.top_links,d:st.discovery_min})){
  const TL=st.top_links||[], sn2=(a,b)=>`${a==null?"-":(a>0?"+":"")+a}<span class="dim"> / ${b==null?"-":(b>0?"+":"")+b}</span>`;
  $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Reliability</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
-  TL.map(r=>{const c=r.loss==null?"dim":r.loss<=10?"good":r.loss<=30?"mid":"poor";   // reliability 90%+ / 70%+ / below
+  TL.map(r=>{const c=r.loss==null?"dim":r.loss<=20?"good":r.loss<=40?"mid":"poor";   // reliability 80%+ / 60%+ / below
    return `<tr><td>${esc(r.name)}</td><td>${r.virtual?'<span class="good">100%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${(100-r.loss).toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
    `<td>${sn2(r.in_last,r.in_avg)}</td><td>${sn2(r.out_last,r.out_avg)}</td><td>${r.rtt!=null?r.rtt+" ms":"-"}</td><td>${r.last_ok?ago(r.last_ok)+" ago":"never"}</td></tr>`}).join("")
   :`<tr><td class="dim">no neighbours yet: the room discovers its direct repeaters every ${st.discovery_min||15} minutes</td></tr>`;
@@ -9532,7 +9554,7 @@ async function load(){
 }
 function drawMap(st){
  if(typeof L==="undefined"){$("mapnote").textContent="Map needs internet access (Leaflet / OpenStreetMap). Tables above still work.";return}
- const R=st.room,pos={},tip={};st.repeaters.forEach(r=>{if(r.lat!=null&&(r.lat||r.lon)){pos[r.hash]=[r.lat,r.lon,r.name||r.hash];tip[r.hash]=`${esc(r.name||r.hash)} (${hopsTxt(hops(r))})`}});
+ const R=st.room,pos={},tip={};st.repeaters.forEach(r=>{if(r.on_map!==false&&r.lat!=null&&(r.lat||r.lon)){pos[r.hash]=[r.lat,r.lon,r.name||r.hash];tip[r.hash]=`${esc(r.name||r.hash)} (${hopsTxt(hops(r))})`}});
  if(R.lat||R.lon)pos[""]=[R.lat,R.lon,R.name+" (room)"];
  const pts=Object.values(pos);
  if(!map){

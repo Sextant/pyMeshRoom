@@ -114,7 +114,7 @@ The admin-only **Welcome DMs** card on each room's page lets that room's admins 
 # Additional useful features:
 * Web dashboard, public to view with an admin login, and isolated so it can't slow the radio.
    * Members table: delivery score, current TX/RX routes, and up to 5 alternates each way.
-   * Repeater map with links, and a detail pane for every repeater (key, position, routes, neighbors with SNR).
+   * Repeater map with links, and a detail pane for every repeater (key, position, routes, neighbors with SNR). Repeaters not heard for 72 hours are left off the map.
    * Best-neighbor table: discovery every 15 minutes plus idle-time traces, ranked by reliability (100% minus trace packet loss), with SNR both ways.
    * Stats: CPU and memory (now and 10-minute average), modem voltage, noise floor, channel use, packets/min, and pushes/min with delivery %.
    * Admin tools: resync, route suggestions with autocomplete, kick, ban/unban, and a chat box that posts as the room.
@@ -352,7 +352,7 @@ All fields below are for **inbound** MQTT augmentation. They do not change the o
 | Transport | `WebSockets` or `TCP`. | `WebSockets` for the GoMesh example. |
 | WebSocket path | The path supplied by the broker operator. | `/mqtt` for the GoMesh example. It is unused with TCP. |
 | TLS / Verify TLS certificate | Enable TLS when the broker supports it; leave certificate verification enabled for a public broker. | Both enabled for the GoMesh example. Disable verification only for a deliberately trusted private/self-signed deployment. |
-| Regions | Region codes to take in, like `SJC, SFO, MRY` (up to 16): the codes observers publish under. Saving fills in the topic filters below (`meshcore/SJC/+/packets`, ...); empty takes every region. | Keeps nodes thousands of miles away out of the directory and MeshCore Web. |
+| Regions | Region codes to take in, like `SJC, SFO, MRY` (up to 16): the codes observers publish under. Saving fills in the topic filters below (`meshcore/SJC/+/packets`, ...); empty takes every region. Messages from any other region are dropped, even if the broker sends them. | Keeps nodes thousands of miles away out of the directory and MeshCore Web. |
 | Topic filter(s) | One or more MQTT subscription filters, separated with commas. | Use the operator-approved filter. `meshcore/#` is only a broad example; a region such as `SJC` is not portable to another installation. |
 | Subscriber username / password | The read-only credentials issued by the broker operator. Enter both fields together. | They are write-only and never appear in the status API or after page reload. |
 | ACK, Message, Topology, Advert, Activity ingestion | Choose which accepted MQTT packets can augment local room state. | All are enabled by default when MQTT augmentation is enabled. Disable a category if it is not useful to your deployment. |
