@@ -23,3 +23,13 @@ __pycache__/
 .env.*
 *.pem
 *.key
+
+# The WhereBot config holds its private key and API key.
+/bots/where_bot/where_bot.yaml
+__pycache__/
+
+# Antenna test results.
+/tools/antenna_test/results/
+
+# MeshCore Web (web/)
+web/node_modules/

@@ -1,0 +1,271 @@
+asyncapi: 3.0.0
+info:
+  title: pyMeshRoom KaaS
+  version: "1"
+  description: >
+    KISS radio as an API service: every packet the radio hears and sends, and raw packets out.
+    Human-readable guide: api.md. Clients do all MeshCore crypto themselves.
+servers:
+  meshroom:
+    host: "{server}:{port}"
+    protocol: ws
+    pathname: /api/v1/kaas
+    description: The dashboard's port. Put it behind an HTTPS reverse proxy (wss) when clients connect over the internet.
+    variables:
+      server:
+        default: localhost
+      port:
+        default: "8081"
+    security:
+      - $ref: "#/components/securitySchemes/apiKey"
+channels:
+  kaas:
+    address: /api/v1/kaas
+    messages:
+      hello:
+        $ref: "#/components/messages/hello"
+      packet:
+        $ref: "#/components/messages/packet"
+      sendResult:
+        $ref: "#/components/messages/sendResult"
+      dropped:
+        $ref: "#/components/messages/dropped"
+      pong:
+        $ref: "#/components/messages/pong"
+      error:
+        $ref: "#/components/messages/error"
+      send:
+        $ref: "#/components/messages/send"
+      ping:
+        $ref: "#/components/messages/ping"
+      near:
+        $ref: "#/components/messages/near"
+      nearResult:
+        $ref: "#/components/messages/nearResult"
+      routes:
+        $ref: "#/components/messages/routes"
+      routesResult:
+        $ref: "#/components/messages/routesResult"
+      route:
+        $ref: "#/components/messages/route"
+      routeResult:
+        $ref: "#/components/messages/routeResult"
+operations:
+  receive:
+    action: receive
+    channel:
+      $ref: "#/channels/kaas"
+    messages:
+      - $ref: "#/channels/kaas/messages/hello"
+      - $ref: "#/channels/kaas/messages/packet"
+      - $ref: "#/channels/kaas/messages/sendResult"
+      - $ref: "#/channels/kaas/messages/dropped"
+      - $ref: "#/channels/kaas/messages/pong"
+      - $ref: "#/channels/kaas/messages/error"
+      - $ref: "#/channels/kaas/messages/nearResult"
+      - $ref: "#/channels/kaas/messages/routesResult"
+      - $ref: "#/channels/kaas/messages/routeResult"
+  send:
+    action: send
+    channel:
+      $ref: "#/channels/kaas"
+    messages:
+      - $ref: "#/channels/kaas/messages/send"
+      - $ref: "#/channels/kaas/messages/ping"
+      - $ref: "#/channels/kaas/messages/near"
+      - $ref: "#/channels/kaas/messages/routes"
+      - $ref: "#/channels/kaas/messages/route"
+components:
+  securitySchemes:
+    apiKey:
+      type: httpBearerToken
+      description: >
+        Authorization: Bearer kaas_... (made on the dashboard's KaaS card; shown once). Browsers, which can't send
+        that header on a websocket, log in by signing with a node's key (POST /api/v1/web/login, see docs/api.md) for
+        {"ticket": "kt_...", "expires_in": 30} and connect with ?ticket=kt_... instead (one connection, once).
+  messages:
+    hello:
+      summary: First message after connecting.
+      payload:
+        type: object
+        required: [type, api, key, send_burst, send_window_s, airtime_pct, nodes]
+        properties:
+          type: {const: hello}
+          api: {type: integer, const: 1}
+          server: {type: string}
+          key:
+            type: object
+            properties:
+              id: {type: string}
+              receive: {type: boolean}
+              send: {type: boolean}
+              expires: {type: [integer, "null"], description: seconds since 1970}
+          send_burst: {type: integer, description: packets per key per send_window_s (ACKs and path returns excepted)}
+          send_window_s: {type: number}
+          airtime_pct: {type: number}
+          radio:
+            type: [object, "null"]
+            properties:
+              freq_hz: {type: integer}
+              bw_hz: {type: integer}
+              sf: {type: integer}
+              cr: {type: integer}
+          nodes:
+            type: object
+            description: Public keys (hex) of the nodes on this radio.
+            properties:
+              room: {type: string}
+              tenants: {type: array, items: {type: string}}
+              repeater: {type: [string, "null"]}
+              companion: {type: [string, "null"]}
+          names:
+            type: object
+            description: The room's and each tenant room's name, by public key (hex).
+            additionalProperties: {type: string}
+    packet:
+      summary: A packet the radio heard (rx) or sent (tx). Keys that may receive only.
+      payload:
+        type: object
+        required: [type, dir, ts, raw]
+        properties:
+          type: {const: packet}
+          dir: {enum: [rx, tx]}
+          ts: {type: number, description: seconds since 1970}
+          raw: {type: string, description: the whole packet, hex}
+          ptype: {type: [string, integer], description: "req, resp, txt, ack, advert, grp_txt, grp_data, anon_req, path, trace, multipart, control"}
+          route: {enum: [flood, direct]}
+          hops: {type: integer}
+          hash: {type: string, description: "8-byte packet hash (hex): de-duplicate on it"}
+          snr: {type: number, description: rx only}
+          rssi: {type: integer, description: rx only}
+    sendResult:
+      payload:
+        type: object
+        required: [type, status]
+        properties:
+          type: {const: send_result}
+          id: {type: [string, integer, "null"]}
+          status: {enum: [queued, sent, local, dropped]}
+          reason: {type: string}
+          retry_after: {type: number, description: seconds}
+    dropped:
+      summary: Messages discarded because this client read too slowly.
+      payload:
+        type: object
+        properties:
+          type: {const: dropped}
+          count: {type: integer}
+    pong:
+      payload:
+        type: object
+        properties:
+          type: {const: pong}
+          id: {type: [string, integer, "null"]}
+    error:
+      payload:
+        type: object
+        properties:
+          type: {const: error}
+          id: {type: [string, integer, "null"]}
+          error: {type: string}
+    send:
+      summary: A raw packet to transmit. Keys that may send only.
+      payload:
+        type: object
+        required: [type, raw]
+        properties:
+          type: {const: send}
+          id: {type: [string, integer], maxLength: 64}
+          raw: {type: string, description: the whole packet, hex}
+    ping:
+      payload:
+        type: object
+        required: [type]
+        properties:
+          type: {const: ping}
+          id: {type: [string, integer]}
+    near:
+      summary: Which repeaters hear a node (its first hop into the mesh), and each one's share.
+      payload:
+        type: object
+        required: [type]
+        properties:
+          type: {const: near}
+          id: {type: [string, integer]}
+          node: {type: string, description: "public key, hex (at least 8 bytes)"}
+          name: {type: string, description: "instead of node: its advertised name, or a mention like @[platinum]"}
+          limit: {type: integer, minimum: 1, maximum: 10, default: 4}
+    nearResult:
+      payload:
+        type: object
+        properties:
+          type: {const: near_result}
+          id: {type: [string, integer, "null"]}
+          node: {type: string, description: "first 8 bytes of its public key, hex"}
+          name: {type: [string, "null"], description: its advertised name, if heard}
+          repeaters:
+            type: array
+            items:
+              type: object
+              properties:
+                id: {type: string, description: "2-byte repeater id, hex (when direct: this radio's virtual repeater, else the room)"}
+                name: {type: [string, "null"]}
+                direct: {type: boolean, description: this radio hears the node itself}
+                share: {type: number}
+    routes:
+      summary: The best known routes from this radio to a repeater.
+      payload:
+        type: object
+        required: [type, repeater]
+        properties:
+          type: {const: routes}
+          id: {type: [string, integer]}
+          repeater: {type: string, description: "public key or id, hex (at least 2 bytes)"}
+          limit: {type: integer, minimum: 1, maximum: 10, default: 3}
+    routesResult:
+      payload:
+        type: object
+        properties:
+          type: {const: routes_result}
+          id: {type: [string, integer, "null"]}
+          repeater: {type: string}
+          name: {type: [string, "null"]}
+          routes:
+            type: array
+            items:
+              type: object
+              properties:
+                path_len: {type: integer, description: the packet header's path_len byte}
+                path: {type: string, description: "hex; the repeater is the last hop"}
+                hops: {type: array, items: {type: string}}
+                names: {type: array, items: {type: [string, "null"]}}
+                confidence: {type: number}
+    route:
+      summary: Suggested routes from one node (or repeater) to another, through the repeater links the room has seen.
+      payload:
+        type: object
+        required: [type, from, to]
+        properties:
+          type: {const: route}
+          id: {type: [string, integer]}
+          from: {type: string, description: "a node's public key in hex (at least 8 bytes), its name or @[name], or a repeater's 2-byte id"}
+          to: {type: string, description: same forms as from}
+          limit: {type: integer, minimum: 1, maximum: 5, default: 3}
+    routeResult:
+      payload:
+        type: object
+        properties:
+          type: {const: route_result}
+          id: {type: [string, integer, "null"]}
+          from: {type: object, description: "{node, name} or {repeater, name}"}
+          to: {type: object, description: "{node, name} or {repeater, name}"}
+          routes:
+            type: array
+            items:
+              type: object
+              properties:
+                path_len: {type: integer, description: the packet header's path_len byte (2-byte hops)}
+                path: {type: string, description: "hex, from the source's end"}
+                hops: {type: array, items: {type: string}}
+                names: {type: array, items: {type: [string, "null"]}}
+                score: {type: number, description: "0..1: the ends' shares times each link's confidence"}

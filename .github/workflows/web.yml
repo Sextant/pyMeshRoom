@@ -1,0 +1,45 @@
+# MeshCore Web (web/): tests the source and rebuilds meshroom/data/meshcore-web.html, which pyMeshRoom serves at
+# /meshcore-web/, committing it when it changed, so the file on main always matches the source. (Its own commit
+# doesn't start this workflow again: pushes made with GITHUB_TOKEN don't.)
+name: MeshCore Web
+
+on:
+  push:
+    branches: [main]
+    paths: ["web/**", ".github/workflows/web.yml"]
+  pull_request:
+    paths: ["web/**", "meshroom/data/meshcore-web.html", ".github/workflows/web.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      - run: node build.mjs
+      - name: On a pull request, the committed build must match the source
+        if: github.event_name == 'pull_request'
+        run: |
+          if ! git diff --exit-code -- ../meshroom/data/meshcore-web.html; then
+            echo "meshroom/data/meshcore-web.html is out of date: cd web && node build.mjs, then commit it"
+            exit 1
+          fi
+      - name: Commit meshcore-web.html if it changed
+        if: github.event_name != 'pull_request'
+        run: |
+          if git diff --quiet -- ../meshroom/data/meshcore-web.html; then echo "up to date"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898720+github-actions[bot]@users.noreply.github.com"
+          git add ../meshroom/data/meshcore-web.html
+          git commit -m "Build meshroom/data/meshcore-web.html"
+          git push

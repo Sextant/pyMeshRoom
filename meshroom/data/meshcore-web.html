@@ -1,0 +1,4230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-J7T+FuQGbzumww/co0A/1vBQBOTxdckFir1SpSlAs3E=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-QAA9mnKovJKzu6MY1LBEguSKQQWkKeuAzEyWRJJ59iI=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>MeshCore Web</title>
+<style>:root {
+  /* pyMeshRoom's dashboard */
+  --bg: #111418;
+  --panel: #1a1f26;
+  --side: #151a20;
+  --text: #d8dee6;
+  --muted: #8a94a3;
+  --line: #2a313b;
+  --accent: #5cb3ff;
+  --accent-text: #0b1420;
+  --button: #2a313b;
+  --mine: #1f3042;
+  --theirs: #1a1f26;
+  --danger: #e05a5a;
+  --ok: #4caf7a;
+  --warn: #e0a83e;
+  --mention: #3a3220;
+  --radius: 8px;
+  color-scheme: dark;
+}
+
+/* a light variant, for a theme switch */
+:root[data-theme="light"] {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --side: #eceef2;
+  --text: #1c1f24;
+  --muted: #646b76;
+  --line: #d9dde3;
+  --accent: #1f6fd1;
+  --accent-text: #ffffff;
+  --button: #e6e9ee;
+  --mine: #dbe7ff;
+  --theirs: #ffffff;
+  --danger: #c62828;
+  --ok: #2e7d32;
+  --warn: #b26a00;
+  --mention: #fff1b8;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html, body { height: 100%; margin: 0; }
+@supports (height: 100dvh) { html, body { height: 100dvh; } }   /* phones: the part not under the browser's bars */
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+button, input, textarea { font: inherit; color: inherit; }
+input, textarea {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  outline: none;
+}
+input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+
+button {
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  cursor: pointer;
+  white-space: nowrap;
+}
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+button.ghost { background: var(--button); border-color: var(--line); }
+button.ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--text) 7%, transparent); }
+button.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+button.wide { width: 100%; text-align: left; }
+button.icon { padding: 6px 10px; font-size: 18px; line-height: 1; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 22px;
+}
+.card h1 { margin: 0 0 6px; font-size: 20px; }
+.card h3, .sect {
+  margin: 0 0 12px; font-size: 14px; color: var(--accent); text-transform: uppercase; letter-spacing: .04em;
+}
+.sect { margin: 12px 14px 4px; font-size: 12px; }
+label { display: block; margin: 14px 0 5px; font-weight: 500; font-size: 13px; color: var(--muted); }
+label.check { display: flex; gap: 8px; align-items: center; font-weight: 400; font-size: 14px; }
+label.check input { width: auto; }
+.hint { margin: 5px 0 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.sub { margin: 0 0 6px; color: var(--muted); }
+.error { margin: 14px 0 0; color: var(--danger); font-size: 14px; }
+.row { display: flex; gap: 6px; }
+.row input { flex: 1; min-width: 0; }
+.buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; flex-wrap: wrap; }
+.buttons.stack { flex-direction: column; align-items: stretch; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* login */
+.login { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; }
+.login .card { width: 100%; max-width: 440px; }
+.login button.primary { width: 100%; margin-top: 18px; padding: 11px; }
+
+/* chat */
+.chat { display: grid; grid-template-columns: 270px 1fr; height: var(--app-h, 100%); }   /* (--app-h: above a phone's keyboard) */
+.sidebar {
+  background: var(--side);
+  border-right: 1px solid var(--line);
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+.side-head { padding: 14px 14px 10px; border-bottom: 1px solid var(--line); }
+.identity { display: flex; gap: 10px; align-items: center; }
+.me-name { font-weight: 700; }
+.me-key { color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.open { background: var(--ok); }
+.dot.connecting { background: var(--warn); }
+.dot.failed { background: var(--danger); }
+
+.channels { flex: 1; overflow-y: auto; padding: 8px; }
+.channels button {
+  display: flex; width: 100%; align-items: center; gap: 8px;
+  background: transparent; border-color: transparent; text-align: left; padding: 8px 10px; margin-bottom: 2px;
+}
+.channels button:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
+.channels button.on { background: var(--panel); border-color: var(--line); font-weight: 600; box-shadow: inset 3px 0 var(--accent); }
+.channels .ch-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.channels .ch-kind { color: var(--muted); font-size: 12px; }
+.badge {
+  background: var(--accent); color: var(--accent-text);
+  border-radius: 10px; padding: 0 7px; font-size: 12px; font-weight: 700; min-width: 20px; text-align: center;
+}
+.side-actions { padding: 8px; display: grid; gap: 6px; border-top: 1px solid var(--line); }
+.server { padding: 8px 14px 12px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+.room { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+.room-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.room-title { flex: 1; min-width: 0; }
+.room-title h2 { margin: 0; font-size: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-sub { color: var(--muted); font-size: 12px; }
+#toggle-side { display: none; }
+
+.banner { padding: 8px 16px; background: color-mix(in srgb, var(--warn) 18%, var(--panel)); font-size: 14px; border-bottom: 1px solid var(--line); }
+.banner.bad { background: color-mix(in srgb, var(--danger) 18%, var(--panel)); }
+
+.messages { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+.empty { margin: auto; color: var(--muted); text-align: center; max-width: 340px; }
+.day { align-self: center; color: var(--muted); font-size: 12px; margin: 6px 0; }
+.msg {
+  max-width: min(640px, 86%);
+  align-self: flex-start;
+  background: var(--theirs);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 7px 11px 6px;
+}
+.msg.mine { align-self: flex-end; background: var(--mine); border-color: transparent; }
+.msg .meta { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.msg .sender { font-weight: 700; color: var(--text); font-size: 13px; }
+.msg .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg .status { font-size: 12px; color: var(--muted); text-align: right; }
+.msg .status.bad { color: var(--danger); }
+.msg .status button { padding: 0 6px; margin-left: 6px; font-size: 12px; }
+.mention { background: color-mix(in srgb, var(--accent) 16%, transparent); border-radius: 4px; padding: 0 2px; font-weight: 600; }
+.mention.me { background: var(--mention); }
+
+.composer { display: flex; gap: 8px; align-items: flex-end; padding: 10px 16px max(14px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--panel); }
+.composer textarea { flex: 1; min-width: 0; resize: none; max-height: 140px; }
+.composer button { flex: none; }
+.composer .count { color: var(--muted); font-size: 12px; min-width: 30px; text-align: right; padding-bottom: 10px; }
+.composer .count.over { color: var(--danger); font-weight: 700; }
+
+dialog { border: none; padding: 0; background: transparent; width: min(440px, calc(100% - 32px)); color: var(--text); }
+dialog::backdrop { background: rgb(0 0 0 / .45); }
+.tabs { display: flex; gap: 6px; margin-bottom: 4px; }
+.tab { background: transparent; border-color: var(--line); }
+.tab.on { background: var(--accent); color: var(--accent-text); }
+
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 8px; font-size: 14px;
+  max-width: calc(100% - 32px); z-index: 10;
+}
+
+@media (max-width: 720px) {
+  .chat { grid-template-columns: 1fr; }
+  .sidebar {
+    position: fixed; inset: 0 auto 0 0; width: min(300px, 86vw); z-index: 5;
+    transform: translateX(-100%); transition: transform .18s ease;
+  }
+  .sidebar.open { transform: none; box-shadow: 0 0 30px rgb(0 0 0 / .3); }
+  #toggle-side { display: inline-block; }
+  .room-head, .messages, .composer, .banner { padding-left: 16px; padding-right: 16px; }
+  .composer { gap: 6px; padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+  .composer .count { min-width: 0; }
+  input, textarea, select { font-size: 16px; }   /* iOS zooms into a field under 16px, pushing Send off the screen */
+  .msg { max-width: 92%; }
+}
+
+/* login: server from the page's own address */
+.server-auto { margin: 14px 0 0; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; overflow-wrap: anywhere; }
+button.linkish { background: none; border: none; padding: 0; color: var(--accent); text-decoration: underline; cursor: pointer; }
+details { margin-top: 14px; }
+details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+.side-check { margin: 4px 2px 0; font-size: 13px; color: var(--muted); }
+
+/* GIFs */
+.msg .gif { display: block; margin: 4px 0; }
+.msg .gif img { display: block; max-width: min(260px, 100%); max-height: 260px; border-radius: 8px; background: var(--line); }
+.msg .gif-link { color: var(--accent); }
+.gif-preview { padding: 8px 16px 0; background: var(--panel); border-top: 1px solid var(--line); display: flex; gap: 8px; }
+.gif-preview img { max-height: 90px; border-radius: 6px; }
+
+/* sidebar sections */
+.side-scroll { flex: 1; overflow-y: auto; min-height: 0; }
+.side-scroll .channels { flex: none; overflow: visible; padding: 2px 8px 6px; }
+.sect { display: flex; align-items: center; justify-content: space-between; }
+.sect-add { padding: 0 7px; font-size: 15px; line-height: 20px; background: transparent; border-color: transparent; color: var(--accent); }
+.sect-add:hover { background: var(--button); }
+.side-actions .two { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.side-select { display: flex; align-items: center; gap: 8px; }
+.side-select select { flex: 1; }
+select { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; }
+.channels .sub { color: var(--muted); font-size: 12px; }
+.opt { font-weight: 400; color: var(--muted); }
+
+/* contacts, map */
+dialog.wide { width: min(760px, calc(100% - 32px)); }
+.contact-list { margin-top: 10px; max-height: min(52vh, 460px); overflow-y: auto; border: 1px solid var(--line); border-radius: 4px; }
+.contact { display: flex; gap: 10px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.contact:last-child { border-bottom: none; }
+.contact .who { flex: 1; min-width: 0; }
+.contact .who b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contact .who span { color: var(--muted); font-size: 12px; }
+.contact .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.contact .acts button { padding: 3px 9px; font-size: 13px; }
+.map { height: min(60vh, 520px); border-radius: 6px; background: var(--side); }
+.map .leaflet-popup-content { color: #1c1f24; }
+.map-pop b { display: block; }
+.map-pop button { margin-top: 6px; }
+
+/* @mentions */
+.mentions { margin: 0 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; max-height: 200px; overflow-y: auto; }
+.mentions button { display: block; width: 100%; text-align: left; border: none; border-radius: 0; background: transparent; padding: 6px 10px; }
+.mentions button.on, .mentions button:hover { background: var(--mine); }
+.msg .room-author { color: var(--muted); font-weight: 400; }
+
+/* reactions */
+.msg { position: relative; }
+.react-btn {
+  position: absolute; top: -10px; right: 6px; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 9px;
+  background: var(--panel); border-color: var(--line); color: var(--muted); opacity: 0; transition: opacity .1s;
+}
+.msg:hover .react-btn, .msg:focus-within .react-btn { opacity: 1; }
+@media (hover: none) { .react-btn { opacity: .75; } }
+.reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.chip { padding: 0 7px; font-size: 13px; line-height: 20px; border-radius: 10px; background: var(--button); border-color: var(--line); }
+.chip.me { border-color: var(--accent); }
+.react-pop {
+  position: fixed; z-index: 20; display: grid; grid-template-columns: repeat(6, 36px); gap: 2px; padding: 6px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgb(0 0 0 / .35);
+}
+.react-pop button { padding: 4px 0; font-size: 18px; border: none; background: transparent; }
+.react-pop button:hover { background: var(--button); }
+.react-pop .more { font-size: 15px; color: var(--muted); }
+
+/* the composer's emoji and GIF pickers (and the full emoji set for a reaction) */
+.composer .tool { flex: none; padding: 0; width: 38px; height: 38px; font-size: 18px; line-height: 1; }
+.composer .gif-tool { font-size: 12px; font-weight: 700; letter-spacing: .5px; }
+.pick-pop {
+  position: fixed; z-index: 20; display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  width: min(352px, calc(100vw - 16px)); height: min(340px, 60dvh);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgb(0 0 0 / .35);
+}
+.pick-tabs { display: flex; gap: 2px; overflow-x: auto; flex: none; }
+.pick-tabs button { flex: none; padding: 3px 6px; font-size: 17px; border: none; background: transparent; border-radius: 4px; }
+.pick-tabs button.on { background: var(--button); }
+.pick-grid { flex: 1; min-height: 0; overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(38px, 1fr)); align-content: start; gap: 2px; }
+.pick-grid > button { padding: 4px 0; font-size: 22px; border: none; background: transparent; border-radius: 4px; }
+.pick-grid > button:hover, .pick-grid > button:focus-visible { background: var(--button); }
+.pick-grid.gifs { grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.pick-grid.gifs > button { padding: 0; height: 92px; overflow: hidden; background: var(--line); }
+.pick-grid.gifs img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.pick-grid .pick-msg { grid-column: 1 / -1; color: var(--muted); font-size: 13px; padding: 12px 4px; text-align: center; }
+.pick-foot { flex: none; color: var(--muted); font-size: 11px; text-align: right; }
+.pick-foot:empty { display: none; }
+#gif-q { flex: none; padding: 6px 9px; }
+
+.reaction-note { align-self: center; color: var(--muted); font-size: 12px; }
+.reaction-note .emoji { font-size: 15px; }
+.msg .text.big { font-size: 34px; line-height: 1.2; }
+
+/* a contact's or room's route (Details) */
+.route-box { margin-top: 14px; }
+.route-modes { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 4px 0 2px; }
+.route-modes .check { margin: 0; }
+.suggested { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px; }
+.suggested li { padding: 4px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.suggested li:first-child { border-top: none; }
+.suggested .mono { font-family: ui-monospace, monospace; }
+button.small { padding: 1px 8px; font-size: 12px; }
+.dim { color: var(--muted); }
+
+/* replies */
+.reply-bar { display: flex; align-items: center; gap: 8px; padding: 6px 16px; background: var(--panel); border-top: 1px solid var(--line); font-size: 13px; }
+.reply-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quote { border-left: 3px solid var(--accent); padding: 2px 8px; margin: 2px 0 4px; font-size: 13px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.quote b { color: var(--text); font-weight: 600; }
+.quote.found { cursor: pointer; }
+.msg.flash { outline: 2px solid var(--accent); outline-offset: 2px; transition: outline-color .3s; }
+.msg-acts { position: absolute; top: -10px; right: 6px; display: flex; gap: 4px; opacity: 0; transition: opacity .1s; }
+.msg:hover .msg-acts, .msg:focus-within .msg-acts { opacity: 1; }
+@media (hover: none) { .msg-acts { opacity: .75; } }
+.msg-acts button { position: static; opacity: 1; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 9px;
+  background: var(--panel); border-color: var(--line); color: var(--muted); }
+.reaction-note button.linkish { margin-left: 6px; font-size: 12px; }
+
+/* the message of the day */
+.motd { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow-y: auto; }
+</style>
+<script type="module">// src/bytes.js
+const __src_bytes_js = (() => {
+// Byte helpers: hex, UTF-8, concatenation, randomness.
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: false });
+
+function hexToBytes(hex) {
+  const s = String(hex).trim().replace(/^0x/i, "").replace(/\s+/g, "");
+  if (s.length % 2 || /[^0-9a-f]/i.test(s)) throw new Error("not hex");
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+  return out;
+}
+
+function bytesToHex(bytes) {
+  let s = "";
+  for (const b of bytes) s += b.toString(16).padStart(2, "0");
+  return s;
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(String(b64).trim());
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+const utf8Encode = (s) => textEncoder.encode(s);
+const utf8Decode = (b) => textDecoder.decode(b);
+
+function concatBytes(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let i = 0;
+  for (const p of parts) {
+    out.set(p, i);
+    i += p.length;
+  }
+  return out;
+}
+
+function equalBytes(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i];
+  return d === 0;
+}
+
+function randomBytes(n) {
+  return crypto.getRandomValues(new Uint8Array(n));
+}
+
+// At most n bytes of UTF-8, never ending mid-character.
+function utf8Cut(bytes, n) {
+  let end = Math.min(n, bytes.length);
+  if (end < bytes.length) while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end);
+}
+
+function u32le(n) {
+  return new Uint8Array([n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]);
+}
+
+function readU32le(b, i) {
+  return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0;
+}
+
+function i32le(n) {
+  return u32le(n | 0);
+}
+
+return { hexToBytes, bytesToHex, base64ToBytes, utf8Encode, utf8Decode, concatBytes, equalBytes, randomBytes, utf8Cut, u32le, readU32le, i32le };
+})();
+
+// src/hash.js
+const __src_hash_js = (() => {
+// SHA-256, SHA-512 and HMAC-SHA256 in plain JS: WebCrypto exists only on secure origins, and is async.
+const { concatBytes } = __src_bytes_js;
+// The round constants and initial values come from the primes (cube and square roots), so none are typed in.
+function firstPrimes(n) {
+  const out = [];
+  for (let c = 2; out.length < n; c++) if (out.every((p) => c % p)) out.push(c);
+  return out;
+}
+
+function iroot(x, k) {
+  // floor(x^(1/k)) for BigInt x, by Newton's method from above
+  let r = 1n << BigInt(Math.ceil(x.toString(2).length / Number(k)) + 1);
+  for (;;) {
+    const next = ((k - 1n) * r + x / r ** (k - 1n)) / k;
+    if (next >= r) return r;
+    r = next;
+  }
+}
+
+const MASK64 = (1n << 64n) - 1n;
+const PRIMES = firstPrimes(80);
+const K512 = PRIMES.map((p) => iroot(BigInt(p) << 192n, 3n) & MASK64);
+const H512 = PRIMES.slice(0, 8).map((p) => iroot(BigInt(p) << 128n, 2n) & MASK64);
+const K256 = Uint32Array.from(K512.slice(0, 64), (k) => Number(k >> 32n));
+const H256 = Uint32Array.from(H512, (h) => Number(h >> 32n));
+
+function pad(msg, blockBytes, lenBytes) {
+  const n = msg.length;
+  const total = Math.ceil((n + 1 + lenBytes) / blockBytes) * blockBytes;
+  const out = new Uint8Array(total);
+  out.set(msg);
+  out[n] = 0x80;
+  const bits = BigInt(n) * 8n;
+  for (let i = 0; i < 8; i++) out[total - 1 - i] = Number((bits >> BigInt(8 * i)) & 255n);
+  return out;
+}
+
+function sha256(msg) {
+  const m = pad(msg, 64, 8);
+  const h = Uint32Array.from(H256);
+  const w = new Uint32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let off = 0; off < m.length; off += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = off + i * 4;
+      w[i] = (m[j] << 24) | (m[j + 1] << 16) | (m[j + 2] << 8) | m[j + 3];
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i]) | 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 8; i++) {
+    out[i * 4] = h[i] >>> 24; out[i * 4 + 1] = h[i] >>> 16; out[i * 4 + 2] = h[i] >>> 8; out[i * 4 + 3] = h[i];
+  }
+  return out;
+}
+
+// BigInt words: slow next to native code, but it only signs the odd advert.
+function sha512(msg) {
+  const m = pad(msg, 128, 16);
+  const h = H512.slice();
+  const w = new Array(80);
+  const rotr = (x, n) => ((x >> n) | (x << (64n - n))) & MASK64;
+  for (let off = 0; off < m.length; off += 128) {
+    for (let i = 0; i < 16; i++) {
+      let v = 0n;
+      for (let j = 0; j < 8; j++) v = (v << 8n) | BigInt(m[off + i * 8 + j]);
+      w[i] = v;
+    }
+    for (let i = 16; i < 80; i++) {
+      const s0 = rotr(w[i - 15], 1n) ^ rotr(w[i - 15], 8n) ^ (w[i - 15] >> 7n);
+      const s1 = rotr(w[i - 2], 19n) ^ rotr(w[i - 2], 61n) ^ (w[i - 2] >> 6n);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & MASK64;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 80; i++) {
+      const t1 = (hh + (rotr(e, 14n) ^ rotr(e, 18n) ^ rotr(e, 41n)) + ((e & f) ^ (~e & MASK64 & g)) + K512[i] + w[i]) & MASK64;
+      const t2 = ((rotr(a, 28n) ^ rotr(a, 34n) ^ rotr(a, 39n)) + ((a & b) ^ (a & c) ^ (b & c))) & MASK64;
+      hh = g; g = f; f = e; e = (d + t1) & MASK64; d = c; c = b; b = a; a = (t1 + t2) & MASK64;
+    }
+    [a, b, c, d, e, f, g, hh].forEach((v, i) => { h[i] = (h[i] + v) & MASK64; });
+  }
+  const out = new Uint8Array(64);
+  h.forEach((v, i) => {
+    for (let j = 0; j < 8; j++) out[i * 8 + j] = Number((v >> BigInt(56 - 8 * j)) & 255n);
+  });
+  return out;
+}
+
+function hmacSha256(key, msg) {
+  let k = key.length > 64 ? sha256(key) : key;
+  const block = new Uint8Array(64);
+  block.set(k);
+  const ipad = block.map((b) => b ^ 0x36);
+  const opad = block.map((b) => b ^ 0x5c);
+  return sha256(concatBytes(opad, sha256(concatBytes(ipad, msg))));
+}
+
+return { sha256, sha512, hmacSha256 };
+})();
+
+// src/format.js
+const __src_format_js = (() => {
+// What MeshCore apps put inside a message's text, as the MeshTrax message format describes it
+// (github.com/venamartin/meshtrax, docs/message-format.md): reactions, and the hash that ties one to its message.
+const { concatBytes, u32le, utf8Encode } = __src_bytes_js;
+const { sha256 } = __src_hash_js;
+const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
+
+// The quick-reaction row, as MeshTrax offers it.
+const QUICK_REACTIONS = ["👍", "❤️", "😂", "🎉", "👏", "🔥", "😮", "😢", "🙏", "👀", "✅", "💯"];
+
+// meshcore-open's frozen r: table (decode only: its hash can't be reproduced outside Dart, so such a reaction is
+// shown, but not attached to a message).
+const LEGACY_EMOJI = [
+  "👍", "❤️", "😂", "🎉", "👏", "🔥",
+  "😀", "😃", "😄", "😁", "😅", "😂", "🤣", "😊", "😇", "🙂", "🙃", "😉", "😌", "😍", "🥰", "😘", "😗", "😙", "😚",
+  "😋", "😛", "😝", "😜", "🤪", "🤨", "🧐", "🤓", "😎", "🥸", "🤩", "🥳", "😏", "😒", "😞", "😔", "😟", "😕", "🙁",
+  "😣", "😖", "😫", "😩", "🥺", "😢", "😭", "😤", "😠", "😡", "🤬", "🤯", "😳", "🥵", "🥶", "😱", "😨", "😰", "😥",
+  "😓", "🤗", "🤔", "🤭", "🤫", "🤥", "😶",
+  "👍", "👎", "👊", "✊", "🤛", "🤜", "🤞", "✌️", "🤟", "🤘", "👌", "🤌", "🤏", "👈", "👉", "👆", "👇", "☝️", "👋",
+  "🤚", "🖐️", "✋", "🖖", "👏", "🙌", "👐", "🤲", "🤝", "🙏", "✍️", "💅", "🤳", "💪",
+  "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🤎", "💔", "❤️‍🔥", "❤️‍🩹", "💕", "💞", "💓", "💗", "💖", "💘",
+  "💝", "💟", "💌", "💢", "💥", "💫", "💦", "💨", "🕳️", "💬", "👁️‍🗨️", "🗨️", "🗯️", "💭",
+  "🎉", "🎊", "🎈", "🎁", "🎀", "🪅", "🪆", "🏆", "🥇", "🥈", "🥉", "⚽", "⚾", "🥎", "🏀", "🏐", "🏈", "🏉", "🎾",
+  "🥏", "🎳", "🏏", "🏑", "🏒", "🥍", "🏓", "🏸", "🥊", "🥋", "🥅", "⛳", "🔥", "⭐", "🌟", "✨", "⚡", "💡", "🔦",
+  "🏮", "🪔", "📱", "💻", "⌚", "📷", "📺", "📻", "🎵", "🎶", "🚀",
+];
+
+// A message's hash, as reactions name it: the first 5 bytes of SHA-256(UTF-8 text + its sender timestamp, u32 LE),
+// in 8 characters of lowercase Crockford Base32.
+function messageHash(text, ts) {
+  const d = sha256(concatBytes(utf8Encode(text), u32le(ts >>> 0)));
+  let bits = 0n;
+  for (let i = 0; i < 5; i++) bits = (bits << 8n) | BigInt(d[i]);
+  let out = "";
+  for (let shift = 35n; shift >= 0n; shift -= 5n) out += CROCKFORD[Number((bits >> shift) & 31n)];
+  return out;
+}
+
+function crockford(raw) {
+  if (raw.length !== 8) return null;
+  let out = "";
+  for (let ch of raw.toLowerCase()) {
+    if (ch === "o") ch = "0";
+    if (ch === "i" || ch === "l") ch = "1";
+    if (!CROCKFORD.includes(ch)) return null;
+    out += ch;
+  }
+  return out;
+}
+
+const looksLikeEmoji = (s) => {
+  const cps = [...s].map((c) => c.codePointAt(0));
+  return cps.length > 0 && cps.length <= 8 && (cps[0] >= 0x2000 || cps.some((c) => c === 0xfe0f || c === 0x20e3));
+};
+
+// A reaction's text -> {emoji, hash, targetSender} (MeshCore One: "@[Name]👍\nhash", older "👍@[Name]\nhash", or in a DM
+// "👍\nhash"), {emoji, legacy: true} (meshcore-open's "r:HASH:INDEX"), or null. A MeshCore One reaction looks like any
+// two-line message, so it only counts as one when its hash finds the message.
+function parseReaction(text) {
+  const legacy = /^r:([0-9a-f]{4}):([0-9a-f]{2})$/.exec(text);
+  if (legacy) {
+    const emoji = LEGACY_EMOJI[parseInt(legacy[2], 16)];
+    return emoji ? { emoji, legacy: true } : null;
+  }
+  const nl = text.lastIndexOf("\n");
+  if (nl < 0) return null;
+  const hash = crockford(text.slice(nl + 1));
+  let head = text.slice(0, nl);
+  if (!hash || head.includes("\n")) return null;
+  let targetSender = null;
+  if (head.startsWith("@[")) {
+    const close = head.lastIndexOf("]");
+    if (close < 3) return null;
+    targetSender = head.slice(2, close);
+    head = head.slice(close + 1);
+  } else {
+    const at = head.indexOf("@[");
+    if (at >= 0) {
+      if (!head.endsWith("]")) return null;
+      targetSender = head.slice(at + 2, -1);
+      if (!targetSender) return null;
+      head = head.slice(0, at);
+    }
+  }
+  return looksLikeEmoji(head) ? { emoji: head, hash, targetSender } : null;
+}
+
+// The text to send for a reaction: in a channel or a room, naming the message's author; in a DM, without.
+function reactionText(emoji, hash, author = null) {
+  return (author ? "@[" + author + "]" : "") + emoji + "\n" + hash;
+}
+
+// The forms a message's text may have been hashed in, the one to send with first: trimmed of tabs and Unicode spaces at
+// the ends (never newlines), mentions kept, as MeshCore One holds it; as received; without leading "@[Name] " mentions
+// (as some apps show it); and without leading mentions in either form, "@[Name] " or reply markup "@[Name]\n".
+function hashTexts(text) {
+  const trimmed = text.replace(/^[\t\p{Zs}]+|[\t\p{Zs}]+$/gu, "");
+  const display = trimmed.replace(/^(?:@\[[^\]]+\] )+/, "");
+  const bare = trimmed.replace(/^(?:@\[[^\]]+\][ \n]?)+/, "");
+  return [...new Set([trimmed, text, display, bare])];
+}
+
+// A message of nothing but emoji, at most 5: shown large.
+function emojiOnly(text) {
+  const t = text.trim();
+  if (!t || /[\p{L}\p{N}]/u.test(t.replace(/[\u{1F1E6}-\u{1F1FF}]/gu, ""))) return false;
+  const parts = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(t)].filter((s) => s.segment.trim());
+  return parts.length <= 5 && parts.every((s) => /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u.test(s.segment));
+}
+
+// ---------------------------------------------------------------- replies (MeshCore One's format, as MeshTrax uses it)
+
+const collapse = (s) => s.replace(/\s+/g, " ").trim();
+const chars = (s) => Array.from(s);                       // (characters, not UTF-16 units: an emoji counts once)
+const stripMentions = (s) => s.replace(/^(?:@\[[^\]]+\][ \n]?)+/, "");
+
+// A reply's wire text: "@[Name]\n>{first 10 characters of theirs}..\n{reply}" (".." only when theirs was longer). Theirs
+// leaves out a leading mention of the one replying (me). When it doesn't fit maxBytes, the quote shrinks to 6
+// characters, then goes, leaving "@[Name]\n{reply}". -> the text, or null when the reply alone doesn't fit.
+function buildReply(name, original, body, maxBytes, me = "") {
+  let theirs = collapse(original);
+  if (me && theirs.startsWith("@[" + me + "]")) theirs = collapse(theirs.slice(me.length + 3));
+  const fits = (t) => utf8Encode(t).length <= maxBytes;
+  for (const n of [10, 6]) {
+    const c = chars(theirs);
+    const quote = c.slice(0, n).join("").trim() + (c.length > n ? ".." : "");
+    const t = "@[" + name + "]\n>" + quote + "\n" + body;
+    if (quote.replace(/\.\.$/, "") && fits(t)) return t;
+  }
+  const t = "@[" + name + "]\n" + body;
+  return fits(t) ? t : null;
+}
+
+// A reply's parts, or null: {name, quote (may be ""), body, partial: the quote was cut}. MeshCore One's
+// "@[Name]\n>quote..\nreply" (and "@[Name]\nreply" with no quote line), and meshcore-open's "@[Name] re:quote…reply".
+// A plain mention ("@[Name] hello") isn't a reply.
+function parseReply(text) {
+  let m = /^@\[([^\]\n]+)\]\n>([^\n]*)\n([\s\S]*)$/.exec(text);
+  if (m) {
+    const partial = m[2].endsWith("..");
+    return { name: m[1], quote: partial ? m[2].slice(0, -2) : m[2], body: m[3], partial };
+  }
+  m = /^@\[([^\]\n]+)\] re:([\s\S]*?)(?:…|\.\.\.)\s*([\s\S]*)$/i.exec(text);
+  if (m) return { name: m[1], quote: m[2], body: m[3], partial: true };
+  m = /^@\[([^\]\n]+)\]\n(?!>)([\s\S]+)$/.exec(text);
+  if (m) return { name: m[1], quote: "", body: m[2], partial: false };
+  return null;
+}
+
+// Whether a message's text is the one a reply quotes: it starts with the quote, ignoring case, runs of whitespace and
+// leading mentions on both sides.
+function quoteMatches(original, quote) {
+  const norm = (s) => collapse(stripMentions(collapse(s))).toLowerCase();
+  const q = norm(quote);
+  return !!q && norm(original).startsWith(q);
+}
+
+return { QUICK_REACTIONS, messageHash, parseReaction, reactionText, hashTexts, emojiOnly, buildReply, parseReply, quoteMatches };
+})();
+
+// src/emoji.js
+const __src_emoji_js = (() => {
+// The emoji picker's emoji, by category. Kept short: the common ones, which every phone and desktop draws.
+
+const split = (s) => [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(s)].map((x) => x.segment).filter((x) => x.trim());
+
+const EMOJI_CATEGORIES = [
+  ["😀", "Smileys", split(
+    "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇🥰😍🤩😘😗😚😙😋😛😜🤪😝🤑🤗🤭🤫🤔🤐🤨😐😑😶😏😒🙄😬🤥😌😔😪🤤😴😷🤒🤕🤢🤮🤧🥵🥶🥴😵🤯🤠🥳😎🤓🧐" +
+    "😕😟🙁☹️😮😯😲😳🥺😦😧😨😰😥😢😭😱😖😣😞😓😩😫🥱😤😡😠🤬😈👿💀☠️💩🤡👻👽🤖😺😸😹😻😼😽🙀😿😾")],
+  ["👍", "People", split(
+    "👋🤚🖐️✋🖖👌🤌🤏✌️🤞🤟🤘🤙👈👉👆👇☝️👍👎✊👊🤛🤜👏🙌👐🤲🤝🙏✍️💪🦾🦵🦶👂👃🧠👀👁️👅👄" +
+    "👶🧒👦👧🧑👱👨🧔👩🧓👴👵🙍🙎🙅🙆💁🙋🧏🙇🤦🤷👮🕵️💂👷🤴👸🧙🧚🧛🧜🧝🧞🧟🚶🏃💃🕺👯🧘")],
+  ["❤️", "Hearts", split(
+    "❤️🧡💛💚💙💜🖤🤍🤎💔❣️💕💞💓💗💖💘💝💟💌💋💯💢💥💫💦💨🕳️💬🗨️🗯️💭💤✨⭐🌟⚡🔥🌈☀️🌙☁️⛅🌧️⛈️❄️☃️🌊")],
+  ["🐶", "Nature", split(
+    "🐶🐱🐭🐹🐰🦊🐻🐼🐨🐯🦁🐮🐷🐸🐵🙈🙉🙊🐔🐧🐦🐤🦆🦅🦉🦇🐺🐗🐴🦄🐝🐛🦋🐌🐞🐜🦟🐢🐍🦎🐙🦑🦐🦀🐡🐠🐟🐬🐳🐋🦈🐊" +
+    "🌵🎄🌲🌳🌴🌱🌿☘️🍀🍁🍂🍃🌷🌹🥀🌺🌸🌼🌻🌞🌝🌎🌍🌏🪐")],
+  ["🍕", "Food", split(
+    "🍏🍎🍐🍊🍋🍌🍉🍇🍓🫐🍈🍒🍑🥭🍍🥥🥝🍅🥑🍆🥔🥕🌽🌶️🥒🥬🥦🧄🧅🍄🥜🍞🥐🥖🥨🧀🥚🍳🥓🥩🍗🍖🌭🍔🍟🍕🥪🌮🌯🥗🍝🍜🍲🍛🍣🍱🥟🍤🍙🍚🍘" +
+    "🍦🍧🍨🍩🍪🎂🍰🧁🥧🍫🍬🍭🍮🍯🍼☕🍵🧃🥤🍶🍺🍻🥂🍷🥃🍸🍹🧉🍾🧊")],
+  ["⚽", "Activities", split(
+    "⚽🏀🏈⚾🥎🎾🏐🏉🥏🎱🏓🏸🏒🏑🥍🏏⛳🪁🏹🎣🤿🥊🥋🎽🛹🛼🛷⛸️🎿⛷️🏂🏋️🤸⛹️🤺🤾🏌️🏇🧗🚴🚵🏆🥇🥈🥉🏅🎖️🎗️🎫🎟️🎪🎭🎨🎬🎤🎧🎼🎹🥁🎷🎺🎸🎻🎲♟️🎯🎳🎮🎰🧩")],
+  ["🚗", "Travel", split(
+    "🚗🚕🚙🚌🚎🏎️🚓🚑🚒🚐🛻🚚🚛🚜🏍️🛵🚲🛴🚨🚔🚍🚘🚖✈️🛫🛬🛩️🚁🚀🛸⛵🚤🛥️🛳️⛴️🚢⚓🚧⛽🚦🚥🗺️🗿🗽🗼🏰🏯🏟️🎡🎢🎠⛲⛱️🏖️🏝️🏜️🌋⛰️🏔️🗻🏕️⛺🏠🏡🏘️🏚️🏗️🏭🏢🏬🏣🏤🏥🏦🏨🏪🏫🏩💒🏛️⛪🕌🕍🛕🕋⛩️🌁🌃🏙️🌄🌅🌆🌇🌉🎆🎇")],
+  ["💡", "Objects", split(
+    "⌚📱📲💻⌨️🖥️🖨️🖱️💾💿📷📸📹🎥📞☎️📟📠📺📻🎙️🎚️🎛️🧭⏱️⏲️⏰🕰️⌛⏳📡🔋🔌💡🔦🕯️🧯💸💵💰💳💎⚖️🧰🔧🔨⚒️🛠️⛏️🔩⚙️🧱⛓️🧲🔫💣🧨🪓🔪🗡️⚔️🛡️🚬⚰️🔮📿🧿💈⚗️🔭🔬🩹💊💉🧬🦠🧪🌡️🧹🧺🧻🚽🚰🚿🛁🔑🗝️🚪🛋️🛏️🧸🎁🎈🎏🎀🎊🎉📦📫📬📮✉️📩📨📧📝📁📂📅📆📇📈📉📊📋📌📍📎🖇️📏📐✂️🔒🔓🔏🔐")],
+  ["✅", "Symbols", split(
+    "✅☑️✔️❌❎➕➖➗✖️♾️‼️⁉️❓❔❕❗〰️⚠️🚸⛔🚫🚳🚭🚯🚱🚷📵🔞☢️☣️⬆️↗️➡️↘️⬇️↙️⬅️↖️↕️↔️↩️↪️⤴️⤵️🔃🔄🔙🔚🔛🔜🔝🛐⚛️☮️✝️☪️☯️🔯🕎☸️♈♉♊♋♌♍♎♏♐♑♒♓⛎🔀🔁🔂▶️⏩⏭️⏯️◀️⏪⏮️🔼⏫🔽⏬⏸️⏹️⏺️⏏️🎦🔅🔆📶📳📴♻️🔱📛🔰⭕🆗🆒🆕🆓🆙🆘🆚🔴🟠🟡🟢🔵🟣🟤⚫⚪🟥🟧🟨🟩🟦🟪🟫⬛⬜🔶🔷🔸🔹🔺🔻💠🔘🔳🔲🏁🚩🎌🏴🏳️🏳️‍🌈🏴‍☠️")],
+];
+
+const RECENT_MAX = 32;
+
+return { EMOJI_CATEGORIES, RECENT_MAX };
+})();
+
+// src/gif.js
+const __src_gif_js = (() => {
+// GIFs: a Giphy link in a message (as people paste them from giphy.com) is shown as the GIF itself.
+// Only Giphy's own image hosts are ever loaded, by id, so a message can't make the page fetch anything else.
+
+// As the MeshTrax message format reads them, standing alone (separated by spaces or line breaks): meshcore-open's
+// g:ID; giphy.com/gifs/[slug-]ID (also /embed/, /clips/, /stickers/); media[0-4].giphy.com/media/[v1.../]ID/...;
+// i.giphy.com/[media/]ID[.gif]. The scheme is optional on the links.
+const GIPHY_RE = new RegExp(
+  "(?<=^|\\s)(?:" +
+    "g:([A-Za-z0-9_-]{12,64})" +
+    "|(?:https?://)?(?:" +
+      "(?:www\\.)?giphy\\.com/(?:gifs|embed|clips|stickers)/(?:[\\w-]*-)?([A-Za-z0-9]{6,40})" +
+      "|media\\d?\\.giphy\\.com/media/(?:v1\\.[\\w.=-]+/)?([A-Za-z0-9]{6,40})" +
+      "|i\\.giphy\\.com/(?:media/)?([A-Za-z0-9]{6,40})" +
+    ")[^\\s]*" +
+  ")(?=$|\\s)",
+  "g",
+);
+
+// [{start, end, id}] for each Giphy link in the text, in order.
+function findGifs(text) {
+  const out = [];
+  for (const m of String(text).matchAll(GIPHY_RE)) {
+    out.push({ start: m.index, end: m.index + m[0].length, id: m[1] || m[2] || m[3] || m[4] });
+  }
+  return out;
+}
+
+const gifUrl = (id) => "https://media.giphy.com/media/" + id + "/giphy.gif";
+const gifFallbackUrl = (id) => "https://i.giphy.com/" + id + ".gif";
+const gifPageUrl = (id) => "https://giphy.com/gifs/" + id;
+// A small rendition, for the GIF picker.
+const gifThumbUrl = (id) => "https://media.giphy.com/media/" + id + "/200w.gif";
+
+return { findGifs, gifUrl, gifFallbackUrl, gifPageUrl, gifThumbUrl };
+})();
+
+// src/kaas.js
+const __src_kaas_js = (() => {
+// The KaaS connection: log in for a one-time ticket over HTTPS by signing with the node's private key, open the
+// websocket with it, stream packets in, and send raw packets out within the server's per-key rate
+// limit. Reconnects by itself, logging in again each time.
+const { bytesToHex, hexToBytes, utf8Encode } = __src_bytes_js;
+const KAAS_PATH = "/api/v1/kaas";
+const WEB_PATH = "/api/v1/web";
+// Signed first, always from here and never from the server, so a login signature can't be anything but a login.
+const WEB_LOGIN_LABEL = "meshcore-web login v1";
+
+class AuthError extends Error {}
+
+// The server's MeshCore Web has a page password, and this login didn't give it (or gave a wrong one).
+class PagePasswordNeeded extends AuthError {}
+
+// "https://host[/prefix]" (or with /api/v1/kaas on the end, or ws(s)://) -> {challenge, login, ticket: https URLs, ws}
+function kaasEndpoints(input) {
+  let s = String(input || "").trim();
+  if (!s) throw new Error("Enter the pyMeshRoom URL.");
+  if (!/^[a-z]+:\/\//i.test(s)) s = "https://" + s;
+  const u = new URL(s);
+  const secure = { https: true, wss: true, http: false, ws: false }[u.protocol.slice(0, -1)];
+  if (secure === undefined) throw new Error("The URL must start with https://.");
+  let base = u.pathname.replace(/\/+$/, "");
+  if (base.endsWith(KAAS_PATH)) base = base.slice(0, -KAAS_PATH.length);
+  const host = u.host + base;
+  const http = (secure ? "https://" : "http://") + host;
+  return {
+    challenge: http + WEB_PATH + "/challenge",
+    login: http + WEB_PATH + "/login",
+    ticket: http + WEB_PATH + "/ticket",
+    ws: (secure ? "wss://" : "ws://") + host + KAAS_PATH,
+    host: u.host,
+    secure,
+  };
+}
+
+// What a web login signs: the label, the server's host as we reach it, the server's challenge, our public key.
+function webLoginMessage(host, challenge, pubHex) {
+  return utf8Encode([WEB_LOGIN_LABEL, host, challenge, pubHex].join("\n"));
+}
+
+// Why a websocket didn't open, from what the server says became of its ticket (POST /api/v1/web/ticket).
+const TICKET_OUTCOMES = {
+  waiting: "the login worked, but the websocket never reached pyMeshRoom. If a reverse proxy is in front of it, the " +
+    "proxy has to pass websockets on (nginx: proxy_http_version 1.1, and set the Upgrade and Connection headers); " +
+    "otherwise a browser extension or firewall may be blocking websockets",
+  unused: null,                                         // (the same as waiting)
+  no_upgrade: "the websocket reached pyMeshRoom without its Upgrade header: a reverse proxy in front of it is " +
+    "dropping it (nginx: proxy_http_version 1.1, and set the Upgrade and Connection headers)",
+  bad_version: "the websocket reached pyMeshRoom in a version it doesn't speak (a proxy may be changing it)",
+  busy: "the server was too busy",
+  full: "all of this server's web sessions are in use",
+  too_many: "too many sessions or connections from your address: close another tab, or wait a minute",
+  expired: "the login expired before the websocket opened",
+  refused: "the server refused the session (web logins were turned off, or this key was banned)",
+};
+TICKET_OUTCOMES.unused = TICKET_OUTCOMES.waiting;
+
+// Reconnecting: after 1 s, then twice as long each time, up to 15 s (a server restart is back within a few tries).
+const RETRY_FIRST_MS = 1000;
+const RETRY_MAX_MS = 15000;
+
+const CLOSE_REASONS = {
+  4003: "this key is banned from this server",
+  4004: "web logins were turned off on this server",
+  4005: "the admin disconnected this session",
+  1001: "the server is shutting down",
+};
+
+// Events: "state" {state: "connecting" | "open" | "closed" | "failed", reason}, "hello" (the hello message),
+// "packet" ({dir, raw: Uint8Array, snr, rssi, ts, hash}), "dropped" (count), "send" ({id, status, reason}),
+// "access" ({send, state}): a web login may now send, or may not anymore.
+// auth: {identity, name, pagePassword?}: logs in by signing with the identity's private key.
+class KaasClient extends EventTarget {
+  constructor(url, auth) {
+    super();
+    this.endpoints = kaasEndpoints(url);
+    this.identity = auth.identity || null;
+    this.name = auth.name || "";
+    this.pagePassword = auth.pagePassword || "";        // (a page served by the server itself has its cookie instead)
+    this.ws = null;
+    this.hello = null;
+    this.state = "closed";
+    this.stopped = true;
+    this.retryMs = RETRY_FIRST_MS;
+    this.timer = null;
+    this.nextId = 1;
+    this.waiting = new Map();             // send id -> {resolve, packet}
+    this.queries = new Map();             // request id -> {resolve, reject}: nodes, near, routes, route
+    this.queue = [];                      // {raw, resolve}: sends waiting for the rate limit
+    this.recent = [];                     // when our sends went (performance.now()), for the rolling window
+    this.pumping = false;
+  }
+
+  emit(type, detail) {
+    this.dispatchEvent(new CustomEvent(type, { detail }));
+  }
+
+  setState(state, reason = "") {
+    this.state = state;
+    this.emit("state", { state, reason });
+  }
+
+  // Resolves with hello on the first connection; rejects (AuthError for a bad key) if that one fails.
+  start() {
+    this.stopped = false;
+    if (!this.wake && typeof window !== "undefined") {
+      this.wake = () => this.retryNow();
+      window.addEventListener("online", this.wake);
+      document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && this.wake());
+    }
+    return this.connect();
+  }
+
+  // Waiting to reconnect: try now (the network came back, or the tab was shown again).
+  retryNow() {
+    if (this.stopped || !this.timer || this.state !== "closed") return;
+    this.retryMs = RETRY_FIRST_MS;
+    this.connect().catch(() => {});
+  }
+
+  stop() {
+    this.stopped = true;
+    clearTimeout(this.timer);
+    if (this.ws) this.ws.close(1000);
+    this.ws = null;
+    this.failAll("disconnected");
+    for (const item of this.queue.splice(0)) item.resolve({ status: "dropped", reason: "disconnected" });
+    this.setState("closed");
+  }
+
+  async post(url, headers, body) {
+    let r;
+    try {
+      r = await fetch(url, {
+        method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body || {}),
+        cache: "no-store",
+      });
+    } catch (e) {
+      throw new Error("Can't reach " + this.endpoints.host + " (offline, a wrong URL, or a pyMeshRoom too old for browser logins).");
+    }
+    const answer = await r.json().catch(() => ({}));
+    if (r.status === 401 && answer.page_password) throw new PagePasswordNeeded(answer.error || "this server needs a page password");
+    if (r.status === 401 || r.status === 403) throw new AuthError(answer.error || "the server refused the login");
+    if (!r.ok) throw new Error(answer.error || "The server answered " + r.status + ".");
+    return answer;
+  }
+
+  async getTicket() {
+    const page = this.pagePassword ? { page_password: this.pagePassword } : {};
+    const { challenge } = await this.post(this.endpoints.challenge, {}, page);
+    if (!/^wc_[\w-]{8,100}$/.test(String(challenge))) throw new Error("The server sent a malformed challenge.");
+    const pub = this.identity.pubHex;
+    const signature = bytesToHex(this.identity.sign(webLoginMessage(this.endpoints.host, challenge, pub)));
+    const r = await this.post(this.endpoints.login, {}, { pub, signature, challenge, host: this.endpoints.host, name: this.name, ...page });
+    if (!r.ticket) throw new Error("The server sent no ticket.");
+    return r.ticket;
+  }
+
+  connect() {
+    clearTimeout(this.timer);
+    this.setState("connecting");
+    return new Promise((resolve, reject) => {
+      let opened = false;
+      this.getTicket().then((ticket) => {
+        if (this.stopped) return;
+        const ws = new WebSocket(this.endpoints.ws + "?ticket=" + encodeURIComponent(ticket));
+        this.ws = ws;
+        ws.onmessage = (e) => {
+          let msg;
+          try {
+            msg = JSON.parse(e.data);
+          } catch {
+            return;
+          }
+          if (!opened) {
+            if (msg.type !== "hello") return;
+            opened = true;
+            this.hello = msg;
+            this.retryMs = RETRY_FIRST_MS;
+            this.setState("open");
+            this.emit("hello", msg);
+            resolve(msg);
+            this.pump();
+            return;
+          }
+          this.onMessage(msg);
+        };
+        ws.onclose = (e) => {
+          if (this.ws !== ws) return;
+          this.ws = null;
+          this.failAll("connection closed");
+          const reason = CLOSE_REASONS[e.code] || e.reason || (opened ? "connection lost" : "");
+          if (reason) {
+            if (!opened) reject(new Error(reason));
+            if (e.code >= 4001 && e.code <= 4005) return this.fail(reason);
+            return this.retry(reason);
+          }
+          this.whyNotOpen(ticket).then((why) => {        // (a browser isn't told why a websocket didn't open: ask)
+            reject(new Error(why));
+            this.retry(why);
+          });
+        };
+      }).catch((e) => {
+        if (e instanceof AuthError) {
+          this.fail(e.message);
+          reject(e);
+          return;
+        }
+        reject(e);
+        this.retry(e.message);
+      });
+    });
+  }
+
+  async whyNotOpen(ticket) {
+    try {
+      const { outcome } = await this.post(this.endpoints.ticket, {}, { ticket });
+      if (TICKET_OUTCOMES[outcome]) return "The websocket didn't open: " + TICKET_OUTCOMES[outcome];
+    } catch {}
+    return "The websocket didn't open";
+  }
+
+  fail(reason) {
+    this.stopped = true;
+    this.setState("failed", reason);
+  }
+
+  retry(reason) {
+    if (this.stopped) return;
+    const wait = this.retryMs;
+    this.retryMs = Math.min(this.retryMs * 2, RETRY_MAX_MS);
+    this.setState("closed", reason + "; retrying in " + Math.round(wait / 1000) + " s");
+    this.timer = setTimeout(() => this.connect().catch(() => {}), wait);
+  }
+
+  onMessage(msg) {
+    if (msg.type === "packet") {
+      let raw;
+      try {
+        raw = hexToBytes(msg.raw);
+      } catch {
+        return;
+      }
+      this.emit("packet", { dir: msg.dir, raw, snr: msg.snr, rssi: msg.rssi, ts: msg.ts, hash: msg.hash, seq: msg.seq });
+    } else if (msg.type === "replay_batch") {
+      this.emit("replay", msg.packets || []);
+    } else if (msg.type === "send_result") {
+      const w = this.waiting.get(msg.id);
+      this.emit("send", msg);
+      if (w && msg.status !== "queued") {
+        this.waiting.delete(msg.id);
+        w.resolve(msg);
+      }
+    } else if ((/_result$|^replay_done$/.test(msg.type) || msg.type === "error") && this.queries.has(msg.id)) {
+      const q = this.queries.get(msg.id);
+      this.queries.delete(msg.id);
+      if (msg.type === "error") q.reject(new Error(msg.error || "the server couldn't answer"));
+      else q.resolve(msg);
+    } else if (msg.type === "room_post") {
+      this.emit("room_post", msg);
+    } else if (msg.type === "dropped") {
+      this.emit("dropped", msg.count);
+    } else if (msg.type === "access" && this.hello?.key) {
+      this.hello.key.send = !!msg.send;
+      this.hello.key.state = msg.state;
+      this.emit("access", msg);
+      this.pump();
+    }
+  }
+
+  failAll(reason) {
+    for (const w of this.waiting.values()) w.resolve({ status: "dropped", reason });
+    this.waiting.clear();
+    for (const q of this.queries.values()) q.reject(new Error(reason));
+    this.queries.clear();
+  }
+
+  // A question for the server ({type: "nodes", days: 7}, ...) -> its answer, or throws with the server's error.
+  request(type, fields = {}, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return reject(new Error("not connected"));
+      const id = "q" + this.nextId++;
+      const timer = setTimeout(() => { this.queries.delete(id); reject(new Error("no answer from the server")); }, timeoutMs);
+      this.queries.set(id, {
+        resolve: (m) => { clearTimeout(timer); resolve(m); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      this.ws.send(JSON.stringify({ ...fields, type, id }));
+    });
+  }
+
+  // One packet straight to the server -> the final send_result.
+  sendNow(raw) {
+    return new Promise((resolve) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return resolve({ status: "dropped", reason: "not connected" });
+      const id = this.nextId++;
+      this.waiting.set(id, { resolve });
+      this.ws.send(JSON.stringify({ type: "send", id, raw: bytesToHex(raw) }));
+    });
+  }
+
+  // A packet through the queue: waits its turn under send_burst per send_window_s, and retries once if the server
+  // still says rate limit (another client on the same key). Resolves with the final send_result.
+  send(raw) {
+    return new Promise((resolve) => {
+      this.queue.push({ raw, resolve, tries: 0 });
+      this.pump();
+    });
+  }
+
+  async pump() {
+    if (this.pumping) return;
+    this.pumping = true;
+    try {
+      while (this.queue.length && this.state === "open") {
+        const burst = Number(this.hello?.send_burst ?? 3);
+        const windowMs = Number(this.hello?.send_window_s ?? 20) * 1000;
+        const now = performance.now();
+        this.recent = this.recent.filter((t) => now - t < windowMs);
+        if (this.recent.length >= burst) {
+          await sleep(this.recent[0] + windowMs - now + 50);
+          continue;
+        }
+        const item = this.queue[0];
+        this.recent.push(performance.now());
+        const res = await this.sendNow(item.raw);
+        if (res.status === "dropped" && /rate limit/.test(res.reason || "") && item.tries++ < 2) {
+          await sleep(1000 * Number(res.retry_after || 1));
+          continue;
+        }
+        this.queue.shift();
+        item.resolve(res);
+      }
+    } finally {
+      this.pumping = false;
+    }
+  }
+
+  // Sends still waiting for the rate limit (shown as "waiting" in the UI).
+  get backlog() {
+    return this.queue.length;
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
+
+return { KAAS_PATH, WEB_PATH, WEB_LOGIN_LABEL, AuthError, PagePasswordNeeded, kaasEndpoints, webLoginMessage, KaasClient };
+})();
+
+// src/map.js
+const __src_map_js = (() => {
+// The map: nodes that advertise a position (repeaters, rooms, people), on OpenStreetMap through Leaflet. Leaflet is
+// loaded only when the map is first opened: from the pyMeshRoom serving this page, else from unpkg, pinned by hash.
+const LEAFLET = {
+  js: ["static/leaflet.js", "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="],
+  css: ["static/leaflet.css", "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="],
+};
+const UNPKG = "https://unpkg.com/leaflet@1.9.4/dist/";
+const COLORS = { repeater: "#5cb3ff", room: "#c38bff", chat: "#4caf7a", sensor: "#e0a83e" };
+
+let loading = null;
+
+// A name as text (Leaflet puts a string tooltip in as HTML, and names come from adverts and servers).
+function textNode(text) {
+  const e = document.createElement("span");
+  e.textContent = text;
+  return e;
+}
+
+function load(tag, attrs) {
+  return new Promise((resolve, reject) => {
+    const e = document.createElement(tag);
+    Object.assign(e, attrs, { crossOrigin: "anonymous", onload: resolve, onerror: () => reject(new Error("couldn't load the map library")) });
+    document.head.append(e);
+  });
+}
+
+// serverBase: the pyMeshRoom serving this page (its /static/ has Leaflet, or sends us on to unpkg), or null.
+function leaflet(serverBase) {
+  if (window.L) return Promise.resolve(window.L);
+  const base = serverBase ? serverBase.replace(/\/$/, "") + "/" : UNPKG;
+  const url = (f) => (serverBase ? base + f : UNPKG + f.replace("static/", ""));
+  loading ||= Promise.all([
+    load("link", { rel: "stylesheet", href: url(LEAFLET.css[0]), integrity: LEAFLET.css[1] }),
+    load("script", { src: url(LEAFLET.js[0]), integrity: LEAFLET.js[1] }),
+  ]).then(() => window.L).catch((e) => { loading = null; throw e; });
+  return loading;
+}
+
+let map = null, layer = null;
+
+// Shows the nodes with positions in `box`. popup(node) builds each marker's popup (a DOM element: names are untrusted).
+async function showMap(box, nodes, { serverBase, center, popup }) {
+  const L = await leaflet(serverBase);
+  if (!map) {
+    map = L.map(box, { worldCopyJump: true });
+    // OSM's tile servers refuse requests without a Referer (their tile usage policy), and this page sends none: the
+    // tiles carry the page's origin (only that), as the dashboard's map does
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 18, attribution: "&copy; OpenStreetMap contributors", referrerPolicy: "strict-origin-when-cross-origin",
+    }).addTo(map);
+    layer = L.layerGroup().addTo(map);
+  }
+  layer.clearLayers();
+  const placed = nodes.filter((n) => n.lat != null && n.lon != null && (n.lat || n.lon));
+  for (const n of placed) {
+    L.circleMarker([n.lat, n.lon], {
+      radius: n.type === "repeater" ? 7 : 6, color: "#0b1420", weight: 1, fillColor: COLORS[n.type] || COLORS.chat, fillOpacity: 0.9,
+    }).bindPopup(() => popup(n)).bindTooltip(textNode(n.name || n.pubHex.slice(0, 8))).addTo(layer);
+  }
+  map.invalidateSize();
+  if (center) map.setView([center.lat, center.lon], 12);
+  else if (placed.length) map.fitBounds(placed.map((n) => [n.lat, n.lon]), { padding: [30, 30], maxZoom: 12 });
+  else map.setView([20, 0], 2);
+  return placed.length;
+}
+
+return { showMap };
+})();
+
+// src/aes.js
+const __src_aes_js = (() => {
+// AES-128, one block at a time (MeshCore uses ECB, which WebCrypto doesn't offer).
+
+const SBOX = new Uint8Array(256);
+const INV_SBOX = new Uint8Array(256);
+const xtime = (x) => ((x << 1) ^ (x & 0x80 ? 0x1b : 0)) & 0xff;
+
+(function makeSboxes() {
+  // walk GF(2^8) with generator 3: p runs over all non-zero elements, q over their inverses
+  let p = 1, q = 1;
+  do {
+    p = p ^ xtime(p);
+    q ^= q << 1; q ^= q << 2; q ^= q << 4; q &= 0xff;
+    if (q & 0x80) q ^= 0x09;
+    const rot = (x, n) => ((x << n) | (x >> (8 - n))) & 0xff;
+    const s = q ^ rot(q, 1) ^ rot(q, 2) ^ rot(q, 3) ^ rot(q, 4) ^ 0x63;
+    SBOX[p] = s;
+    INV_SBOX[s] = p;
+  } while (p !== 1);
+  SBOX[0] = 0x63;
+  INV_SBOX[0x63] = 0;
+})();
+
+function mul(a, b) {
+  let r = 0;
+  while (b) {
+    if (b & 1) r ^= a;
+    a = xtime(a);
+    b >>= 1;
+  }
+  return r;
+}
+
+function aesExpandKey(key16) {
+  const w = new Uint8Array(176);
+  w.set(key16.subarray(0, 16));
+  let rcon = 1;
+  for (let i = 16; i < 176; i += 4) {
+    let t = w.slice(i - 4, i);
+    if (i % 16 === 0) {
+      t = new Uint8Array([SBOX[t[1]] ^ rcon, SBOX[t[2]], SBOX[t[3]], SBOX[t[0]]]);
+      rcon = xtime(rcon);
+    }
+    for (let j = 0; j < 4; j++) w[i + j] = w[i - 16 + j] ^ t[j];
+  }
+  return w;
+}
+
+function addRoundKey(s, w, round) {
+  for (let i = 0; i < 16; i++) s[i] ^= w[round * 16 + i];
+}
+
+// state is column-major: s[c * 4 + r]
+function shiftRows(s, inv) {
+  const t = s.slice();
+  for (let r = 1; r < 4; r++)
+    for (let c = 0; c < 4; c++) s[c * 4 + r] = t[((inv ? c - r + 4 : c + r) % 4) * 4 + r];
+}
+
+function mixColumns(s, inv) {
+  const m = inv ? [14, 11, 13, 9] : [2, 3, 1, 1];
+  for (let c = 0; c < 4; c++) {
+    const col = s.slice(c * 4, c * 4 + 4);
+    for (let r = 0; r < 4; r++)
+      s[c * 4 + r] = mul(col[r], m[0]) ^ mul(col[(r + 1) % 4], m[1]) ^ mul(col[(r + 2) % 4], m[2]) ^ mul(col[(r + 3) % 4], m[3]);
+  }
+}
+
+function aesEncryptBlock(w, block) {
+  const s = block.slice(0, 16);
+  addRoundKey(s, w, 0);
+  for (let round = 1; round <= 10; round++) {
+    for (let i = 0; i < 16; i++) s[i] = SBOX[s[i]];
+    shiftRows(s, false);
+    if (round < 10) mixColumns(s, false);
+    addRoundKey(s, w, round);
+  }
+  return s;
+}
+
+function aesDecryptBlock(w, block) {
+  const s = block.slice(0, 16);
+  addRoundKey(s, w, 10);
+  for (let round = 9; round >= 0; round--) {
+    shiftRows(s, true);
+    for (let i = 0; i < 16; i++) s[i] = INV_SBOX[s[i]];
+    addRoundKey(s, w, round);
+    if (round > 0) mixColumns(s, true);
+  }
+  return s;
+}
+
+// ECB over whole blocks; the plaintext is zero-padded to a multiple of 16 first.
+function aesEcbEncrypt(key16, data) {
+  const w = aesExpandKey(key16);
+  const n = Math.ceil(data.length / 16) * 16 || 16;
+  const padded = new Uint8Array(n);
+  padded.set(data);
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i += 16) out.set(aesEncryptBlock(w, padded.subarray(i, i + 16)), i);
+  return out;
+}
+
+function aesEcbDecrypt(key16, data) {
+  const w = aesExpandKey(key16);
+  const out = new Uint8Array(data.length);
+  for (let i = 0; i + 16 <= data.length; i += 16) out.set(aesDecryptBlock(w, data.subarray(i, i + 16)), i);
+  return out;
+}
+
+return { aesExpandKey, aesEncryptBlock, aesDecryptBlock, aesEcbEncrypt, aesEcbDecrypt };
+})();
+
+// src/ed25519.js
+const __src_ed25519_js = (() => {
+// Ed25519 from MeshCore's 64-byte expanded private key [clamped scalar || prefix]. WebCrypto only takes 32-byte
+// seeds, and a key exported from a MeshCore app has no seed, so the curve math is done here with BigInt.
+const { concatBytes } = __src_bytes_js;
+const { sha512 } = __src_hash_js;
+const P = 2n ** 255n - 19n;
+const L = 2n ** 252n + 27742317777372353535851937790883648493n;
+const mod = (a, m = P) => ((a % m) + m) % m;
+
+function powMod(b, e, m = P) {
+  let r = 1n;
+  b = mod(b, m);
+  while (e > 0n) {
+    if (e & 1n) r = (r * b) % m;
+    b = (b * b) % m;
+    e >>= 1n;
+  }
+  return r;
+}
+
+const inv = (a) => powMod(a, P - 2n);
+const D = mod(-121665n * inv(121666n));
+
+// extended coordinates (X, Y, Z, T)
+function add(p, q) {
+  const a = mod((p[1] - p[0]) * (q[1] - q[0]));
+  const b = mod((p[1] + p[0]) * (q[1] + q[0]));
+  const c = mod(2n * p[3] * q[3] * D);
+  const d = mod(2n * p[2] * q[2]);
+  const e = b - a, f = d - c, g = d + c, h = b + a;
+  return [mod(e * f), mod(g * h), mod(f * g), mod(e * h)];
+}
+
+function mulPoint(s, p) {
+  let q = [0n, 1n, 1n, 0n];
+  while (s > 0n) {
+    if (s & 1n) q = add(q, p);
+    p = add(p, p);
+    s >>= 1n;
+  }
+  return q;
+}
+
+const BASE = (() => {
+  const y = mod(4n * inv(5n));
+  const x2 = mod((y * y - 1n) * inv(D * y * y + 1n));
+  let x = powMod(x2, (P + 3n) / 8n);
+  if (mod(x * x - x2) !== 0n) x = mod(x * powMod(2n, (P - 1n) / 4n));
+  if (x & 1n) x = P - x;
+  return [x, y, 1n, mod(x * y)];
+})();
+
+const bytesToBig = (b) => b.reduceRight((n, x) => (n << 8n) | BigInt(x), 0n);
+
+function bigToBytes(n, len = 32) {
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i++, n >>= 8n) out[i] = Number(n & 255n);
+  return out;
+}
+
+function encodePoint(p) {
+  const zi = inv(p[2]);
+  const x = mod(p[0] * zi), y = mod(p[1] * zi);
+  return bigToBytes(y | ((x & 1n) << 255n));
+}
+
+// A 32-byte seed becomes the 64-byte key the way MeshCore does it: SHA-512, then clamp.
+function expandSeed(seed) {
+  const h = sha512(seed);
+  h[0] &= 248;
+  h[31] &= 127;
+  h[31] |= 64;
+  return h;
+}
+
+function ed25519PublicKey(priv64) {
+  const a = bytesToBig(priv64.subarray(0, 32)) & ((1n << 255n) - 1n);
+  return encodePoint(mulPoint(a, BASE));
+}
+
+function ed25519Sign(priv64, pub, msg) {
+  const a = bytesToBig(priv64.subarray(0, 32)) & ((1n << 255n) - 1n);
+  const r = mod(bytesToBig(sha512(concatBytes(priv64.subarray(32, 64), msg))), L);
+  const R = encodePoint(mulPoint(r, BASE));
+  const h = mod(bytesToBig(sha512(concatBytes(R, pub, msg))), L);
+  return concatBytes(R, bigToBytes(mod(r + h * a, L)));
+}
+
+// A point from its 32-byte encoding, or null if it isn't on the curve.
+function decodePoint(b) {
+  const n = bytesToBig(b);
+  const y = n & ((1n << 255n) - 1n);
+  if (y >= P) return null;
+  const x2 = mod((y * y - 1n) * inv(D * y * y + 1n));
+  let x = powMod(x2, (P + 3n) / 8n);
+  if (mod(x * x - x2) !== 0n) x = mod(x * powMod(2n, (P - 1n) / 4n));
+  if (mod(x * x - x2) !== 0n) return null;
+  if ((x & 1n) !== n >> 255n) {
+    if (x === 0n) return null;
+    x = P - x;
+  }
+  return [x, y, 1n, mod(x * y)];
+}
+
+// A key of small order: not a real node's (such a key "verifies" signatures nobody made, and its shared secret is
+// known to everyone). False for anything that isn't a point at all.
+function isWeakKey(pub) {
+  const A = pub.length === 32 ? decodePoint(pub) : null;
+  if (!A) return false;
+  const e = encodePoint(mulPoint(8n, A));
+  return e[0] === 1 && e.subarray(1).every((v) => v === 0);
+}
+
+// Checks [S]B == R + [h]A, h = SHA-512(R || A || msg). (Adverts: a forged one can't rename a contact.) A key of small
+// order never verifies.
+function ed25519Verify(pub, sig, msg) {
+  if (pub.length !== 32 || sig.length !== 64) return false;
+  const A = decodePoint(pub);
+  const R = decodePoint(sig.subarray(0, 32));
+  const S = bytesToBig(sig.subarray(32, 64));
+  if (!A || !R || S >= L || isWeakKey(pub)) return false;
+  const h = mod(bytesToBig(sha512(concatBytes(sig.subarray(0, 32), pub, msg))), L);
+  const left = encodePoint(mulPoint(S, BASE));
+  const right = encodePoint(add(R, mulPoint(h, A)));
+  return left.every((v, i) => v === right[i]);
+}
+
+// X25519 (RFC 7748): the secret two nodes share, from one's private scalar and the other's key.
+function x25519(scalar32, u32) {
+  const k = bytesToBig(scalar32.subarray(0, 32)) & ~7n & ((1n << 254n) - 1n) | (1n << 254n);
+  const x1 = bytesToBig(u32) & ((1n << 255n) - 1n);
+  let x2 = 1n, z2 = 0n, x3 = x1, z3 = 1n, swap = 0n;
+  for (let t = 254n; t >= 0n; t--) {
+    const kt = (k >> t) & 1n;
+    if (swap ^ kt) [x2, x3, z2, z3] = [x3, x2, z3, z2];
+    swap = kt;
+    const A = x2 + z2, AA = mod(A * A), B = x2 - z2, BB = mod(B * B), E = AA - BB;
+    const C = x3 + z3, Dd = x3 - z3, DA = mod(Dd * A), CB = mod(C * B);
+    x3 = mod((DA + CB) ** 2n);
+    z3 = mod(x1 * mod((DA - CB) ** 2n));
+    x2 = mod(AA * BB);
+    z2 = mod(E * (AA + 121665n * E));
+  }
+  if (swap) [x2, z2] = [x3, z3];
+  return bigToBytes(mod(x2 * inv(z2)));
+}
+
+// An Ed25519 public key as an X25519 one: u = (1 + y) / (1 - y).
+function edPubToX25519(pub) {
+  const y = bytesToBig(pub) & ((1n << 255n) - 1n);
+  return bigToBytes(mod((1n + y) * inv(mod(1n - y))));
+}
+
+return { expandSeed, ed25519PublicKey, ed25519Sign, isWeakKey, ed25519Verify, x25519, edPubToX25519 };
+})();
+
+// src/meshcore.js
+const __src_meshcore_js = (() => {
+// MeshCore packets, identities, adverts and channel messages: a port of pyMeshRoom's client/meshroom_kaas.
+const { aesEcbDecrypt, aesEcbEncrypt } = __src_aes_js;
+const { base64ToBytes, bytesToHex, concatBytes, equalBytes, hexToBytes, i32le, readU32le, u32le, utf8Cut, utf8Decode, utf8Encode } = __src_bytes_js;
+const { ed25519PublicKey, ed25519Sign, ed25519Verify, edPubToX25519, expandSeed, x25519 } = __src_ed25519_js;
+const { hmacSha256, sha256 } = __src_hash_js;
+const ROUTE_TRANSPORT_FLOOD = 0;
+const ROUTE_FLOOD = 1;
+const ROUTE_DIRECT = 2;
+const ROUTE_TRANSPORT_DIRECT = 3;
+const PT_REQ = 0;
+const PT_RESPONSE = 1;
+const PT_TXT_MSG = 2;
+const PT_ACK = 3;
+const PT_ADVERT = 4;
+const PT_GRP_TXT = 5;
+const PT_ANON_REQ = 7;
+const PT_PATH = 8;
+const PT_TRACE = 9;
+const PT_MULTIPART = 10;
+const ADV_TYPE_CHAT = 1;
+const ADV_TYPE_REPEATER = 2;
+const ADV_TYPE_ROOM = 3;
+const ADV_TYPE_SENSOR = 4;
+const TXT_TYPE_PLAIN = 0;
+const TXT_TYPE_SIGNED_PLAIN = 2;
+const ADV_LATLON_MASK = 0x10, ADV_FEAT1_MASK = 0x20, ADV_FEAT2_MASK = 0x40, ADV_NAME_MASK = 0x80;
+const MAX_ADVERT_DATA_SIZE = 32;
+const MAX_TEXT_LEN = 160;            // a channel message, "Name: " included
+const MAX_NAME_LEN = 31;             // what fits an advert with no location
+const MAX_PACKET_PAYLOAD = 184;
+const MAX_PATH_SIZE = 64;
+const CIPHER_MAC_SIZE = 2;
+const PUBLIC_CHANNEL_KEY = base64ToBytes("izOH6cXN6mrJ5e26oRXNcg==");   // the well-known "Public" channel
+
+// ---------------------------------------------------------------- packets
+
+const pathBytes = (pathLen) => (pathLen & 63) * ((pathLen >> 6) + 1);
+const pathValid = (pathLen) => (pathLen >> 6) + 1 !== 4 && pathBytes(pathLen) <= MAX_PATH_SIZE;
+
+// header (route type: low 2 bits, payload type: next 4), optional transport codes, path_len, path, payload
+function parsePacket(raw) {
+  if (raw.length < 2) return null;
+  let i = 0;
+  const header = raw[i++];
+  const routeType = header & 3;
+  const hasTransport = routeType === ROUTE_TRANSPORT_FLOOD || routeType === ROUTE_TRANSPORT_DIRECT;
+  if (hasTransport) {
+    if (raw.length < i + 4) return null;
+    i += 4;
+  }
+  if (raw.length <= i) return null;
+  const pathLen = raw[i++];
+  if (!pathValid(pathLen)) return null;
+  const path = raw.subarray(i, i + pathBytes(pathLen));
+  i += path.length;
+  if (i >= raw.length) return null;
+  const payload = raw.subarray(i);
+  if (payload.length > MAX_PACKET_PAYLOAD) return null;
+  return {
+    header, routeType, ptype: (header >> 2) & 15, pathLen, path, payload,
+    hops: pathLen & 63, hashSize: (pathLen >> 6) + 1,
+    isFlood: routeType === ROUTE_FLOOD || routeType === ROUTE_TRANSPORT_FLOOD,
+  };
+}
+
+function floodPacket(ptype, payload, hashSize = 1) {
+  return concatBytes(new Uint8Array([((ptype & 15) << 2) | ROUTE_FLOOD, (hashSize - 1) << 6]), payload);
+}
+
+function zeroHopPacket(ptype, payload) {
+  return concatBytes(new Uint8Array([((ptype & 15) << 2) | ROUTE_DIRECT, 0]), payload);
+}
+
+// Along a known path (path_len 0 = zero hop: only nodes that hear this radio directly).
+function directPacket(ptype, payload, path, pathLen) {
+  return concatBytes(new Uint8Array([((ptype & 15) << 2) | ROUTE_DIRECT, pathLen]), path.subarray(0, pathBytes(pathLen)), payload);
+}
+
+// What MeshCore nodes de-duplicate on: the same packet heard along different paths has the same hash.
+function packetHash(pkt) {
+  const parts = [new Uint8Array([pkt.ptype])];
+  if (pkt.ptype === PT_TRACE) parts.push(new Uint8Array([pkt.pathLen & 255, pkt.pathLen >> 8]));
+  parts.push(pkt.payload);
+  return bytesToHex(sha256(concatBytes(...parts)).subarray(0, 8));
+}
+
+// ---------------------------------------------------------------- identity
+
+// A node identity from a 64-byte MeshCore private key (as the apps export it) or a 32-byte seed, in hex.
+class Identity {
+  constructor(privateHex) {
+    let key = hexToBytes(privateHex);
+    if (key.length === 32) key = expandSeed(key);
+    if (key.length !== 64) throw new Error("a private key is 64 bytes (128 hex characters), or a 32-byte seed");
+    this.privateKey = key;
+    this.pub = ed25519PublicKey(key);
+    this.pubHex = bytesToHex(this.pub);
+  }
+
+  static generate() {
+    return new Identity(bytesToHex(crypto.getRandomValues(new Uint8Array(32))));
+  }
+
+  get privateHex() {
+    return bytesToHex(this.privateKey);
+  }
+
+  sign(msg) {
+    return ed25519Sign(this.privateKey, this.pub, msg);
+  }
+
+  // The 32-byte secret this node shares with another (X25519 on the converted keys), cached.
+  sharedSecret(otherPub) {
+    const k = bytesToHex(otherPub);
+    this.secrets ||= new Map();
+    let s = this.secrets.get(k);
+    if (!s) {
+      s = x25519(this.privateKey.subarray(0, 32), edPubToX25519(otherPub));
+      if (s.every((v) => v === 0)) throw new Error("that key can't be used (a weak key: anyone could read its messages)");
+      this.secrets.set(k, s);
+    }
+    return s;
+  }
+}
+
+// A signed advert payload -> {pub, pubHex, ts, type, name, lat, lon}, or null if malformed or forged.
+function readAdvert(payload) {
+  if (payload.length < 101) return null;
+  const pub = payload.subarray(0, 32), sig = payload.subarray(36, 100);
+  const app = payload.subarray(100, 100 + MAX_ADVERT_DATA_SIZE);
+  if (!ed25519Verify(pub, sig, concatBytes(pub, payload.subarray(32, 36), app))) return null;
+  const flags = app[0];
+  let i = 1, lat = null, lon = null;
+  if (flags & ADV_LATLON_MASK) {
+    if (app.length < 9) return null;
+    const la = readU32le(app, 1) | 0, lo = readU32le(app, 5) | 0;
+    if (la || lo) [lat, lon] = [la / 1e6, lo / 1e6];
+    i += 8;
+  }
+  if (flags & ADV_FEAT1_MASK) i += 2;
+  if (flags & ADV_FEAT2_MASK) i += 2;
+  let name = "";
+  if (flags & ADV_NAME_MASK) {
+    let end = app.indexOf(0, i);
+    if (end < 0) end = app.length;
+    name = utf8Decode(app.subarray(i, end)).replace(/[\u0000-\u001f]/g, " ");
+  }
+  return { pub: Uint8Array.from(pub), pubHex: bytesToHex(pub), ts: readU32le(payload, 32), type: flags & 15, name, lat, lon };
+}
+
+// An advert payload: lets other nodes learn this node's name and key.
+function advertPayload(identity, name, ts, lat = 0, lon = 0) {
+  let flags = ADV_TYPE_CHAT;
+  let body = new Uint8Array(0);
+  if (lat || lon) {
+    flags |= ADV_LATLON_MASK;
+    body = concatBytes(i32le(Math.round(lat * 1e6)), i32le(Math.round(lon * 1e6)));
+  }
+  const nameBytes = utf8Cut(utf8Encode(name), MAX_ADVERT_DATA_SIZE - 1 - body.length);
+  if (nameBytes.length) flags |= ADV_NAME_MASK;
+  const app = concatBytes(new Uint8Array([flags]), body, nameBytes);
+  const tsb = u32le(ts);
+  return concatBytes(identity.pub, tsb, identity.sign(concatBytes(identity.pub, tsb, app)), app);
+}
+
+// ---------------------------------------------------------------- channels
+
+function hashtagChannelKey(name) {
+  return sha256(utf8Encode(name.startsWith("#") ? name : "#" + name)).subarray(0, 16);
+}
+
+const channelHash = (key16) => sha256(key16)[0];
+
+// MAC (2 bytes of HMAC-SHA256 keyed with the 32-byte secret) + AES-128-ECB of the zero-padded text.
+function encryptThenMac(secret32, plain) {
+  const ct = aesEcbEncrypt(secret32.subarray(0, 16), plain);
+  return concatBytes(hmacSha256(secret32, ct).subarray(0, CIPHER_MAC_SIZE), ct);
+}
+
+// The plaintext (still zero-padded), or null when the MAC doesn't match.
+function macThenDecrypt(secret32, data) {
+  if (data.length <= CIPHER_MAC_SIZE || (data.length - CIPHER_MAC_SIZE) % 16) return null;
+  const ct = data.subarray(CIPHER_MAC_SIZE);
+  if (!equalBytes(hmacSha256(secret32, ct).subarray(0, CIPHER_MAC_SIZE), data.subarray(0, CIPHER_MAC_SIZE))) return null;
+  return aesEcbDecrypt(secret32.subarray(0, 16), ct);
+}
+
+// {name, kind: "public" | "hashtag" | "private", key (16 bytes), keyHex, hash}
+function makeChannel(name, kind, keyHex) {
+  let key;
+  if (kind === "public") key = PUBLIC_CHANNEL_KEY;
+  else if (kind === "hashtag") key = hashtagChannelKey(name);
+  else {
+    key = hexToBytes(keyHex);
+    if (key.length !== 16) throw new Error("a channel secret is 16 bytes (32 hex characters)");
+  }
+  return { name, kind, key, keyHex: bytesToHex(key), hash: channelHash(key), secret: concatBytes(key, new Uint8Array(16)) };
+}
+
+// The bytes of text left after "Name: ".
+function textBudget(senderName) {
+  return Math.max(0, MAX_TEXT_LEN - utf8Encode(senderName + ": ").length);
+}
+
+// A channel message, as the apps send it: "Name: text" with a timestamp, flooded. Returns the raw packet.
+function channelMessagePacket(channel, senderName, text, ts, hashSize = 1) {
+  const prefix = utf8Encode(senderName + ": ");
+  const body = utf8Cut(utf8Encode(text), textBudget(senderName));
+  const plain = concatBytes(u32le(ts), new Uint8Array([0]), prefix, body);
+  return floodPacket(PT_GRP_TXT, concatBytes(new Uint8Array([channel.hash]), encryptThenMac(channel.secret, plain)), hashSize);
+}
+
+// A GRP_TXT payload -> {channel, sender, text, ts}, or null if it's for none of these channels.
+function readChannelMessage(channels, payload) {
+  if (payload.length <= 3) return null;
+  for (const ch of channels) {
+    if (ch.hash !== payload[0]) continue;                       // (several channels may share a hash byte)
+    const data = macThenDecrypt(ch.secret, payload.subarray(1));
+    if (!data) continue;
+    if (data.length < 5 || data[4] >> 2) return null;           // not plain text
+    let end = data.indexOf(0, 5);
+    if (end < 0) end = data.length;
+    const full = utf8Decode(data.subarray(5, end));
+    const sep = full.indexOf(": ");
+    return {
+      channel: ch, ts: readU32le(data, 0),
+      sender: sep < 0 ? "" : full.slice(0, sep), text: sep < 0 ? full : full.slice(sep + 2),
+    };
+  }
+  return null;
+}
+
+return { ROUTE_TRANSPORT_FLOOD, ROUTE_FLOOD, ROUTE_DIRECT, ROUTE_TRANSPORT_DIRECT, PT_REQ, PT_RESPONSE, PT_TXT_MSG, PT_ACK, PT_ADVERT, PT_GRP_TXT, PT_ANON_REQ, PT_PATH, PT_TRACE, PT_MULTIPART, ADV_TYPE_CHAT, ADV_TYPE_REPEATER, ADV_TYPE_ROOM, ADV_TYPE_SENSOR, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN, MAX_TEXT_LEN, MAX_NAME_LEN, PUBLIC_CHANNEL_KEY, pathBytes, pathValid, parsePacket, floodPacket, zeroHopPacket, directPacket, packetHash, Identity, readAdvert, advertPayload, hashtagChannelKey, channelHash, encryptThenMac, macThenDecrypt, makeChannel, textBudget, channelMessagePacket, readChannelMessage };
+})();
+
+// src/vault.js
+const __src_vault_js = (() => {
+// Sealing what this browser saves. The private key, with a passphrase: PBKDF2-HMAC-SHA256 makes the keys. Room
+// passwords, with the private key itself: only someone holding it can read them. Either way AES-128-CTR hides the data
+// and HMAC-SHA256 checks it. Plain JS, like the rest (WebCrypto exists only on secure origins), except the
+// passphrase's PBKDF2: WebCrypto's where there is one (many more rounds in the same time), plain JS where not.
+const { aesEncryptBlock, aesExpandKey } = __src_aes_js;
+const { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Decode, utf8Encode } = __src_bytes_js;
+const { hmacSha256 } = __src_hash_js;
+const ROUNDS = 50000;                     // plain JS: about a second in a browser, slow for guessing, fine for logging in
+const ROUNDS_WEBCRYPTO = 600000;          // WebCrypto: OWASP's figure for PBKDF2-HMAC-SHA256, well under a second
+const subtle = () => (typeof crypto !== "undefined" && crypto.subtle) || null;
+
+// pbkdf2(), by WebCrypto when the page has it.
+async function pbkdf2Fast(password, salt, rounds, length) {
+  const s = subtle();
+  if (!s) return pbkdf2(password, salt, rounds, length);
+  const key = await s.importKey("raw", password, "PBKDF2", false, ["deriveBits"]);
+  return new Uint8Array(await s.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: rounds }, key, length * 8));
+}
+
+function pbkdf2(password, salt, rounds, length = 32) {
+  const out = new Uint8Array(length);
+  for (let block = 1, done = 0; done < length; block++) {
+    let u = hmacSha256(password, concatBytes(salt, new Uint8Array([block >>> 24, block >>> 16, block >>> 8, block])));
+    const t = Uint8Array.from(u);
+    for (let i = 1; i < rounds; i++) {
+      u = hmacSha256(password, u);
+      for (let j = 0; j < t.length; j++) t[j] ^= u[j];
+    }
+    out.set(t.subarray(0, length - done), done);
+    done += t.length;
+  }
+  return out;
+}
+
+function ctr(key16, iv, data) {
+  const w = aesExpandKey(key16);
+  const out = new Uint8Array(data.length);
+  for (let i = 0; i < data.length; i += 16) {
+    const ks = aesEncryptBlock(w, concatBytes(iv.subarray(0, 12), u32le(i / 16)));
+    for (let j = 0; j < 16 && i + j < data.length; j++) out[i + j] = data[i + j] ^ ks[j];
+  }
+  return out;
+}
+
+async function keys(passphrase, salt, rounds) {
+  const k = await pbkdf2Fast(utf8Encode(passphrase), salt, rounds, 48);
+  return { enc: k.subarray(0, 16), mac: k.subarray(16, 48) };
+}
+
+function sealWith(k, secret, salt) {
+  const iv = randomBytes(12);
+  const data = ctr(k.enc, iv, secret);
+  const mac = hmacSha256(k.mac, concatBytes(salt, iv, data));
+  return { iv: bytesToHex(iv), data: bytesToHex(data), mac: bytesToHex(mac) };
+}
+
+function unsealWith(k, box, salt) {
+  const iv = hexToBytes(box.iv), data = hexToBytes(box.data);
+  if (!equalBytes(hmacSha256(k.mac, concatBytes(salt, iv, data)), hexToBytes(box.mac))) return null;
+  return ctr(k.enc, iv, data);
+}
+
+// -> (a promise of) {v: 1, rounds, salt, iv, data, mac} (hex), for localStorage. The rounds are kept with it.
+async function seal(secret, passphrase) {
+  const salt = randomBytes(16), rounds = subtle() ? ROUNDS_WEBCRYPTO : ROUNDS;
+  return { v: 1, rounds, salt: bytesToHex(salt), ...sealWith(await keys(passphrase, salt, rounds), secret, salt) };
+}
+
+// (A promise of) the secret, or null for a wrong passphrase (or a damaged record).
+async function unseal(box, passphrase) {
+  try {
+    const salt = hexToBytes(box.salt);
+    return unsealWith(await keys(passphrase, salt, Math.min(Math.max(box.rounds | 0, 1000), 1000000)), box, salt);
+  } catch {
+    return null;
+  }
+}
+
+// What this browser saves for an identity, sealed with a key that comes from its private key (one-way, and under a
+// label of its own, so it is never usable as the node's key). A sealer: {seal(text) -> box, open(box) -> text | null}.
+function keySealer(privateKey) {
+  const root = hmacSha256(privateKey, utf8Encode("meshcore-web local storage v1"));
+  const k = { enc: hmacSha256(root, utf8Encode("enc")).subarray(0, 16), mac: hmacSha256(root, utf8Encode("mac")) };
+  const none = new Uint8Array(0);
+  return {
+    seal: (text) => ({ v: 1, ...sealWith(k, utf8Encode(text), none) }),
+    open: (box) => {
+      try {
+        const b = unsealWith(k, box, none);
+        return b && utf8Decode(b);
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+return { pbkdf2, seal, unseal, keySealer };
+})();
+
+// src/node.js
+const __src_node_js = (() => {
+// A MeshCore chat node in the browser: contacts (from adverts and the server's directory), DMs with their ACKs and
+// retries, path returns, and rooms (log in, receive posts, post). A port of meshroom_kaas.Node (client/ in
+// pyMeshRoom); all the crypto happens here, so the server only ever sees encrypted packets.
+const { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Cut, utf8Decode, utf8Encode } = __src_bytes_js;
+const { sha256 } = __src_hash_js;
+const { isWeakKey } = __src_ed25519_js;
+const { keySealer } = __src_vault_js;
+const { ADV_TYPE_CHAT, ADV_TYPE_REPEATER, ADV_TYPE_ROOM, ADV_TYPE_SENSOR, MAX_TEXT_LEN, PT_ACK, PT_ADVERT, PT_ANON_REQ, PT_MULTIPART, PT_PATH, PT_RESPONSE, PT_TXT_MSG, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN, directPacket, encryptThenMac, floodPacket, macThenDecrypt, parsePacket, pathBytes, pathValid, readAdvert } = __src_meshcore_js;
+const MAX_ROOM_POST_LEN = 151;       // a room keeps 9 bytes of each post for the author and timestamp
+const TYPE_NAMES = { [ADV_TYPE_CHAT]: "chat", [ADV_TYPE_REPEATER]: "repeater", [ADV_TYPE_ROOM]: "room", [ADV_TYPE_SENSOR]: "sensor" };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+class LoginFailed extends Error {}
+
+// Events: "advert" (contact), "dm" ({contact, text, ts}), "post" ({room, author: 4-byte key prefix in hex, text, ts}),
+// "contacts" (the list changed).
+// The server's suggested paths are tried when the best scores this (else floods), and then those scoring the second
+// (its room's own thresholds: _build_plan in meshroom.py).
+const SUGGEST_FIRST = 0.35;
+const SUGGEST_MORE = 0.2;
+
+class MeshNode extends EventTarget {
+  constructor(client, identity, name, { markSeen = () => false, uniqueTime } = {}) {
+    super();
+    this.client = client;
+    this.hashSize = 1;                    // bytes of each repeater's id in the paths of floods we start (1 to 3)
+    this.id = identity;
+    this.name = name;
+    this.markSeen = markSeen;                 // the app's de-duplication: our own packets aren't handled again
+    this.uniqueTime = uniqueTime || (() => Math.floor(Date.now() / 1000));
+    this.contacts = new Map();                // pubHex -> contact
+    this.expected = new Map();                // ACK (hex) -> resolve
+    this.logins = new Map();                  // room pubHex -> {resolve}
+    this.recent = new Set();                  // DMs and posts already delivered (a resend after a lost ACK: once only)
+    this.sealer = keySealer(identity.privateKey);   // room passwords are saved sealed with our private key
+  }
+
+  emit(type, detail) {
+    this.dispatchEvent(new CustomEvent(type, { detail }));
+  }
+
+  // ---------------------------------------------------------------- contacts
+
+  // The contact for a public key, added if new. {pub, pubHex, name, type: "chat" | "repeater" | "room" | "sensor",
+  // lat, lon, lastHeard (s), lastAdvert (advert ts), outPath, outLen (null: flood), room: {syncSince, loggedIn, ...}}
+  // A "partial" contact is known by the first 8 bytes of its key only (the server's name cache): listed and mentioned,
+  // but no DM until its full key turns up, which replaces it.
+  contact(pubHex, fields = {}) {
+    pubHex = pubHex.toLowerCase();
+    let c = this.contacts.get(pubHex);
+    if (!c) {
+      const partial = pubHex.length === 16;
+      if (!partial) {
+        const stub = this.contacts.get(pubHex.slice(0, 16));
+        if (stub?.partial) {
+          this.contacts.delete(stub.pubHex);
+          fields = { name: stub.name, lastHeard: stub.lastHeard, ...fields };
+        }
+      }
+      c = { pub: hexToBytes(pubHex), pubHex, name: "", type: "chat", lat: null, lon: null, lastHeard: null,
+        lastAdvert: null, outPath: new Uint8Array(0), outLen: null, room: null, partial };
+      this.contacts.set(pubHex, c);
+    }
+    for (const [k, v] of Object.entries(fields)) if (v !== undefined && v !== null && v !== "") c[k] = v;
+    return c;
+  }
+
+  // The server's node directory (KaaS "nodes"): fills in names, types, positions and when each was last heard.
+  mergeDirectory(rows) {
+    for (const r of rows || []) {
+      const pub = String(r.pub || "").toLowerCase();
+      if (pub === this.id.pubHex || pub === this.id.pubHex.slice(0, 16)) continue;
+      if (r.partial) {
+        if (!/^[0-9a-f]{16}$/.test(pub) || [...this.contacts.keys()].some((k) => k.length === 64 && k.startsWith(pub))) continue;
+      } else if (!/^[0-9a-f]{64}$/.test(pub) || isWeakKey(hexToBytes(pub))) continue;
+      const c = this.contact(pub);
+      if (!c.lastHeard || (r.last_heard || 0) >= c.lastHeard) {
+        Object.assign(c, { type: typeof r.type === "string" ? r.type : TYPE_NAMES[r.type] || c.type, lastHeard: r.last_heard });
+        if (r.name) c.name = r.name;
+        if (r.lat != null) [c.lat, c.lon] = [r.lat, r.lon];
+      }
+    }
+    this.emit("contacts");
+  }
+
+  // For saving: what's worth keeping across visits (routes and room state included).
+  saveContacts() {
+    return [...this.contacts.values()].map((c) => ({
+      pub: c.pubHex, name: c.name, type: c.type, lat: c.lat, lon: c.lon, lastHeard: c.lastHeard, lastAdvert: c.lastAdvert,
+      outPath: c.outLen == null ? null : bytesToHex(c.outPath), outLen: c.outLen,
+      routeMode: c.routeMode === "auto" ? undefined : c.routeMode,
+      manual: c.manual ? { path: bytesToHex(c.manual.path), plen: c.manual.plen } : undefined,
+      room: c.room ? { syncSince: c.room.syncSince, sealedPassword: this.sealer.seal(c.room.password || "") } : null,
+    }));
+  }
+
+  loadContacts(list) {
+    for (const s of list || []) {
+      try {
+        const c = this.contact(s.pub, { name: s.name, type: s.type, lat: s.lat, lon: s.lon, lastHeard: s.lastHeard, lastAdvert: s.lastAdvert });
+        if (s.outLen != null && pathValid(s.outLen)) [c.outPath, c.outLen] = [hexToBytes(s.outPath || ""), s.outLen];
+        if (s.manual && pathValid(s.manual.plen)) c.manual = { path: hexToBytes(s.manual.path || ""), plen: s.manual.plen };
+        if (["manual", "flood"].includes(s.routeMode) && (s.routeMode !== "manual" || c.manual)) c.routeMode = s.routeMode;
+        if (s.room) {
+          // (a password saved in the clear by an older version is read too, and sealed when next saved)
+          const password = s.room.sealedPassword ? this.sealer.open(s.room.sealedPassword) : s.room.password;
+          c.room = { syncSince: s.room.syncSince || 0, password: password || "", loggedIn: false };
+        }
+      } catch {
+        // a damaged entry: skip it
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- sending
+
+  // Seconds of airtime for a packet this long, from the radio settings in hello (as the firmware reckons it).
+  airtimeMs(length) {
+    const r = this.client.hello?.radio;
+    if (!r) return 400;
+    const ts = (1 << r.sf) / r.bw_hz;
+    const de = ts > 0.016 ? 1 : 0;
+    const n = 8 + Math.max(Math.ceil((8 * length - 4 * r.sf + 28 + 16) / (4 * (r.sf - 2 * de))) * r.cr, 0);
+    return Math.floor((16 + 4.25 + n) * ts * 1000);
+  }
+
+  ackTimeoutMs(raw) {
+    const pkt = parsePacket(raw), t = this.airtimeMs(raw.length);
+    return pkt.isFlood ? 500 + 16 * t : 500 + (t * 6 + 250) * (pkt.hops + 1);
+  }
+
+  route(c, ptype, payload, flood = false) {
+    return c.outLen == null || flood ? floodPacket(ptype, payload, this.hashSize) : directPacket(ptype, payload, c.outPath, c.outLen);
+  }
+
+  // How to send to c, try by try: [{plen, path, source} | {flood: true}], `tries` long. c.routeMode: "flood", only floods;
+  // "manual", only c.manual; "auto" (the default): the path learned from c (if any), the server's suggestions, then a
+  // flood. A suggestion's score is the chance the room's planner gives it of delivering; as that planner does for its
+  // own deliveries, none is used unless the best scores SUGGEST_FIRST, and then only those scoring SUGGEST_MORE: a
+  // weaker one is less likely to get through than another flood. this.suggest(c) -> the suggestions (may be []).
+  async plan(c, tries = 3) {
+    const flood = { flood: true };
+    if (c.routeMode === "flood") return Array(tries).fill(flood);
+    if (c.routeMode === "manual" && c.manual) return Array(tries).fill({ ...c.manual, source: "manual" });
+    const direct = [];
+    if (c.outLen != null) direct.push({ plen: c.outLen, path: c.outPath, source: "learned" });
+    if (direct.length < tries - 1 && this.suggest) {
+      const got = await this.suggest(c).catch(() => []);
+      const usable = got.length && got[0].score >= SUGGEST_FIRST ? got.filter((p) => p.score >= SUGGEST_MORE) : [];
+      for (const p of usable) {
+        if (direct.length >= tries - 1) break;
+        if (!direct.some((d) => d.plen === p.plen && equalBytes(d.path, p.path))) direct.push({ ...p, source: p.source || "suggested" });
+      }
+    }
+    if (!direct.length) return Array(tries).fill(flood);
+    return [...direct, ...Array(tries - direct.length).fill(flood)];
+  }
+
+  // A try's outcome, in automatic mode: a path that worked is the one to use from now on; the learned one failing is
+  // forgotten (the next message asks the server again, then floods).
+  tried(c, step, ok) {
+    if (c.routeMode && c.routeMode !== "auto") return;
+    if (ok && !step.flood && step.source !== "learned") [c.outPath, c.outLen] = [step.path, step.plen];
+    if (!ok && step.source === "learned" && c.outLen === step.plen && equalBytes(c.outPath, step.path))
+      [c.outPath, c.outLen] = [new Uint8Array(0), null];
+    this.emit("contacts");
+  }
+
+  packetFor(step, ptype, payload) {
+    return step.flood ? floodPacket(ptype, payload, this.hashSize) : directPacket(ptype, payload, step.path, step.plen);
+  }
+
+  datagram(c, data) {
+    return concatBytes(new Uint8Array([c.pub[0], this.id.pub[0]]), encryptThenMac(this.id.sharedSecret(c.pub), data));
+  }
+
+  pathReturn(c, path, pathLen, extraType = null, extra = null) {
+    let data = concatBytes(new Uint8Array([pathLen]), path.subarray(0, pathBytes(pathLen)));
+    data = concatBytes(data, extra ? concatBytes(new Uint8Array([extraType]), extra) : concatBytes(new Uint8Array([0xff]), randomBytes(4)));
+    return this.datagram(c, data);
+  }
+
+  // ACKs and path returns skip the rate limit (the server exempts them: a node must answer what it's sent).
+  sendNow(raw) {
+    if (this.readOnly) return Promise.resolve({ status: "dropped", reason: "read only" });
+    this.markSeen(raw);
+    return this.client.sendNow(raw);
+  }
+
+  send(raw) {
+    this.markSeen(raw);
+    return this.client.send(raw);
+  }
+
+  // A direct message (or a post, to a room). Retries until ACKed, the last try by flood. -> {acked, status, reason}
+  // ts: its timestamp (the same on every try), which a reaction to it hashes.
+  // -> {acked, status, reason, via: the try that was ACKed ({plen, path, source} | {flood: true})}
+  async sendDm(c, text, attempts = 3, onAttempt = () => {}, ts = this.uniqueTime()) {
+    const body = utf8Cut(utf8Encode(text), c.room ? MAX_ROOM_POST_LEN : MAX_TEXT_LEN);
+    const plan = await this.plan(c, attempts);
+    let last = { status: "dropped", reason: "not sent" };
+    for (let attempt = 0; attempt < plan.length; attempt++) {
+      const step = plan[attempt];
+      const data = concatBytes(u32le(ts), new Uint8Array([(TXT_TYPE_PLAIN << 2) | (attempt & 3)]), body);
+      const ack = bytesToHex(sha256(concatBytes(data, this.id.pub)).subarray(0, 4));
+      const raw = this.packetFor(step, PT_TXT_MSG, this.datagram(c, data));
+      const acked = new Promise((resolve) => this.expected.set(ack, resolve));
+      onAttempt(attempt, step);
+      last = await this.send(raw);
+      if (last.status === "sent" || last.status === "local") {
+        const got = await Promise.race([acked.then(() => true), sleep(this.ackTimeoutMs(raw) + 2000).then(() => false)]);
+        this.tried(c, step, got);
+        if (got) return { acked: true, status: last.status, via: step };
+      }
+      this.expected.delete(ack);
+    }
+    return { acked: false, status: last.status, reason: last.reason || "no ACK" };
+  }
+
+  // Log in to a room server. Its posts then arrive as "post" events. Throws LoginFailed.
+  async joinRoom(pubHex, password = "", timeoutMs = 30000) {
+    const c = this.contact(pubHex, { type: "room" });
+    c.room ||= { syncSince: 0, password: "", loggedIn: false };
+    c.room.password = password;
+    const data = concatBytes(u32le(this.uniqueTime()), u32le(c.room.syncSince), utf8Encode(password).subarray(0, 15));
+    const payload = concatBytes(new Uint8Array([c.pub[0]]), this.id.pub, encryptThenMac(this.id.sharedSecret(c.pub), data));
+    const answer = new Promise((resolve) => this.logins.set(pubHex, resolve));
+    // a direct try first (when there's a path to try), then a flood with the rest of the time
+    const plan = (await this.plan(c, 2)).filter((s, i, all) => !s.flood || i === all.length - 1 || !all[i + 1]?.flood);
+    let ok = null, sent = null;
+    for (const [i, step] of plan.entries()) {
+      const res = await this.send(this.packetFor(step, PT_ANON_REQ, payload));
+      if (res.status !== "sent" && res.status !== "local") {
+        sent ||= res;
+        continue;
+      }
+      sent = res;
+      const wait = i < plan.length - 1 ? Math.min(12000, timeoutMs / 2) : timeoutMs;
+      ok = await Promise.race([answer, sleep(wait).then(() => null)]);
+      this.tried(c, step, ok !== null);
+      if (ok !== null) break;
+    }
+    this.logins.delete(pubHex);
+    if (sent && sent.status !== "sent" && sent.status !== "local")
+      throw new LoginFailed("the login wasn't sent: " + (sent.reason || sent.status));
+    if (ok === null) throw new LoginFailed("no answer from the room (a wrong password, or it didn't hear the login)");
+    if (!ok.ok) throw new LoginFailed("the room refused the login");
+    Object.assign(c.room, { loggedIn: true, isAdmin: ok.isAdmin, perms: ok.perms });
+    this.emit("contacts");
+    return c;
+  }
+
+  // ---------------------------------------------------------------- receiving
+
+  // A packet the radio heard or sent (already de-duplicated by the app). readOnly: an old one (a catch-up) or one an
+  // MQTT observer heard: read it, but answer nothing (no ACKs, no paths) and learn no route from it.
+  handle(pkt, { readOnly = false } = {}) {
+    if (!pkt.isFlood && pkt.hops > 0) return;           // still on its way through repeaters: not for us yet
+    this.readOnly = readOnly;
+    try {
+      this.dispatch(pkt);
+    } finally {
+      this.readOnly = false;
+    }
+  }
+
+  dispatch(pkt) {
+    const t = pkt.ptype, p = pkt.payload;
+    if (t === PT_ADVERT) this.rxAdvert(p);
+    else if (t === PT_TXT_MSG || t === PT_RESPONSE || t === PT_PATH) this.rxPeer(pkt);
+    else if (t === PT_ACK && p.length >= 4) this.rxAck(p.subarray(0, 4));
+    else if (t === PT_MULTIPART && p.length >= 5 && (p[0] & 15) === PT_ACK) this.rxAck(p.subarray(1, 5));
+  }
+
+  rxAck(ack) {
+    const k = bytesToHex(ack);
+    const resolve = this.expected.get(k);
+    if (resolve) {
+      this.expected.delete(k);
+      resolve();
+    }
+  }
+
+  rxAdvert(payload) {
+    if (payload.length < 101 || equalBytes(payload.subarray(0, 32), this.id.pub)) return;
+    const known = this.contacts.get(bytesToHex(payload.subarray(0, 32)));
+    const ts = (payload[32] | (payload[33] << 8) | (payload[34] << 16) | (payload[35] << 24)) >>> 0;
+    if (known && known.lastAdvert != null && ts <= known.lastAdvert) return;     // older, or a replay: skip the check
+    const a = readAdvert(payload);
+    if (!a) return;
+    const c = this.contact(a.pubHex, { name: a.name, type: TYPE_NAMES[a.type] || "chat", lastAdvert: a.ts,
+      lastHeard: Math.floor(Date.now() / 1000) });
+    if (a.lat != null) [c.lat, c.lon] = [a.lat, a.lon];
+    this.emit("advert", c);
+    this.emit("contacts");
+  }
+
+  rxPeer(pkt) {
+    const p = pkt.payload;
+    if (p.length <= 4 || p[0] !== this.id.pub[0]) return;
+    for (const c of this.contacts.values()) {
+      if (c.partial || c.pub[0] !== p[1]) continue;
+      let secret;
+      try {
+        secret = this.id.sharedSecret(c.pub);
+      } catch {
+        continue;                                         // (a weak key: never a real node)
+      }
+      const data = macThenDecrypt(secret, p.subarray(2));
+      if (!data) continue;
+      if (pkt.ptype === PT_PATH) this.rxPath(pkt, c, data);
+      else if (pkt.ptype === PT_TXT_MSG) this.rxTxt(pkt, c, data);
+      else if (pkt.ptype === PT_RESPONSE) this.rxResponse(c, data);
+      return;
+    }
+  }
+
+  rxPath(pkt, c, data) {
+    const plen = data[0];
+    if (!pathValid(plen)) return;
+    const k = 1 + pathBytes(plen);
+    const path = Uint8Array.from(data.subarray(1, k));
+    const extraType = k < data.length ? data[k] & 15 : 0xff;
+    const extra = data.subarray(k + 1);
+    if (!this.readOnly) [c.outPath, c.outLen] = [path, plen];   // how to reach them directly from now on
+    if (extraType === PT_ACK && extra.length >= 4) this.rxAck(extra.subarray(0, 4));
+    else if (extraType === PT_RESPONSE && extra.length) this.rxResponse(c, extra);
+    if (pkt.isFlood) this.sendNow(directPacket(PT_PATH, this.pathReturn(c, pkt.path, pkt.pathLen), path, plen));
+  }
+
+  replyAck(pkt, c, ack) {
+    let raw;
+    if (pkt.isFlood) raw = floodPacket(PT_PATH, this.pathReturn(c, pkt.path, pkt.pathLen, PT_ACK, ack), pkt.hashSize);
+    else if (c.outLen == null) raw = floodPacket(PT_ACK, ack, this.hashSize);
+    else raw = directPacket(PT_ACK, ack, c.outPath, c.outLen);
+    this.sendNow(raw);
+  }
+
+  rxTxt(pkt, c, data) {
+    if (data.length <= 5) return;
+    const ts = (data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24)) >>> 0;
+    const kind = data[4] >> 2;
+    const end = (from) => { const z = data.indexOf(0, from); return z < 0 ? data.length : z; };
+    if (kind === TXT_TYPE_PLAIN) {
+      const e = end(5);
+      this.replyAck(pkt, c, sha256(concatBytes(data.subarray(0, e), c.pub)).subarray(0, 4));
+      const text = utf8Decode(data.subarray(5, e));
+      if (this.fresh(c.pubHex + "|" + ts + "|" + text)) this.emit("dm", { contact: c, text, ts });
+    } else if (kind === TXT_TYPE_SIGNED_PLAIN && data.length > 9 && c.room) {
+      // a room on the server we're connected to is read through the server instead: what it pushes over the air is for
+      // our radio (the same key on a companion app), so it's left for that radio to ACK
+      if (this.isLocalRoom?.(c.pubHex)) return;
+      const e = end(9);
+      this.replyAck(pkt, c, sha256(concatBytes(data.subarray(0, e), this.id.pub)).subarray(0, 4));
+      c.room.syncSince = Math.max(c.room.syncSince || 0, ts);
+      const author = bytesToHex(data.subarray(5, 9)), text = utf8Decode(data.subarray(9, e));
+      if (this.fresh(c.pubHex + "|" + ts + "|" + author + "|" + text)) this.emit("post", { room: c, author, text, ts });
+    }
+  }
+
+  fresh(k) {
+    if (this.recent.has(k)) return false;
+    this.recent.add(k);
+    if (this.recent.size > 512) this.recent.delete(this.recent.values().next().value);
+    return true;
+  }
+
+  rxResponse(c, data) {
+    const resolve = this.logins.get(c.pubHex);
+    if (!resolve || data.length < 5) return;
+    resolve({ ok: data[4] === 0, isAdmin: data.length >= 8 && data[6] === 1, perms: data.length >= 8 ? data[7] : 0 });
+  }
+}
+
+return { MAX_ROOM_POST_LEN, LoginFailed, MeshNode };
+})();
+
+// src/store.js
+const __src_store_js = (() => {
+// What this browser remembers, in localStorage. Every access is guarded: storage can be off or full.
+
+const PREFIX = "meshcore-web.";
+
+function read(key, fallback) {
+  try {
+    const v = localStorage.getItem(PREFIX + key);
+    return v == null ? fallback : JSON.parse(v);
+  } catch {
+    return fallback;
+  }
+}
+
+function write(key, value) {
+  try {
+    if (value === undefined) localStorage.removeItem(PREFIX + key);
+    else localStorage.setItem(PREFIX + key, JSON.stringify(value));
+  } catch {
+    // (private mode, quota): this session still works, it just won't be remembered
+  }
+}
+
+// {url, name, remember, privateKey?, pagePassword?}: the keys only when "remember" was ticked
+const loadSettings = () => read("settings", {});
+const saveSettings = (s) => write("settings", s);
+
+// The message of the day this browser was asked not to show again (its hash): a new one shows.
+const loadMotdHidden = () => read("motd.hidden", null);
+const saveMotdHidden = (h) => write("motd.hidden", h);
+
+// The emoji picker's recently used, most recent first.
+const loadRecentEmoji = () => read("emoji.recent", []);
+const saveRecentEmoji = (list) => write("emoji.recent", list);
+
+// Per identity (its public key), so two identities in one browser don't share channels or history.
+const loadChannels = (pubHex) => read("channels." + pubHex.slice(0, 16), null);
+const saveChannels = (pubHex, list) => write("channels." + pubHex.slice(0, 16), list);
+const loadHistory = (pubHex) => read("history." + pubHex.slice(0, 16), {});
+const saveHistory = (pubHex, h) => write("history." + pubHex.slice(0, 16), h);
+
+// Contacts (with routes and joined rooms), and the open conversations, per identity too.
+const loadContacts = (pubHex) => read("contacts." + pubHex.slice(0, 16), []);
+const saveContacts = (pubHex, list) => write("contacts." + pubHex.slice(0, 16), list);
+const loadConversations = (pubHex) => read("conversations." + pubHex.slice(0, 16), { dms: [], last: null });
+const saveConversations = (pubHex, c) => write("conversations." + pubHex.slice(0, 16), c);
+
+// How far this browser has caught up, per identity and server: the last backlog seq it has.
+const loadCursor = (pubHex, server) => {
+  const c = read("cursor." + pubHex.slice(0, 16), null);
+  return c && c.server === server ? c.seq : null;
+};
+const saveCursor = (pubHex, server, seq) => write("cursor." + pubHex.slice(0, 16), { server, seq });
+
+function forgetEverything() {
+  try {
+    for (const k of Object.keys(localStorage)) if (k.startsWith(PREFIX)) localStorage.removeItem(k);
+  } catch {
+    // nothing stored, or nothing reachable
+  }
+}
+
+return { loadSettings, saveSettings, loadMotdHidden, saveMotdHidden, loadRecentEmoji, saveRecentEmoji, loadChannels, saveChannels, loadHistory, saveHistory, loadContacts, saveContacts, loadConversations, saveConversations, loadCursor, saveCursor, forgetEverything };
+})();
+
+// src/app.js
+const __src_app_js = (() => {
+// The web app: log in, then talk on MeshCore channels, in DMs and in rooms through pyMeshRoom's KaaS API.
+// The private key, channel secrets and room passwords never leave the browser; the server only sees encrypted packets.
+const { bytesToHex, hexToBytes, randomBytes, utf8Decode, utf8Encode } = __src_bytes_js;
+const { QUICK_REACTIONS, buildReply, emojiOnly, hashTexts, messageHash, parseReaction, parseReply, quoteMatches, reactionText } = __src_format_js;
+const { EMOJI_CATEGORIES, RECENT_MAX } = __src_emoji_js;
+const { findGifs, gifFallbackUrl, gifPageUrl, gifThumbUrl, gifUrl } = __src_gif_js;
+const { sha256 } = __src_hash_js;
+const { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } = __src_kaas_js;
+const { showMap } = __src_map_js;
+const { Identity, MAX_NAME_LEN, MAX_TEXT_LEN, PT_ADVERT, PT_GRP_TXT, advertPayload, channelMessagePacket, floodPacket, makeChannel, packetHash, parsePacket, readChannelMessage, textBudget, zeroHopPacket } = __src_meshcore_js;
+const { LoginFailed, MAX_ROOM_POST_LEN, MeshNode } = __src_node_js;
+const { loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadMotdHidden, loadRecentEmoji, loadSettings, saveChannels, saveContacts, saveConversations, saveHistory, saveMotdHidden, saveRecentEmoji, saveSettings } = __src_store_js;
+const { seal, unseal } = __src_vault_js;
+const HISTORY_PER_CONVERSATION = 300;
+const SUGGEST_KEEP_MS = 5 * 60 * 1000;
+const SEEN_MAX = 4096;
+const DIRECTORY_EVERY_MS = 15 * 60 * 1000;     // the server's node directory, refreshed this often
+const DIRECTORY_DAYS = 30;
+const REACTION_WINDOW_MS = 7 * 86400 * 1000;   // a reaction is matched against messages this recent
+const $ = (id) => document.getElementById(id);
+
+const app = {
+  identity: null,
+  name: "",
+  client: null,
+  node: null,                   // MeshNode: contacts, DMs, rooms
+  channels: [],                 // makeChannel() objects, Public first
+  dms: [],                      // public keys (hex) with a DM conversation, newest first
+  active: null,                 // the conversation on screen: a channel's keyHex, "dm:<pub>" or "room:<pub>"
+  history: {},                  // conversation -> [message]
+  unread: {},                   // conversation -> count
+  seen: new Set(),              // packet hashes already handled (floods arrive once per repeater)
+  lastTs: 0,
+  saveTimer: null,
+  dirTimer: null,
+  lastPkt: null,                // the packet being handled (for a DM's hops and SNR)
+  directoryError: null,
+  cursor: null,                 // the last backlog seq handled (the server numbers channel messages and DMs)
+  catchingUp: false,
+  replayQueue: [],
+};
+let autoTried = false;          // connect by ourselves once per page load (not again after logging out)
+
+// ---------------------------------------------------------------- small DOM helpers
+
+function el(tag, props = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") e.className = v;
+    else if (k === "dataset") Object.assign(e.dataset, v);
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null && v !== false) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) if (c != null && c !== false) e.append(c);
+  return e;
+}
+
+let toastTimer;
+function toast(text) {
+  const t = $("toast");
+  t.textContent = text;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 3500);
+}
+
+function showError(id, text) {
+  $(id).textContent = text || "";
+  $(id).hidden = !text;
+}
+
+function ago(s) {
+  if (!s) return "never";
+  const d = Math.max(0, Date.now() / 1000 - s);
+  return d < 60 ? "just now" : d < 3600 ? Math.round(d / 60) + " min ago" : d < 86400 ? Math.round(d / 3600) + " h ago"
+    : Math.round(d / 86400) + " d ago";
+}
+
+const newId = () => crypto.randomUUID?.() || bytesToHex(randomBytes(8));
+
+// ---------------------------------------------------------------- theme
+
+// How many bytes of each repeater's id the floods we start collect in their path (MeshCore's path hash mode): 2 by
+// default. Longer ids mix up fewer repeaters, so the direct paths learned from those floods are surer.
+function pathHashSize() {
+  const n = Number(loadSettings().pathHash);
+  return [1, 2, 3].includes(n) ? n : 2;
+}
+
+function applyTheme(choice = loadSettings().theme || "dark") {
+  const light = choice === "light" || (choice === "system" && matchMedia("(prefers-color-scheme: light)").matches);
+  if (light) document.documentElement.dataset.theme = "light";
+  else delete document.documentElement.dataset.theme;
+  $("theme").value = choice;
+}
+
+// ---------------------------------------------------------------- login
+
+// Served by pyMeshRoom itself (at .../meshcore-web/): the server is the one this page came from, behind whatever
+// proxy path it sits on. Otherwise (a file on disk, another host) null, and the URL is typed in.
+function servedBy() {
+  if (!/^https?:$/.test(location.protocol)) return null;
+  const m = location.pathname.match(/^(.*?)\/meshcore-web(?:\/[^/]*)?$/);
+  return m ? location.origin + m[1] : null;
+}
+
+// A phone's on-screen keyboard covers the page without resizing it (iOS, and Chrome without interactive-widget): keep
+// the chat, and so the composer, within what's visible.
+function fitToKeyboard() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const fit = () => {
+    const covered = window.innerHeight - vv.height > 60;     // (more than the browser's bars: a keyboard)
+    document.documentElement.style.setProperty("--app-h", covered ? vv.height + "px" : "");
+    if (covered) window.scrollTo(0, 0);                        // (iOS pans the page up instead)
+  };
+  vv.addEventListener("resize", fit);
+  vv.addEventListener("scroll", fit);
+}
+
+function initLogin() {
+  const s = loadSettings();
+  const served = servedBy();
+  $("f-url").value = served && !s.otherServer ? served : s.url || "";
+  $("url-box").hidden = !!served && !s.otherServer;
+  $("url-auto").hidden = !served || !!s.otherServer;
+  $("url-host").textContent = served ? new URL(served).host : "";
+  $("f-name").value = s.name || "";
+  $("f-remember").checked = s.remember !== false;            // (on unless they turned it off)
+  $("f-pass").value = "";
+  $("pass-box").hidden = s.remember === false;
+  $("f-priv").value = s.remember && !s.vault ? s.privateKey || "" : "";
+  setUnlockMode(!!(s.remember && s.vault));
+  $("f-sitepw").value = s.remember && !s.vault ? s.pagePassword || "" : "";
+  $("sitepw-box").hidden = !$("f-sitepw").value;
+  updatePubPreview();
+  $("login").hidden = false;
+  if (!autoTried && s.remember && s.privateKey && s.name && $("f-url").value) {
+    autoTried = true;                                   // remembered, without a passphrase: connect by ourselves
+    return login();
+  }
+  autoTried = true;
+  const empty = ["f-url", "f-unlock", "f-priv", "f-name"].map($).find((i) => !i.value && !i.closest("[hidden]"));
+  (empty || $("login-go")).focus();
+}
+
+function setUnlockMode(on) {
+  $("unlock-box").hidden = !on;
+  $("priv-box").hidden = on;
+  $("f-unlock").value = "";
+}
+
+let previewTimer;
+function updatePubPreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => {
+    const v = $("f-priv").value.trim();
+    const hint = $("f-pub");
+    if (!v) {
+      hint.textContent = "Exported from a MeshCore app, or press New to make one. Keep a copy: a new key is a new node.";
+      return;
+    }
+    try {
+      hint.textContent = "Public key: " + new Identity(v).pubHex;
+      hint.classList.add("mono");
+    } catch (e) {
+      hint.textContent = e.message === "not hex" ? "That isn't hex." : e.message;
+      hint.classList.remove("mono");
+    }
+  }, 150);
+}
+
+async function login(ev) {
+  ev?.preventDefault();
+  showError("login-error", "");
+  const s = loadSettings();
+  const url = $("f-url").value.trim();
+  let pagePassword = $("f-sitepw").value;
+  let priv = $("f-priv").value.trim();
+  const name = $("f-name").value.trim();
+  const go = $("login-go");
+  if (!$("unlock-box").hidden) {
+    go.disabled = true;
+    go.textContent = "Unlocking…";
+    await new Promise((r) => setTimeout(r, 20));        // (let the button repaint: unlocking takes about a second)
+    const opened = await unseal(s.vault || {}, $("f-unlock").value);
+    go.disabled = false;
+    go.textContent = "Connect";
+    if (!opened) return showError("login-error", "That passphrase doesn't unlock the saved key.");
+    ({ privateKey: priv, pagePassword = pagePassword } = JSON.parse(utf8Decode(opened)));
+  }
+  let identity;
+  try {
+    const ep = kaasEndpoints(url);
+    if (location.protocol === "https:" && !ep.secure) throw new Error("This page is on HTTPS, so the server must be too (https://).");
+    identity = new Identity(priv);
+    if (!name) throw new Error("Enter your name.");
+    if (utf8Encode(name).length > MAX_NAME_LEN) throw new Error("Your name is at most " + MAX_NAME_LEN + " bytes.");
+  } catch (e) {
+    return showError("login-error", e.message === "not hex" ? "The private key isn't hex." : e.message);
+  }
+  const remember = $("f-remember").checked;
+  const otherServer = !$("url-box").hidden && !!servedBy();
+  const prefs = { url, name, remember, otherServer, gifs: s.gifs, theme: s.theme, pathHash: s.pathHash };
+  if (!remember) saveSettings(prefs);
+  else if (!$("unlock-box").hidden) saveSettings({ ...prefs, vault: s.vault });   // (unlocked: keep it sealed)
+  else if ($("f-pass").value) {
+    go.textContent = "Saving…";
+    await new Promise((r) => setTimeout(r, 20));
+    saveSettings({ ...prefs, vault: await seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, pagePassword })), $("f-pass").value) });
+  } else saveSettings({ ...prefs, pagePassword: pagePassword || undefined, privateKey: identity.privateHex });
+
+  go.disabled = true;
+  go.textContent = "Connecting…";
+  const client = new KaasClient(url, { identity, name, pagePassword });
+  try {
+    await client.start();
+  } catch (e) {
+    client.stop();
+    go.disabled = false;
+    go.textContent = "Connect";
+    if (e instanceof PagePasswordNeeded) {
+      const asked = !$("sitepw-box").hidden;
+      $("sitepw-box").hidden = false;
+      $("f-sitepw").focus();
+      return showError("login-error", asked && pagePassword ? "That isn't the server's page password." :
+        "This server's MeshCore Web needs a password: enter it above.");
+    }
+    return showError("login-error", e instanceof AuthError ? "The server refused the login: " + e.message : e.message);
+  }
+  go.disabled = false;
+  go.textContent = "Connect";
+  $("f-priv").value = remember && !loadSettings().vault ? $("f-priv").value : "";
+  $("f-sitepw").value = remember && !loadSettings().vault ? $("f-sitepw").value : "";
+  $("f-pass").value = $("f-unlock").value = "";
+  startChat(identity, name, client);
+}
+
+// ---------------------------------------------------------------- chat session
+
+function startChat(identity, name, client) {
+  Object.assign(app, { identity, name, client, unread: {}, seen: new Set(), motdShown: false });
+  app.channels = [makeChannel("Public", "public")];
+  for (const c of loadChannels(identity.pubHex) || []) {
+    if (c.kind === "public") continue;
+    try {
+      if (!app.channels.some((x) => x.keyHex === c.keyHex)) app.channels.push(makeChannel(c.name, c.kind, c.keyHex));
+    } catch {
+      // a damaged entry: skip it
+    }
+  }
+  app.history = loadHistory(identity.pubHex) || {};
+  for (const msgs of Object.values(app.history))
+    for (const m of msgs) if (m.mine && ["sending", "waiting", "retrying"].includes(m.status)) m.status = "unknown";
+
+  const node = new MeshNode(client, identity, name, {
+    markSeen: (raw) => markSeen(packetHash(parsePacket(raw))), uniqueTime,
+  });
+  node.loadContacts(loadContacts(identity.pubHex));
+  node.isLocalRoom = isLocalRoom;
+  node.hashSize = pathHashSize();
+  node.suggest = suggestPaths;
+  app.server = client.endpoints.ws;
+  app.cursor = loadCursor(identity.pubHex, app.server);
+  for (const c of node.contacts.values()) if (c.room) c.room.loggedIn = false;
+  app.node = node;
+  const convs = loadConversations(identity.pubHex);
+  app.dms = (convs.dms || []).filter((p) => /^[0-9a-f]{64}$/.test(p));
+  app.active = convs.last && conv(convs.last) ? convs.last : app.channels[0].keyHex;
+
+  node.addEventListener("dm", (e) => onDm(e.detail));
+  node.addEventListener("post", (e) => onPost(e.detail));
+  node.addEventListener("contacts", () => {
+    renderSidebar();
+    if ($("dlg-contacts").open) renderContacts();       // (an advert heard while the list is open)
+    scheduleSave();
+  });
+  client.addEventListener("packet", (e) => onPacket(e.detail));
+  client.addEventListener("replay", (e) => onReplay(e.detail));
+  client.addEventListener("state", (e) => onState(e.detail));
+  client.addEventListener("hello", () => onHello());
+  client.addEventListener("room_post", (e) => {
+    const c = app.node.contacts.get(String(e.detail.room).toLowerCase());
+    if (c?.room?.local) addLocalPost(c, e.detail);
+  });
+  client.addEventListener("dropped", (e) => toast("The server skipped " + e.detail + " packets (this tab fell behind)."));
+  client.addEventListener("access", (e) => {
+    toast(e.detail.send ? "Your key was heard on the mesh: you can send now." : "Sending was turned off for your key.");
+    onState({ state: client.state });
+    if (e.detail.send) loginRooms();
+  });
+
+  $("me-name").textContent = name;
+  $("me-key").textContent = identity.pubHex.slice(0, 8);
+  $("me-key").title = identity.pubHex;
+  $("login").hidden = true;
+  $("chat").hidden = false;
+  onState({ state: client.state });
+  onHello();
+  clearInterval(app.dirTimer);
+  app.dirTimer = setInterval(refreshDirectory, DIRECTORY_EVERY_MS);
+  renderSidebar();
+  renderConversation();
+  $("text").focus();
+}
+
+// Each (re)connect: the rooms on this radio, the server's directory, and logging in to our rooms again.
+function onHello() {
+  const h = app.client?.hello;
+  renderServer();
+  if (!h) return;
+  showMotd(h.motd);
+  for (const pub of [h.nodes?.room, ...(h.nodes?.tenants || [])].filter(Boolean))
+    app.node.contact(pub, { type: "room", name: h.names?.[pub] });
+  refreshDirectory();
+  loginRooms();
+  catchUp();
+}
+
+async function refreshDirectory() {
+  if (!app.client || app.client.state !== "open") return;
+  try {
+    const r = await app.client.request("nodes", { days: DIRECTORY_DAYS });
+    app.directoryError = null;
+    app.node.mergeDirectory(r.nodes);
+  } catch (e) {
+    app.directoryError = e.message;                     // (an older pyMeshRoom: adverts still fill the list)
+  }
+}
+
+function loginRooms() {
+  if (!canSend()) return;                                 // (rooms wait until this key may send, on this server too)
+  for (const c of app.node.contacts.values()) if (c.room && !c.room.loggedIn) roomLogin(c, c.room.password || "", true);
+}
+
+// The admin's message of the day: once per login (not on every reconnect), unless this browser was asked not to show
+// this one again. Plain text.
+function showMotd(text) {
+  if (app.motdShown || !text) return;
+  app.motdShown = true;
+  const id = bytesToHex(sha256(utf8Encode(text))).slice(0, 16);
+  if (loadMotdHidden() === id) return;
+  $("motd-text").textContent = text;
+  $("motd-hide").checked = false;
+  $("motd-ok").onclick = () => {
+    if ($("motd-hide").checked) saveMotdHidden(id);
+    $("dlg-motd").close();
+  };
+  $("dlg-motd").showModal();
+}
+
+// The server's suggested direct paths to c (KaaS "paths": as its room plans its own deliveries), kept 5 minutes.
+// -> [{plen, path: bytes, hops: [hex], names, score, source}] (none when the server can't say, or is too old to know)
+async function suggestPaths(c, fresh = false) {
+  const got = c.suggested;
+  if (!fresh && got && Date.now() - got.at < SUGGEST_KEEP_MS) return got.paths;
+  let paths = [];
+  try {
+    const r = await app.client.request("paths", { node: c.pubHex, limit: 4 });
+    paths = (r.paths || []).map((p) => ({ ...p, plen: p.path_len, path: hexToBytes(p.path) }));
+  } catch {
+    // (an older server, or none of its budget left: the learned path and floods still work)
+  }
+  c.suggested = { at: Date.now(), paths };
+  return paths;
+}
+
+// A path for people: "a1 › b2 › c3" (repeater ids), "zero hop", or "flood".
+function pathText(step) {
+  if (!step || step.flood) return "flood";
+  const sz = (step.plen >> 6) + 1, n = step.plen & 63;
+  if (!n) return "zero hop";
+  return Array.from({ length: n }, (_, i) => bytesToHex(step.path.subarray(i * sz, (i + 1) * sz))).join(" › ");
+}
+
+// What a DM or room conversation will be sent by, for its subtitle.
+function routeText(c) {
+  if (c.routeMode === "flood") return "route: flood (set)";
+  if (c.routeMode === "manual" && c.manual) return "route: " + pathText(c.manual) + " (set)";
+  return c.outLen == null ? "route: automatic (server's suggestion, then flood)"
+    : "route: " + pathText({ plen: c.outLen, path: c.outPath }) + " (learned)";
+}
+
+// A room on the server we're connected to (its own room, or a tenant room).
+function isLocalRoom(pubHex) {
+  const n = app.client?.hello?.nodes, k = String(pubHex).toLowerCase();
+  return !!n && [n.room, ...(n.tenants || [])].some((x) => String(x || "").toLowerCase() === k);
+}
+
+// A room on this server is read through the server, not logged in to over the air: the room keeps one sync point and
+// one route per key, and those belong to our radio (the same key on a companion app), which would lose posts to us.
+async function readLocalRoom(c, password) {
+  let r;
+  try {
+    r = await app.client.request("room", { room: c.pubHex, since: c.room?.syncSince || 0, password: password || "" });
+  } catch (e) {
+    throw new LoginFailed(e.message);
+  }
+  c.room ||= { syncSince: 0, password: "", loggedIn: false };
+  Object.assign(c.room, { password, loggedIn: true, local: true, isAdmin: r.admin, perms: r.perms, canPost: r.can_post });
+  if (r.name && !c.name) c.name = r.name;
+  for (const p of r.posts || []) addLocalPost(c, p);
+  app.node.emit("contacts");
+}
+
+// A post from a room on this server ({ts, author: full key, name, text, private}), as an "over the air" one would be.
+function addLocalPost(c, p) {
+  c.room.syncSince = Math.max(c.room.syncSince || 0, p.ts);
+  const author = String(p.author).slice(0, 8).toLowerCase();
+  if (!app.node.fresh(c.pubHex + "|" + p.ts + "|" + author + "|" + p.text)) return;
+  const key = "room:" + c.pubHex;
+  if (String(p.author).toLowerCase() === app.identity.pubHex) {
+    // ours: the one we're posting from this page becomes it (the room's stamp is the one reactions use)
+    const ours = (app.history[key] || []).find((m) => m.mine && m.text === p.text && !m.roomTs && m.status !== "failed");
+    if (ours) {
+      Object.assign(ours, { ts: p.ts, roomTs: true, status: "delivered", reason: "" });
+      reactionHashes.delete(ours);
+      updateMessage(ours);
+      return scheduleSave();
+    }
+  }
+  onPost({ room: c, author, text: p.text, ts: p.ts, name: p.name });
+}
+
+async function roomLogin(c, password, quiet = false) {
+  try {
+    if (isLocalRoom(c.pubHex)) await readLocalRoom(c, password);
+    else await app.node.joinRoom(c.pubHex, password);
+    if (!quiet) toast("Joined " + contactName(c) + ".");
+    renderSidebar();
+    if (app.active === "room:" + c.pubHex) renderConversation();
+    scheduleSave();
+    return true;
+  } catch (e) {
+    if (!quiet) throw e;
+    renderSidebar();
+    return false;
+  }
+}
+
+function logout() {
+  app.client?.stop();
+  clearInterval(app.dirTimer);
+  flushSave();
+  const s = loadSettings();
+  if (!s.remember) saveSettings({ url: s.url, name: s.name, remember: false, otherServer: s.otherServer, gifs: s.gifs, theme: s.theme, pathHash: s.pathHash });
+  Object.assign(app, { identity: null, client: null, node: null, channels: [], dms: [], history: {}, unread: {}, active: null });
+  $("chat").hidden = true;
+  $("messages").replaceChildren();
+  document.title = "MeshCore Web";
+  initLogin();
+}
+
+function persistChannels() {
+  saveChannels(app.identity.pubHex, app.channels.map((c) => ({ name: c.name, kind: c.kind, keyHex: c.keyHex })));
+}
+
+function scheduleSave() {
+  clearTimeout(app.saveTimer);
+  app.saveTimer = setTimeout(flushSave, 500);
+}
+
+function flushSave() {
+  clearTimeout(app.saveTimer);
+  if (!app.identity) return;
+  for (const k of Object.keys(app.history)) app.history[k] = app.history[k].slice(-HISTORY_PER_CONVERSATION);
+  saveHistory(app.identity.pubHex, app.history);
+  saveContacts(app.identity.pubHex, app.node.saveContacts());
+  saveConversations(app.identity.pubHex, { dms: app.dms, last: app.active });
+  if (app.cursor != null) saveCursor(app.identity.pubHex, app.server, app.cursor);
+}
+
+function markSeen(hash) {
+  if (app.seen.has(hash)) return true;
+  app.seen.add(hash);
+  if (app.seen.size > SEEN_MAX) app.seen.delete(app.seen.values().next().value);
+  return false;
+}
+
+function uniqueTime() {
+  app.lastTs = Math.max(Math.floor(Date.now() / 1000), app.lastTs + 1);
+  return app.lastTs;
+}
+
+// ---------------------------------------------------------------- conversations
+
+const contactName = (c) => c.name || c.pubHex.slice(0, 8);
+
+// The conversation for a key: {kind: "channel" | "dm" | "room", title, sub, channel | contact}, or null.
+function conv(key = app.active) {
+  if (!key) return null;
+  if (key.startsWith("dm:") || key.startsWith("room:")) {
+    const pub = key.slice(key.indexOf(":") + 1);
+    if (!app.node || !/^[0-9a-f]{64}$/.test(pub)) return null;
+    const c = app.node.contact(pub);
+    if (key.startsWith("dm:")) {
+      return { kind: "dm", key, contact: c, title: contactName(c),
+        sub: "Direct message · " + pub.slice(0, 8) + " · " + routeText(c) };
+    }
+    if (!c.room) return null;
+    return { kind: "room", key, contact: c, title: contactName(c),
+      sub: "Room · " + (c.room.loggedIn ? "logged in" + (c.room.isAdmin ? " as admin" : "") : "not logged in") +
+        (isLocalRoom(c.pubHex) ? " · on this server" : " · " + routeText(c)) };
+  }
+  const ch = app.channels.find((c) => c.keyHex === key);
+  return ch && { kind: "channel", key, channel: ch, title: ch.name, sub: {
+    public: "The public channel every MeshCore node knows",
+    hashtag: "Hashtag channel: anyone who knows the name can read it",
+    private: "Private channel: only people with its secret can read it",
+  }[ch.kind] };
+}
+
+function budget(cv = conv()) {
+  if (!cv) return 0;
+  return cv.kind === "channel" ? textBudget(app.name) : cv.kind === "room" ? MAX_ROOM_POST_LEN : MAX_TEXT_LEN;
+}
+
+// ---------------------------------------------------------------- receiving
+
+// A packet: live from the radio, from an MQTT observer ("mqtt"), or caught up on (old: then `at` is when the server got
+// it). Old and MQTT ones are read only.
+function onPacket({ dir, raw, snr, seq, old = false, at = null }) {
+  if (seq != null) {
+    // while catching up, only the catch-up moves the cursor: a live packet is newer than what's still to come
+    if (app.catchingUp && !old) app.liveSeq = Math.max(app.liveSeq || 0, seq);
+    else if (app.cursor == null || seq > app.cursor) app.cursor = seq;
+  }
+  const pkt = parsePacket(raw);
+  if (!pkt) return;
+  if (markSeen(packetHash(pkt))) return;                     // another copy, or our own packet going out
+  app.lastPkt = { pkt, dir, snr, old, at };
+  if (pkt.ptype === PT_GRP_TXT) onChannelPacket(pkt, dir, snr);
+  else app.node.handle(pkt, { readOnly: old || dir === "mqtt" });
+  app.lastPkt = null;
+}
+
+function onChannelPacket(pkt, dir, snr) {
+  const m = readChannelMessage(app.channels, pkt.payload);
+  if (!m) return;
+  const msgs = app.history[m.channel.keyHex] || [];
+  if (msgs.some((x) => x.ts === m.ts && x.sender === m.sender && x.text === m.text)) return;   // (resent)
+  // a retry: the same text from the same sender, stamped anew. One message, but a reaction may hash either stamp
+  const retried = msgs.slice(-30).find((x) => !x.mine && !x.reaction && x.sender === m.sender && x.text === m.text &&
+    Math.abs(x.ts - m.ts) <= 120);
+  if (retried) {
+    retried.tsAlt = [...new Set([...(retried.tsAlt || []), m.ts])];
+    reactionHashes.delete(retried);
+    attachParked(m.channel.keyHex, retried);
+    return scheduleSave();
+  }
+  addIncoming(m.channel.keyHex, { id: newId(), ts: m.ts, at: app.lastPkt?.at || Date.now(), sender: m.sender, text: m.text,
+    hops: pkt.isFlood ? pkt.hops : null, snr: dir === "rx" ? snr : null, dir, old: app.lastPkt?.old || undefined });
+}
+
+function routeOf() {
+  const l = app.lastPkt;
+  return l ? { hops: l.pkt.isFlood ? l.pkt.hops : null, snr: l.dir === "rx" ? l.snr : null, dir: l.dir, old: l.old || undefined,
+    at: l.at || Date.now() } : {};
+}
+
+function onDm({ contact, text, ts }) {
+  app.dms = [contact.pubHex, ...app.dms.filter((p) => p !== contact.pubHex)];
+  addIncoming("dm:" + contact.pubHex, { id: newId(), ts, sender: contactName(contact), text, ...routeOf() });
+}
+
+function onPost({ room, author, text, ts, name }) {
+  const mine = author === app.identity.pubHex.slice(0, 8);
+  const who = mine ? app.name : [...app.node.contacts.values()].find((c) => c.pubHex.startsWith(author));
+  const msg = { id: newId(), ts, sender: mine ? app.name : who ? contactName(who) : name || author, author, text, ...routeOf() };
+  if (mine) Object.assign(msg, { mine: true, status: "delivered" });
+  addIncoming("room:" + room.pubHex, msg);
+}
+
+function addIncoming(key, msg) {
+  if (takeReaction(key, msg)) return;
+  (app.history[key] ||= []).push(msg);
+  const redraw = attachParked(key, msg, false);
+  scheduleSave();
+  if (key !== app.active || document.hidden) app.unread[key] = (app.unread[key] || 0) + 1;
+  if (app.catchingUp) return void app.touched.add(key);   // (drawn once, in order, when the catch-up ends)
+  if (key === app.active) redraw ? renderConversation() : appendMessage(msg);
+  renderSidebar();
+  updateTitle();
+}
+
+// ---------------------------------------------------------------- catching up (the server's backlog, for web logins)
+
+// On every connect: what was missed since our cursor. A first visit starts from now. Old packets are read only.
+// Replayed packets, as the server sends them: worked through in chunks, so the page stays responsive.
+function onReplay(packets) {
+  app.replayQueue.push(...packets);
+  if (!app.replayPump) app.replayPump = drainReplay().finally(() => { app.replayPump = null; });
+}
+
+async function drainReplay() {
+  while (app.replayQueue.length) {
+    for (const p of app.replayQueue.splice(0, 100)) {
+      onPacket({ dir: p.dir, raw: hexToBytes(p.raw), snr: p.snr, seq: p.seq, old: true, at: (p.ts || 0) * 1000 || Date.now() });
+      app.replayed++;
+    }
+    $("server-info").textContent = "Catching up… " + app.replayed.toLocaleString() + " packets";
+    await new Promise((r) => setTimeout(r, 0));
+  }
+}
+
+async function catchUp() {
+  const client = app.client, key = client.hello?.key;
+  if (!key?.web || app.catchingUp) return;
+  Object.assign(app, { catchingUp: true, touched: new Set(), replayed: 0, liveSeq: 0 });
+  try {
+    const done = await client.request("replay", {
+      since: app.cursor, channels: [...new Set(app.channels.map((c) => c.hash))], me: app.identity.pub[0],
+    }, 10 * 60 * 1000);
+    while (app.replayPump) await app.replayPump;
+    app.cursor = Math.max(app.cursor ?? 0, done.last, app.liveSeq);
+  } catch (e) {
+    while (app.replayPump) await app.replayPump;
+    if (!/catching up is for web logins|unknown message type/.test(e.message)) toast("Couldn't catch up: " + e.message);
+  } finally {
+    app.catchingUp = false;
+    for (const k of app.touched) app.history[k].sort((a, b) => a.at - b.at);
+    const n = [...app.touched].reduce((s, k) => s + (app.unread[k] || 0), 0);
+    renderSidebar();
+    renderConversation();
+    updateTitle();
+    renderServer();
+    flushSave();
+    if (app.replayed) toast(n ? "Caught up: " + n + " missed message" + (n === 1 ? "" : "s") + "." : "Caught up.");
+  }
+}
+
+function onState({ state, reason }) {
+  const dot = $("conn-dot");
+  dot.className = "dot " + state;
+  const label = { open: "Connected", connecting: "Connecting…", closed: "Disconnected", failed: "Stopped" }[state];
+  dot.title = label + (reason ? ": " + reason : "");
+  const banner = $("banner");
+  const key = app.client?.hello?.key || {};
+  let text = "", bad = false;
+  if (state === "failed") { text = "Disconnected: " + reason + ". Log out and in again."; bad = true; }
+  else if (state === "closed") text = "Disconnected: " + (reason || "connection lost") + ".";
+  else if (state === "connecting") text = "Connecting…";
+  else if (key.web && !key.send) text = "You can read, but not send yet: " +
+    (key.pending_message || "Your key must be heard on RF before you can send messages. Please send a flood advert.");
+  banner.textContent = text;
+  banner.className = "banner" + (bad ? " bad" : "");
+  banner.hidden = !text;
+  updateComposer();
+}
+
+// ---------------------------------------------------------------- sending
+
+// ---------------------------------------------------------------- reactions (MeshCore One's format, as MeshTrax uses it)
+
+// An incoming message that is a reaction to one we hold: added to it, and true. Otherwise false (one that finds nothing
+// stays a message, shown as a reaction note).
+function takeReaction(key, msg) {
+  const r = parseReaction(msg.text);
+  if (!r) return false;
+  const target = r.legacy ? null : findReactionTarget(key, r);
+  if (!target) {
+    // shown as a note until its message turns up (one still coming in a catch-up, or a retry stamped anew)
+    msg.reaction = { emoji: r.emoji, to: r.targetSender || null, hash: r.legacy ? undefined : r.hash };
+    return false;
+  }
+  addReaction(target, r.emoji, msg.sender);
+  updateMessage(target);
+  scheduleSave();
+  return true;
+}
+
+function findReactionTarget(key, r) {
+  const since = Date.now() - REACTION_WINDOW_MS;
+  const msgs = (app.history[key] || []).filter((m) => !m.reaction && (m.at || m.ts * 1000) >= since);
+  const hit = (m) => hashesOf(m, key).has(r.hash);
+  for (const pass of [(m) => m.sender === r.targetSender, () => true])
+    for (let i = msgs.length - 1; i >= 0; i--) if (pass(msgs[i]) && hit(msgs[i])) return msgs[i];
+  return null;
+}
+
+// Every hash a reaction to this message may carry (worked out once): each text form (hashTexts), with each stamp it
+// may have been hashed with. Received: as received, and any retry's. Ours: as sent, and the next 3 s (as MeshTrax
+// tries: apps that stamp their own copy a little later); in a room, the server stamps the post with its own clock, so
+// two minutes either side. (40-bit hashes: trying more stamps doesn't make a wrong match likely.)
+const reactionHashes = new WeakMap();
+function hashesOf(m, key) {
+  let set = reactionHashes.get(m);
+  if (set) return set;
+  const stamps = new Set([m.ts, ...(m.tsAlt || [])]);
+  if (m.mine) {
+    const [from, to] = key.startsWith("room:") ? [-120, 120] : [0, 3];
+    for (let d = from; d <= to; d++) stamps.add(m.ts + d);
+  }
+  set = new Set();
+  for (const t of hashTexts(m.text)) for (const s of stamps) set.add(messageHash(t, s));
+  reactionHashes.set(m, set);
+  return set;
+}
+
+// A message just added: reactions to it that came first (shown as notes) go onto it. True if any did (then the
+// conversation is drawn again, unless `draw` is false).
+function attachParked(key, m, draw = true) {
+  const list = app.history[key] || [];
+  const parked = list.filter((x) => x.reaction?.hash && !x.mine);
+  if (!parked.length || m.reaction) return false;
+  const hashes = hashesOf(m, key);
+  const hits = parked.filter((x) => hashes.has(x.reaction.hash));
+  if (!hits.length) return false;
+  for (const x of hits) addReaction(m, x.reaction.emoji, x.sender);
+  app.history[key] = list.filter((x) => !hits.includes(x));
+  scheduleSave();
+  if (draw && key === app.active && !app.catchingUp) renderConversation();
+  return true;
+}
+
+function addReaction(m, emoji, who) {
+  m.reactions ||= {};
+  const list = (m.reactions[emoji] ||= []);
+  if (list.includes(who)) return false;                  // the same person, the same emoji: once
+  list.push(who);
+  return true;
+}
+
+async function react(m, emoji) {
+  closeReactPicker();
+  const key = Object.keys(app.history).find((k) => app.history[k].includes(m));
+  const cv = conv(key);
+  if (!cv || !canSend()) return toast("Can't send right now.");
+  if (!addReaction(m, emoji, app.name)) return;
+  updateMessage(m);
+  scheduleSave();
+  // the hash covers the text as the author's app holds it: in a channel the body trimmed, else exactly as sent
+  const hash = messageHash(cv.kind === "channel" ? hashTexts(m.text)[0] : m.text, m.ts);
+  const text = reactionText(emoji, hash, cv.kind === "dm" ? null : m.sender);
+  let ok;
+  if (cv.kind === "channel") {
+    const raw = channelMessagePacket(cv.channel, app.name, text, uniqueTime(), pathHashSize());
+    markSeen(packetHash(parsePacket(raw)));
+    const res = await app.client.send(raw);
+    ok = res.status === "sent" || res.status === "local";
+  } else {
+    ok = (await app.node.sendDm(cv.contact, text)).acked;
+  }
+  if (!ok) {
+    m.reactions[emoji] = m.reactions[emoji].filter((w) => w !== app.name);
+    if (!m.reactions[emoji].length) delete m.reactions[emoji];
+    updateMessage(m);
+    toast("The reaction wasn't delivered.");
+  }
+}
+
+let pickerFor = null;
+
+function openReactPicker(m, button) {
+  const pop = $("react-pop");
+  if (pickerFor === m && !pop.hidden) return closeReactPicker();
+  pickerFor = m;
+  pop.replaceChildren(...QUICK_REACTIONS.map((e) => el("button", { type: "button", "aria-label": "React " + e, onclick: () => react(m, e) }, e)),
+    el("button", { type: "button", class: "more", "aria-label": "More emoji", title: "More emoji",
+      onclick: (ev) => { ev.stopPropagation(); openPicker("emoji", button, m); } }, "＋"));
+  pop.hidden = false;
+  const r = button.getBoundingClientRect(), w = pop.offsetWidth;
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.right - w)) + "px";
+  pop.style.top = Math.max(8, r.top - pop.offsetHeight - 6) + "px";
+}
+
+function closeReactPicker() {
+  pickerFor = null;
+  $("react-pop").hidden = true;
+}
+
+async function sendMessage(ev) {
+  ev?.preventDefault();
+  closeMentions();
+  const ta = $("text");
+  const text = ta.value.trim();
+  const cv = conv();
+  if (!text || !cv || !canSend()) return;
+  const wire = composed(cv, text);
+  if (wire === null || utf8Encode(wire).length > budget(cv)) return toast("Too long for one message.");
+  ta.value = "";
+  setReply(null);
+  autosize();
+  updateComposer();
+  updateGifPreview();
+  const msg = { id: newId(), ts: uniqueTime(), at: Date.now(), sender: app.name, text: wire, mine: true, status: "sending" };
+  (app.history[cv.key] ||= []).push(msg);
+  appendMessage(msg);
+  if (cv.kind === "dm") app.dms = [cv.contact.pubHex, ...app.dms.filter((p) => p !== cv.contact.pubHex)];
+  renderSidebar();
+  await deliver(cv, msg);
+}
+
+async function deliver(cv, msg) {
+  if (cv.kind === "channel") {
+    const raw = channelMessagePacket(cv.channel, app.name, msg.text, msg.ts, pathHashSize());
+    markSeen(packetHash(parsePacket(raw)));
+    msg.status = app.client.backlog || app.client.state !== "open" ? "waiting" : "sending";
+    updateMessage(msg);
+    const res = await app.client.send(raw);
+    msg.status = res.status === "sent" || res.status === "local" ? res.status : "failed";
+    msg.reason = res.reason || "";
+  } else if (cv.kind === "room" && isLocalRoom(cv.contact.pubHex)) {
+    const c = cv.contact;
+    msg.status = "sending";
+    updateMessage(msg);
+    if (!c.room.loggedIn && !(await roomLogin(c, c.room.password || "", true)))
+      Object.assign(msg, { status: "failed", reason: "couldn't open the room" });
+    else {
+      try {
+        const r = await app.client.request("room_post", { room: c.pubHex, text: msg.text });
+        if (r.status === "duplicate") Object.assign(msg, { status: "failed", reason: "the room already has this post from you" });
+        else if (!msg.roomTs) Object.assign(msg, { ts: r.ts, roomTs: true, status: "delivered", reason: "" });
+        reactionHashes.delete(msg);
+      } catch (e) {
+        Object.assign(msg, { status: "failed", reason: e.message });
+      }
+    }
+  } else {
+    const c = cv.contact;
+    if (cv.kind === "room" && !c.room.loggedIn) {
+      msg.status = "sending";
+      updateMessage(msg);
+      if (!(await roomLogin(c, c.room.password || "", true))) {
+        Object.assign(msg, { status: "failed", reason: "not logged in to the room" });
+        updateMessage(msg);
+        return scheduleSave();
+      }
+    }
+    const res = await app.node.sendDm(c, msg.text, 3, (attempt, step) => {
+      if (attempt) Object.assign(msg, { status: "retrying", reason: step.flood ? "by flood" : "via " + pathText(step) });
+      updateMessage(msg);
+    }, msg.ts);
+    msg.status = res.acked ? "delivered" : res.status === "dropped" ? "failed" : "unconfirmed";
+    msg.reason = res.acked ? "" : res.reason || "";
+    msg.via = res.acked ? pathText(res.via) : undefined;
+    if (app.active === cv.key) $("room-sub").textContent = conv().sub;
+  }
+  updateMessage(msg);
+  scheduleSave();
+}
+
+async function retry(msg) {
+  const key = Object.keys(app.history).find((k) => app.history[k].includes(msg));
+  const cv = conv(key);
+  if (!cv || !canSend()) return;
+  msg.ts = uniqueTime();
+  msg.status = "sending";
+  await deliver(cv, msg);
+}
+
+async function advertise(kind) {
+  $("dlg-advert").close();
+  if (!canSend()) return toast("Not connected, or this key can't send.");
+  const payload = advertPayload(app.identity, app.name, uniqueTime());
+  const raw = kind === "flood" ? floodPacket(PT_ADVERT, payload, pathHashSize()) : zeroHopPacket(PT_ADVERT, payload);
+  markSeen(packetHash(parsePacket(raw)));
+  toast("Sending advert…");
+  const res = await app.client.send(raw);
+  toast(res.status === "sent" || res.status === "local" ? "Advert sent." : "Advert not sent: " + (res.reason || res.status));
+}
+
+function canSend() {
+  return app.client && app.client.state === "open" && app.client.hello?.key?.send !== false;
+}
+
+// ---------------------------------------------------------------- rendering
+
+function renderServer() {
+  const h = app.client?.hello;
+  const parts = [];
+  if (h) {
+    parts.push(h.server || "pyMeshRoom");
+    const room = h.nodes?.room && h.names?.[h.nodes.room];
+    if (room) parts.push(room);
+    if (h.radio) parts.push((h.radio.freq_hz / 1e6).toFixed(3) + " MHz, SF" + h.radio.sf + ", " + h.radio.bw_hz / 1000 + " kHz");
+  }
+  $("server-info").textContent = parts.join(" · ");
+}
+
+function navButton(key, label, extra) {
+  const n = app.unread[key] || 0;
+  return el("button", {
+    type: "button", class: key === app.active ? "on" : "", onclick: () => select(key),
+    "aria-current": key === app.active ? "true" : null,
+  }, el("span", { class: "ch-name" }, label), extra || null, n ? el("span", { class: "badge" }, String(n)) : null);
+}
+
+function renderSidebar() {
+  if (!app.node) return;
+  $("channel-list").replaceChildren(...app.channels.map((ch) =>
+    navButton(ch.keyHex, ch.name, ch.kind === "private" ? el("span", { class: "ch-kind" }, "private") : null)));
+  $("dm-list").replaceChildren(...app.dms.map((pub) => navButton("dm:" + pub, contactName(app.node.contact(pub)))));
+  const rooms = [...app.node.contacts.values()].filter((c) => c.room);
+  $("room-list").replaceChildren(...rooms.map((c) => navButton("room:" + c.pubHex, contactName(c),
+    c.room.loggedIn ? null : el("span", { class: "ch-kind" }, "offline"))));
+  if (conv()) {
+    $("room-name").textContent = conv().title;
+    $("room-sub").textContent = conv().sub;
+  }
+}
+
+function select(key) {
+  if (!conv(key)) return;
+  if (key !== app.active) setReply(null);
+  app.active = key;
+  delete app.unread[key];
+  $("sidebar").classList.remove("open");
+  renderSidebar();
+  renderConversation();
+  updateTitle();
+  scheduleSave();
+  $("text").focus();
+}
+
+function renderConversation() {
+  let cv = conv();
+  if (!cv) {
+    app.active = app.channels[0].keyHex;
+    cv = conv();
+  }
+  $("room-name").textContent = cv.title;
+  $("room-sub").textContent = cv.sub;
+  const box = $("messages");
+  const msgs = app.history[cv.key] || [];
+  box.replaceChildren();
+  if (!msgs.length) {
+    box.append(el("p", { class: "empty" }, {
+      channel: "No messages yet. Messages heard from now on show up here.",
+      dm: "No messages yet. Only the two of you can read a direct message.",
+      room: "No posts yet. The room sends the posts you missed when you log in.",
+    }[cv.kind]));
+  }
+  lastDay = null;
+  for (const m of msgs) appendMessage(m, false);
+  box.scrollTop = box.scrollHeight;
+  updateComposer();
+}
+
+let lastDay = null;
+
+function shownTime(m) {
+  // the sender's clock, unless it is far off from when we got it
+  const sent = m.ts * 1000;
+  return Math.abs(sent - m.at) > 12 * 3600 * 1000 ? m.at : sent;
+}
+
+function appendMessage(m, scroll = true) {
+  const box = $("messages");
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  box.querySelector(".empty")?.remove();
+  const when = new Date(shownTime(m));
+  const day = when.toDateString();
+  if (day !== lastDay) {
+    lastDay = day;
+    box.append(el("div", { class: "day" }, when.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })));
+  }
+  box.append(messageNode(m));
+  if (scroll && (nearBottom || m.mine)) box.scrollTop = box.scrollHeight;
+}
+
+function messageNode(m) {
+  const when = new Date(shownTime(m));
+  if (m.reaction) {
+    return el("div", { class: "reaction-note", dataset: { id: m.id }, title: when.toLocaleString() +
+      (m.reaction.hash ? " · message hash " + m.reaction.hash : "") + (m.reaction.why ? "\n" + m.reaction.why : "") },
+      el("b", {}, m.sender || "(no name)"), " reacted ", el("span", { class: "emoji" }, m.reaction.emoji),
+      m.reaction.to ? " to a message from " + m.reaction.to : " to a message", " not shown here",
+      m.reaction.hash ? el("button", { type: "button", class: "linkish small", onclick: (ev) => lookHarder(m, ev.currentTarget) },
+        m.reaction.why ? "why?" : "Look for it") : null);
+  }
+  const reply = parseReply(m.text);
+  const reactions = Object.entries(m.reactions || {}).filter(([, who]) => who.length);
+  const route = [];
+  if (m.hops != null) route.push(m.hops === 0 ? "direct" : m.hops + (m.hops === 1 ? " hop" : " hops"));
+  if (m.snr != null) route.push("SNR " + Number(m.snr).toFixed(1));
+  if (m.dir === "tx" && !m.mine) route.push("via this radio");
+  if (m.dir === "mqtt") route.push("via MQTT");
+  if (m.old) route.push("while you were away");
+  return el("div", { class: "msg" + (m.mine ? " mine" : ""), dataset: { id: m.id } },
+    el("div", { class: "meta" },
+      el("span", { class: "sender", title: m.author ? "key " + m.author + "…" : null }, m.sender || "(no name)"),
+      el("time", { datetime: when.toISOString(), title: when.toLocaleString() },
+        when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })),
+      route.length ? el("span", {}, route.join(" · ")) : null),
+    reply ? quoteNode(reply) : null,
+    el("div", { class: "text" + (emojiOnly(reply ? reply.body : m.text) ? " big" : "") }, ...richText(reply ? reply.body : m.text)),
+    reactions.length ? el("div", { class: "reactions" }, ...reactions.map(([e, who]) => el("button", {
+      type: "button", class: "chip" + (who.includes(app.name) ? " me" : ""), title: who.join(", "),
+      "aria-label": e + " from " + who.join(", "), onclick: () => react(m, e),
+    }, e + (who.length > 1 ? " " + who.length : "")))) : null,
+    el("div", { class: "msg-acts" },
+      el("button", { type: "button", class: "reply-btn", title: "Reply", "aria-label": "Reply to this message",
+        onclick: () => setReply(m) }, "↩"),
+      el("button", { type: "button", class: "react-btn", title: "React", "aria-label": "React to this message",
+        onclick: (ev) => openReactPicker(m, ev.currentTarget) }, "☺+")),
+    m.mine ? statusNode(m) : null);
+}
+
+// A reply's quote: the message it answers when it's here (click to see it), else what it quoted.
+function quoteNode(r) {
+  const since = Date.now() - 48 * 3600 * 1000;
+  const orig = r.quote ? (app.history[app.active] || []).filter((x) => !x.reaction && (x.at || x.ts * 1000) >= since)
+    .reverse().find((x) => (x.sender === r.name || (x.mine && r.name === app.name)) &&
+      quoteMatches(parseReply(x.text)?.body ?? x.text, r.quote)) : null;
+  const shown = orig ? parseReply(orig.text)?.body ?? orig.text : r.quote + (r.partial ? "…" : "");
+  return el("div", { class: "quote" + (orig ? " found" : ""), title: orig ? "Show the message" : null,
+    onclick: orig ? () => {
+      const node = $("messages").querySelector(`[data-id="${CSS.escape(orig.id)}"]`);
+      node?.scrollIntoView({ block: "center", behavior: "smooth" });
+      node?.classList.add("flash");
+      setTimeout(() => node?.classList.remove("flash"), 1200);
+    } : null }, el("b", {}, r.name), shown ? " " + shown : "");
+}
+
+// A reaction that matched nothing: search harder (each recent message's text forms, with every stamp ±5 minutes).
+// Found: it goes onto that message, and says how far off it was (worth reporting: the usual forms should find it).
+async function lookHarder(note, button) {
+  if (note.reaction.why) return toast(note.reaction.why);
+  button.disabled = true;
+  button.textContent = "Looking…";
+  const key = Object.keys(app.history).find((k) => app.history[k].includes(note));
+  const cv = conv(key);
+  const msgs = (app.history[key] || []).filter((x) => !x.reaction && x !== note).slice(-40).reverse();
+  let hit = null;
+  for (const m of msgs) {
+    const texts = [...hashTexts(m.text), ...(cv?.kind === "channel" ? [(m.sender || "") + ": " + m.text] : [])];
+    const stamps = [m.ts, ...(m.tsAlt || [])];
+    for (let d = 0; d <= 300 && !hit; d++) {
+      for (const base of stamps) for (const sign of d ? [1, -1] : [1]) for (const [i, t] of texts.entries())
+        if (!hit && messageHash(t, base + sign * d) === note.reaction.hash) hit = { m, d: sign * d, named: i >= hashTexts(m.text).length };
+    }
+    if (hit) break;
+    await new Promise((r) => setTimeout(r, 0));          // (a message at a time: the page stays responsive)
+  }
+  if (hit) {
+    addReaction(hit.m, note.reaction.emoji, note.sender);
+    app.history[key] = app.history[key].filter((x) => x !== note);
+    scheduleSave();
+    renderConversation();
+    toast("Found it: a reaction to " + (hit.m.sender || "a message") + "'s \"" + Array.from(hit.m.text).slice(0, 30).join("") +
+      "\" (its time off by " + hit.d + " s" + (hit.named ? ", hashed with the sender's name" : "") + "). Worth reporting: it should have matched.");
+    return;
+  }
+  note.reaction.why = "No message from the last " + msgs.length + " here matches, even ±5 minutes off: it was for a message " +
+    "this page never received (one sent or received by another device with your key, say, or before you joined).";
+  scheduleSave();
+  updateMessage(note);
+  toast(note.reaction.why);
+}
+
+function statusNode(m) {
+  const text = {
+    sending: "Sending…", waiting: "Waiting for the rate limit…", sent: "Sent", local: "Delivered on the radio",
+    delivered: "Delivered" + (m.via ? " via " + m.via : ""), retrying: "No answer yet, trying again" + (m.reason ? " " + m.reason : "") + "…",
+    unconfirmed: "Not delivered: no ACK", failed: "Not sent" + (m.reason ? ": " + m.reason : ""), unknown: "Not confirmed",
+  }[m.status] || m.status;
+  const bad = ["failed", "unknown", "unconfirmed"].includes(m.status);
+  return el("div", { class: "status" + (bad ? " bad" : "") }, text,
+    bad ? el("button", { type: "button", class: "ghost", onclick: () => retry(m) }, "Retry") : null);
+}
+
+function updateMessage(m) {
+  const node = $("messages").querySelector(`[data-id="${CSS.escape(m.id)}"]`);
+  if (node) node.replaceWith(messageNode(m));
+}
+
+// A message's text: Giphy links become the GIF (unless GIFs are off), @[name] mentions stand out.
+function richText(text) {
+  const out = [];
+  let i = 0;
+  for (const g of findGifs(text)) {
+    if (g.start > i) out.push(...withMentions(text.slice(i, g.start)));
+    out.push(gifsOn() ? gifNode(g.id) : el("span", { class: "gif-link" }, text.slice(g.start, g.end)));
+    i = g.end;
+  }
+  if (i < text.length) out.push(...withMentions(text.slice(i)));
+  return out;
+}
+
+function gifNode(id) {
+  const img = el("img", { src: gifUrl(id), alt: "GIF", loading: "lazy", referrerpolicy: "no-referrer" });
+  img.addEventListener("error", () => {
+    if (img.src !== gifFallbackUrl(id)) img.src = gifFallbackUrl(id);
+    else img.replaceWith(el("span", { class: "gif-link" }, gifPageUrl(id)));
+  });
+  return el("a", { class: "gif", href: gifPageUrl(id), target: "_blank", rel: "noopener noreferrer", title: "Open on Giphy" }, img);
+}
+
+function gifsOn() {
+  return loadSettings().gifs !== false;
+}
+
+function updateGifPreview() {
+  const box = $("gif-preview");
+  const gifs = gifsOn() ? findGifs($("text").value) : [];
+  box.replaceChildren(...gifs.slice(0, 3).map((g) => el("img", { src: gifUrl(g.id), alt: "GIF preview", referrerpolicy: "no-referrer" })));
+  box.hidden = !gifs.length;
+}
+
+// @[name] mentions, as the MeshCore apps write them; the reader's own name stands out.
+function withMentions(text) {
+  const out = [];
+  const re = /@\[([^\]]+)\]/g;
+  let i = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > i) out.push(text.slice(i, m.index));
+    const me = m[1].toLowerCase() === app.name.toLowerCase();
+    out.push(el("span", { class: "mention" + (me ? " me" : "") }, "@" + m[1]));
+    i = m.index + m[0].length;
+  }
+  if (i < text.length) out.push(text.slice(i));
+  return out;
+}
+
+// What a message goes out as: with the reply markup when replying (MeshCore One's format; null if it can't fit).
+function composed(cv, text) {
+  const r = app.reply;
+  if (!r || r.key !== cv.key || !text) return text;
+  return buildReply(r.msg.sender || "", parseReply(r.msg.text)?.body ?? r.msg.text, text, budget(cv), app.name);
+}
+
+function setReply(m) {
+  app.reply = m ? { key: app.active, msg: m } : null;
+  $("reply-bar").hidden = !m;
+  if (m) {
+    const shown = parseReply(m.text)?.body ?? m.text;
+    $("reply-name").textContent = m.sender || "(no name)";
+    $("reply-quote").textContent = Array.from(shown).length > 60 ? Array.from(shown).slice(0, 60).join("") + "…" : shown;
+    $("text").focus();
+  }
+  updateComposer();
+}
+
+function updateComposer() {
+  if (!app.identity) return;
+  const typed = $("text").value.trim(), cv = conv();
+  const wire = cv ? composed(cv, typed) : typed;
+  const left = budget() - (wire === null ? budget() + 1 : utf8Encode(wire).length);
+  const count = $("count");
+  count.textContent = String(left);
+  count.className = "count" + (left < 0 ? " over" : "");
+  const ok = canSend();
+  $("send").disabled = !ok || left < 0 || !typed;
+  $("text").placeholder = ok ? "Message " + (conv()?.title || "") : "Can't send right now";
+  $("gif-btn").hidden = !gifsOn() || !giphyKey();
+  $("advert").disabled = !ok;
+}
+
+function updateTitle() {
+  const n = Object.values(app.unread).reduce((a, b) => a + b, 0);
+  document.title = (n ? "(" + n + ") " : "") + "MeshCore Web";
+}
+
+// ---------------------------------------------------------------- emoji and GIF pickers
+
+let picker = null;              // {kind: "emoji" | "gif", react?: message to react to, tab?, seq?}
+
+const giphyKey = () => app.client?.hello?.giphy_key || "";
+
+// Text into the message box at the caret, with a space between it and words either side.
+function insertText(t, spaced = false) {
+  const ta = $("text");
+  const a = ta.selectionStart ?? ta.value.length, b = ta.selectionEnd ?? a;
+  const before = ta.value.slice(0, a), after = ta.value.slice(b);
+  const pre = spaced && before && !/\s$/.test(before) ? " " : "", post = spaced && !/^\s/.test(after) ? " " : "";
+  ta.value = before + pre + t + post + after;
+  const caret = (before + pre + t + post).length;
+  ta.setSelectionRange(caret, caret);
+  autosize();
+  updateComposer();
+  updateGifPreview();
+}
+
+function openPicker(kind, anchor, react = null) {
+  if (picker && picker.kind === kind && !picker.react === !react && !$("pick-pop").hidden) return closePicker();
+  closeReactPicker();
+  picker = { kind, react, tab: loadRecentEmoji().length ? -1 : 0, seq: 0 };
+  const pop = $("pick-pop");
+  pop.hidden = false;
+  $("gif-q").hidden = kind !== "gif";
+  $("pick-tabs").hidden = kind !== "emoji";
+  if (kind === "emoji") renderEmojiTab();
+  else {
+    $("gif-q").value = "";
+    searchGifs();
+    if (matchMedia("(hover: hover)").matches) $("gif-q").focus();   // (on a phone, not the keyboard at once)
+  }
+  placePicker(anchor);
+}
+
+function placePicker(anchor) {
+  const pop = $("pick-pop"), r = anchor.getBoundingClientRect(), w = pop.offsetWidth, h = pop.offsetHeight;
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.left)) + "px";
+  pop.style.top = (r.top - h - 6 >= 8 ? r.top - h - 6 : Math.min(window.innerHeight - h - 8, r.bottom + 6)) + "px";
+}
+
+function closePicker() {
+  picker = null;
+  $("pick-pop").hidden = true;
+}
+
+function renderEmojiTab() {
+  const recent = loadRecentEmoji();
+  const tabs = [...(recent.length ? [["🕘", "Recent", recent]] : []), ...EMOJI_CATEGORIES];
+  const at = Math.max(0, Math.min(tabs.length - 1, picker.tab + (recent.length ? 1 : 0)));
+  $("pick-tabs").replaceChildren(...tabs.map(([icon, name], i) => el("button", {
+    type: "button", role: "tab", title: name, "aria-label": name, class: i === at ? "on" : "", "aria-selected": String(i === at),
+    onclick: () => { picker.tab = i - (recent.length ? 1 : 0); renderEmojiTab(); $("pick-grid").scrollTop = 0; },
+  }, icon)));
+  const grid = $("pick-grid");
+  grid.className = "pick-grid";
+  grid.replaceChildren(...tabs[at][2].map((e) => el("button", { type: "button", "aria-label": e, onclick: () => pickEmoji(e) }, e)));
+  $("pick-foot").textContent = "";
+}
+
+function pickEmoji(e) {
+  saveRecentEmoji([e, ...loadRecentEmoji().filter((x) => x !== e)].slice(0, RECENT_MAX));
+  if (picker?.react) {
+    const m = picker.react;
+    closePicker();
+    return react(m, e);
+  }
+  insertText(e);
+}
+
+let gifTimer = null;
+async function searchGifs() {
+  const q = $("gif-q").value.trim(), seq = ++picker.seq, grid = $("pick-grid");
+  grid.className = "pick-grid gifs";
+  $("pick-foot").textContent = "Powered by GIPHY";
+  if (!grid.children.length) grid.replaceChildren(el("div", { class: "pick-msg" }, "Loading…"));
+  const url = "https://api.giphy.com/v1/gifs/" + (q ? "search" : "trending") + "?api_key=" + encodeURIComponent(giphyKey()) +
+    "&limit=24&rating=pg-13" + (q ? "&q=" + encodeURIComponent(q) : "");
+  let ids;
+  try {
+    const r = await fetch(url, { cache: "no-store", referrerPolicy: "no-referrer" });
+    if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? "Giphy refused this server's API key." : "Giphy answered " + r.status + ".");
+    ids = ((await r.json()).data || []).map((g) => String(g.id || "")).filter((id) => /^[A-Za-z0-9]{6,40}$/.test(id));
+  } catch (e) {
+    if (picker?.seq === seq) grid.replaceChildren(el("div", { class: "pick-msg" }, e.message.startsWith("Giphy") ? e.message : "Can't reach Giphy."));
+    return;
+  }
+  if (picker?.kind !== "gif" || picker.seq !== seq) return;
+  grid.replaceChildren(...(ids.length ? ids.map((id) => el("button", {
+    type: "button", "aria-label": "GIF", onclick: () => { closePicker(); insertText(gifPageUrl(id), true); $("text").focus(); },
+  }, el("img", { src: gifThumbUrl(id), alt: "", loading: "lazy" }))) : [el("div", { class: "pick-msg" }, "No GIFs found.")]));
+}
+
+function autosize() {
+  const ta = $("text");
+  ta.style.height = "auto";
+  ta.style.height = Math.min(ta.scrollHeight, 140) + "px";
+}
+
+// ---------------------------------------------------------------- @mention autocomplete
+
+let mention = null;             // {start, items, index} while the list is open
+
+// Names to offer for "@pre": people who wrote here lately first, then contacts, matching anywhere in the name.
+function mentionNames(pre) {
+  const score = new Map();
+  const add = (name, s) => {
+    if (!name || name === app.name || /[\]\n]/.test(name)) return;
+    score.set(name, Math.max(score.get(name) || 0, s));
+  };
+  const msgs = app.history[app.active] || [];
+  for (let i = msgs.length - 1, n = 0; i >= 0 && n < 200; i--, n++) if (!msgs[i].mine) add(msgs[i].sender, 3 + i / msgs.length);
+  for (const c of app.node.contacts.values()) if (c.type === "chat") add(c.name, c.lastHeard ? 1 + c.lastHeard / 1e10 : 1);
+  const p = pre.toLowerCase();
+  return [...score.entries()].filter(([n]) => n.toLowerCase().includes(p))
+    .sort((a, b) => (b[0].toLowerCase().startsWith(p) - a[0].toLowerCase().startsWith(p)) || b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 8).map(([n]) => n);
+}
+
+function updateMentions() {
+  const ta = $("text");
+  const before = ta.value.slice(0, ta.selectionStart);
+  const m = before.match(/(?:^|\s)@(\[?)([^\]\n@]*)$/);
+  const items = m && app.node ? mentionNames(m[2]) : [];
+  if (!items.length) return closeMentions();
+  mention = { start: before.length - m[2].length - m[1].length - 1, items, index: 0 };
+  renderMentions();
+}
+
+function renderMentions() {
+  const box = $("mentions");
+  box.replaceChildren(...mention.items.map((n, i) => el("button", {
+    type: "button", role: "option", class: i === mention.index ? "on" : "", "aria-selected": i === mention.index ? "true" : "false",
+    onmousedown: (e) => { e.preventDefault(); pickMention(i); },
+  }, "@" + n)));
+  box.hidden = false;
+}
+
+function pickMention(i) {
+  const ta = $("text");
+  const insert = "@[" + mention.items[i] + "] ";
+  ta.value = ta.value.slice(0, mention.start) + insert + ta.value.slice(ta.selectionStart);
+  const caret = mention.start + insert.length;
+  ta.setSelectionRange(caret, caret);
+  closeMentions();
+  updateComposer();
+  ta.focus();
+}
+
+function closeMentions() {
+  mention = null;
+  $("mentions").hidden = true;
+}
+
+function mentionKeys(e) {
+  if (!mention) return false;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    mention.index = (mention.index + (e.key === "ArrowDown" ? 1 : -1) + mention.items.length) % mention.items.length;
+    renderMentions();
+  } else if (e.key === "Enter" || e.key === "Tab") pickMention(mention.index);
+  else if (e.key === "Escape") closeMentions();
+  else return false;
+  e.preventDefault();
+  return true;
+}
+
+// ---------------------------------------------------------------- channels: join, details, leave
+
+let addKind = "hashtag";
+
+function openAdd() {
+  setAddKind("hashtag");
+  $("a-tag").value = "";
+  $("a-name").value = "";
+  $("a-secret").value = "";
+  showError("add-error", "");
+  $("dlg-add").showModal();
+  $("a-tag").focus();
+}
+
+function setAddKind(kind) {
+  addKind = kind;
+  for (const t of document.querySelectorAll("#dlg-add .tab")) t.classList.toggle("on", t.dataset.kind === kind);
+  for (const p of document.querySelectorAll("#dlg-add [data-pane]")) p.hidden = p.dataset.pane !== kind;
+}
+
+function addChannel(ev) {
+  ev.preventDefault();
+  let ch;
+  try {
+    if (addKind === "hashtag") {
+      let tag = $("a-tag").value.trim().replace(/\s+/g, "");
+      if (!tag.replace(/^#/, "")) throw new Error("Enter a hashtag.");
+      if (!tag.startsWith("#")) tag = "#" + tag;
+      ch = makeChannel(tag, "hashtag");
+    } else {
+      const name = $("a-name").value.trim();
+      if (!name) throw new Error("Give the channel a name.");
+      ch = makeChannel(name, "private", parseSecret($("a-secret").value));
+    }
+  } catch (e) {
+    return showError("add-error", e.message === "not hex" ? "The secret isn't hex." : e.message);
+  }
+  const existing = app.channels.find((c) => c.keyHex === ch.keyHex);
+  $("dlg-add").close();
+  if (existing) {
+    toast("You're already in " + existing.name + ".");
+    return select(existing.keyHex);
+  }
+  app.channels.push(ch);
+  persistChannels();
+  select(ch.keyHex);
+}
+
+// 32 hex characters, or base64 of 16 bytes
+function parseSecret(s) {
+  s = s.trim();
+  if (/^[0-9a-f\s]+$/i.test(s)) return s.replace(/\s+/g, "");
+  try {
+    const bin = atob(s);
+    if (bin.length === 16) return bytesToHex(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+  } catch {
+    // not base64 either
+  }
+  throw new Error("A secret is 32 hex characters.");
+}
+
+function openInfo() {
+  const cv = conv();
+  $("i-name").textContent = cv.title;
+  $("i-kind").textContent = cv.sub + ".";
+  const shown = cv.kind === "channel" ? (cv.channel.kind === "private" ? cv.channel.keyHex : "") : cv.contact.pubHex;
+  $("i-secret-box").hidden = !shown;
+  $("i-secret").value = shown;
+  $("i-secret-label").textContent = cv.kind === "channel" ? "Secret" : "Public key";
+  $("i-secret-hint").textContent = cv.kind === "channel" ? "Anyone with this secret can read and send on the channel."
+    : "Compare it with the one in their app to be sure who you're talking to.";
+  $("i-leave").hidden = cv.kind === "channel" && cv.channel.kind === "public";
+  $("i-leave").textContent = { channel: "Leave channel", dm: "Close conversation", room: "Leave room" }[cv.kind];
+  $("i-relogin").hidden = cv.kind !== "room";
+  const routed = cv.kind === "dm" || (cv.kind === "room" && !isLocalRoom(cv.contact.pubHex));
+  $("i-route-box").hidden = !routed;
+  if (routed) renderRouteBox(cv.contact, true);
+  $("dlg-info").showModal();
+}
+
+// Details: how to reach this contact or room. Automatic, a path set by hand, or flood; with the server's suggestions.
+async function renderRouteBox(c, fetch = false) {
+  const mode = c.routeMode === "manual" && c.manual ? "manual" : c.routeMode === "flood" ? "flood" : "auto";
+  for (const r of document.querySelectorAll('input[name="i-route"]')) r.checked = r.value === mode;
+  $("i-manual").value = c.manual ? pathText(c.manual).replace(/ › /g, ",") : "";
+  $("i-manual").disabled = mode !== "manual";
+  $("i-learned").textContent = c.outLen == null ? "No path learned yet: the next message tries the server's suggestions, then floods."
+    : "Learned from their answers: " + pathText({ plen: c.outLen, path: c.outPath }) + ".";
+  $("i-forget").hidden = c.outLen == null;
+  const list = $("i-suggested");
+  if (fetch) list.replaceChildren(el("li", { class: "dim" }, "Asking the server…"));
+  const paths = fetch ? await suggestPaths(c, true) : c.suggested?.paths || [];
+  if (conv()?.contact !== c) return;
+  list.replaceChildren(...(paths.length ? paths.map((p) => el("li", {},
+    el("span", { class: "mono" }, pathText(p)),
+    el("span", { class: "dim" }, " · " + Math.round(p.score * 100) + "% · " + ({ measured: "delivered on before", map: "from the map",
+      shortcut: "a shortcut", direct: "heard directly" }[p.source] || p.source) + (p.names?.some(Boolean) ? " · " + p.names.map((n) => n || "?").join(" › ") : "")),
+    " ", el("button", { type: "button", class: "ghost small", onclick: () => setRoute(c, "manual", p) }, "Use"))) :
+    [el("li", { class: "dim" }, "The server knows no path to them (it hasn't heard them flood lately).")]));
+}
+
+// Parse "a1,b2,c3" (or with spaces / ›): 1-, 2- or 3-byte repeater ids, all the same size. -> {plen, path} | null
+function parsePath(text) {
+  const ids = text.split(/[\s,›>]+/).filter(Boolean);
+  if (!ids.length || ids.length > 63 || !ids.every((x) => /^([0-9a-f]{2}){1,3}$/i.test(x))) return null;
+  const sz = ids[0].length / 2;
+  if (!ids.every((x) => x.length === sz * 2)) return null;
+  return { plen: ((sz - 1) << 6) | ids.length, path: hexToBytes(ids.join("").toLowerCase()) };
+}
+
+function setRoute(c, mode, manual = null) {
+  if (manual) c.manual = { plen: manual.plen, path: manual.path };
+  if (mode === "manual" && !c.manual) return toast("Enter a path first, like a1,b2,c3.");
+  c.routeMode = mode;
+  scheduleSave();
+  renderRouteBox(c);
+  $("room-sub").textContent = conv().sub;
+}
+
+function leaveConversation() {
+  const cv = conv();
+  if (!cv || (cv.kind === "channel" && cv.channel.kind === "public")) return;
+  if (!confirm(cv.kind === "room" ? "Leave " + cv.title + "? Its posts and saved password on this device are deleted too."
+    : (cv.kind === "dm" ? "Close the conversation with " : "Leave ") + cv.title + "? Its messages on this device are deleted too.")) return;
+  if (cv.kind === "channel") {
+    app.channels = app.channels.filter((c) => c !== cv.channel);
+    persistChannels();
+  } else if (cv.kind === "dm") app.dms = app.dms.filter((p) => p !== cv.contact.pubHex);
+  else cv.contact.room = null;
+  delete app.history[cv.key];
+  delete app.unread[cv.key];
+  flushSave();
+  $("dlg-info").close();
+  select(app.channels[0].keyHex);
+}
+
+function clearHistory() {
+  app.history[app.active] = [];
+  flushSave();
+  $("dlg-info").close();
+  renderConversation();
+}
+
+// ---------------------------------------------------------------- contacts, rooms, map
+
+let contactTab = "chat";
+
+function openContacts(tab = contactTab) {
+  contactTab = tab;
+  $("c-search").value = "";
+  renderContacts();
+  $("dlg-contacts").showModal();
+  $("c-search").focus();
+}
+
+function renderContacts() {
+  for (const t of document.querySelectorAll("#dlg-contacts .tab")) t.classList.toggle("on", t.dataset.ctab === contactTab);
+  const q = $("c-search").value.trim().toLowerCase();
+  const list = [...app.node.contacts.values()]
+    .filter((c) => (contactTab === "chat" ? c.type === "chat" || c.type === "sensor" : c.type === contactTab))
+    .filter((c) => !q || c.name.toLowerCase().includes(q) || c.pubHex.startsWith(q))
+    .sort((a, b) => (b.lastHeard || 0) - (a.lastHeard || 0) || contactName(a).localeCompare(contactName(b)));
+  $("c-list").replaceChildren(...(list.length ? list.slice(0, 300).map(contactRow)
+    : [el("p", { class: "empty" }, q ? "No match." : "None heard yet.")]));
+  const noun = { chat: "people", room: "rooms", repeater: "repeaters" }[contactTab];
+  $("c-note").textContent = list.length + " " + noun + (list.length > 300 ? " (the 300 heard most recently shown)" : "") + ". " +
+    (app.directoryError ? "The server's directory isn't available (" + app.directoryError + "): only adverts heard while you're here."
+      : "From the server's directory of the last " + DIRECTORY_DAYS + " days, refreshed every 15 minutes, and adverts heard while you're here.");
+}
+
+function contactRow(c) {
+  const acts = [];
+  if (c.type === "chat" && !c.partial) acts.push(el("button", { type: "button", class: "primary", onclick: () => { $("dlg-contacts").close(); openDm(c); } }, "Message"));
+  if (c.type === "room") acts.push(el("button", { type: "button", class: "primary", onclick: () => { $("dlg-contacts").close(); openRoom(c); } }, c.room ? "Open" : "Join"));
+  if (c.lat != null) acts.push(el("button", { type: "button", class: "ghost", onclick: () => { $("dlg-contacts").close(); openMap(c); } }, "Map"));
+  return el("div", { class: "contact" },
+    el("div", { class: "who" }, el("b", {}, contactName(c)),
+      el("span", { class: "mono" }, c.pubHex.slice(0, 8)), el("span", {}, " · heard " + ago(c.lastHeard)),
+      c.partial ? el("span", { title: "The server knows only part of this key. You can message them once their app adverts within range." },
+        " · can't DM yet") : null),
+    el("div", { class: "acts" }, ...acts));
+}
+
+function openDm(c) {
+  if (!app.dms.includes(c.pubHex)) app.dms = [c.pubHex, ...app.dms];
+  select("dm:" + c.pubHex);
+}
+
+let roomTarget = null;          // the room being joined from the dialog, when it was picked from a list
+
+function openRoom(c) {
+  if (c?.room) return select("room:" + c.pubHex);
+  roomTarget = c || null;
+  $("r-title").textContent = c ? "Join " + contactName(c) : "Join a room";
+  $("r-pick").hidden = !!c;
+  $("r-key").value = "";
+  $("r-pass").value = "";
+  showError("r-error", "");
+  $("r-known").replaceChildren(...[...app.node.contacts.values()].filter((x) => x.type === "room" && x.name)
+    .map((x) => el("option", { value: x.name })));
+  $("dlg-room").showModal();
+  (c ? $("r-pass") : $("r-key")).focus();
+}
+
+async function joinRoomFromDialog(ev) {
+  ev.preventDefault();
+  showError("r-error", "");
+  let c = roomTarget;
+  if (!c) {
+    const v = $("r-key").value.trim();
+    const byName = [...app.node.contacts.values()].filter((x) => x.type === "room" && x.name.toLowerCase() === v.toLowerCase());
+    if (/^[0-9a-f]{64}$/i.test(v)) c = app.node.contact(v.toLowerCase(), { type: "room" });
+    else if (byName.length === 1) c = byName[0];
+    else return showError("r-error", byName.length ? "Several rooms have that name: use its public key." :
+      "No room by that name has been heard. Give its public key (64 hex characters).");
+  }
+  if (!canSend()) return showError("r-error", "You can't send yet, so you can't log in to a room.");
+  $("r-go").disabled = true;
+  $("r-go").textContent = "Logging in…";
+  try {
+    await roomLogin(c, $("r-pass").value);
+    $("dlg-room").close();
+    select("room:" + c.pubHex);
+  } catch (e) {
+    c.room = null;
+    showError("r-error", e instanceof LoginFailed ? "Couldn't log in: " + e.message + "." : e.message);
+  } finally {
+    $("r-go").disabled = false;
+    $("r-go").textContent = "Join";
+  }
+}
+
+async function openMap(focus = null) {
+  $("dlg-map").showModal();
+  const nodes = [...app.node.contacts.values()];
+  $("map-note").textContent = "Loading the map…";
+  try {
+    const n = await showMap($("map-box"), nodes, {
+      serverBase: servedBy(), center: focus && focus.lat != null ? focus : null,
+      popup: (c) => el("div", { class: "map-pop" }, el("b", {}, contactName(c)),
+        el("span", {}, ({ chat: "Person", repeater: "Repeater", room: "Room", sensor: "Sensor" }[c.type] || c.type) +
+          " · " + c.pubHex.slice(0, 8) + " · heard " + ago(c.lastHeard)),
+        c.type === "chat" ? el("button", { type: "button", onclick: () => { $("dlg-map").close(); openDm(c); } }, "Message") : null,
+        c.type === "room" ? el("button", { type: "button", onclick: () => { $("dlg-map").close(); openRoom(c); } }, c.room ? "Open" : "Join") : null),
+    });
+    $("map-note").textContent = n + " of " + nodes.length + " known nodes have shared a position. Repeaters are blue, rooms purple, people green.";
+  } catch (e) {
+    $("map-note").textContent = "The map couldn't load: " + e.message + " (it needs the internet for the map tiles).";
+  }
+}
+
+// ---------------------------------------------------------------- wiring
+
+function wire() {
+  $("login-form").addEventListener("submit", login);
+  $("f-priv").addEventListener("input", updatePubPreview);
+  $("f-priv-gen").addEventListener("click", () => {
+    if ($("f-priv").value.trim() && !confirm("Replace this private key with a new one? A new key is a new node.")) return;
+    $("f-priv").value = Identity.generate().privateHex;
+    $("f-priv").type = "text";
+    $("f-priv-show").textContent = "Hide";
+    updatePubPreview();
+  });
+  $("f-priv-show").addEventListener("click", () => {
+    const shown = $("f-priv").type === "text";
+    $("f-priv").type = shown ? "password" : "text";
+    $("f-priv-show").textContent = shown ? "Show" : "Hide";
+  });
+  $("f-remember").addEventListener("change", () => { $("pass-box").hidden = !$("f-remember").checked; });
+  $("unlock-other").addEventListener("click", () => { setUnlockMode(false); $("f-priv").focus(); });
+  $("url-change").addEventListener("click", () => {
+    $("url-auto").hidden = true;
+    $("url-box").hidden = false;
+    $("f-url").value = "";
+    $("f-url").focus();
+  });
+  $("path-hash").value = String(pathHashSize());
+  $("path-hash").addEventListener("change", () => {
+    saveSettings({ ...loadSettings(), pathHash: Number($("path-hash").value) });
+    if (app.node) app.node.hashSize = pathHashSize();
+  });
+  $("theme").addEventListener("change", () => {
+    saveSettings({ ...loadSettings(), theme: $("theme").value });
+    applyTheme();
+  });
+  matchMedia("(prefers-color-scheme: light)").addEventListener?.("change", () => applyTheme());
+  $("show-gifs").checked = gifsOn();
+  $("show-gifs").addEventListener("change", () => {
+    saveSettings({ ...loadSettings(), gifs: $("show-gifs").checked });
+    if (app.identity) renderConversation();
+    updateGifPreview();
+  });
+  $("composer").addEventListener("submit", sendMessage);
+  $("send").addEventListener("mousedown", (e) => e.preventDefault());   // (a tap on Send leaves the keyboard up)
+  $("text").addEventListener("input", () => { autosize(); updateComposer(); updateGifPreview(); updateMentions(); });
+  $("text").addEventListener("click", updateMentions);
+  $("text").addEventListener("blur", () => setTimeout(closeMentions, 150));
+  $("text").addEventListener("keydown", (e) => {
+    if (mentionKeys(e)) return;
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) sendMessage(e);
+  });
+  $("add-channel").addEventListener("click", openAdd);
+  $("add-form").addEventListener("submit", addChannel);
+  for (const t of document.querySelectorAll("#dlg-add .tab")) t.addEventListener("click", () => setAddKind(t.dataset.kind));
+  $("a-gen").addEventListener("click", () => { $("a-secret").value = bytesToHex(randomBytes(16)); });
+  $("new-dm").addEventListener("click", () => openContacts("chat"));
+  $("join-room").addEventListener("click", () => openRoom(null));
+  $("room-form").addEventListener("submit", joinRoomFromDialog);
+  $("open-contacts").addEventListener("click", () => openContacts());
+  for (const t of document.querySelectorAll("#dlg-contacts .tab")) t.addEventListener("click", () => { contactTab = t.dataset.ctab; renderContacts(); });
+  $("c-search").addEventListener("input", renderContacts);
+  $("open-map").addEventListener("click", () => openMap());
+  $("channel-info").addEventListener("click", openInfo);
+  for (const r of document.querySelectorAll('input[name="i-route"]')) r.addEventListener("change", () => {
+    const c = conv()?.contact;
+    if (!c) return;
+    if (r.value === "manual" && !c.manual) {
+      $("i-manual").disabled = false;
+      return $("i-manual").focus();
+    }
+    setRoute(c, r.value);
+  });
+  $("i-manual-set").addEventListener("click", () => {
+    const c = conv()?.contact, p = parsePath($("i-manual").value);
+    if (!c) return;
+    if (!p) return toast("A path is repeater ids, all the same length: like a1,b2,c3 or a1b2,c3d4.");
+    setRoute(c, "manual", p);
+  });
+  $("i-forget").addEventListener("click", () => {
+    const c = conv()?.contact;
+    if (!c) return;
+    [c.outPath, c.outLen] = [new Uint8Array(0), null];
+    scheduleSave();
+    renderRouteBox(c);
+    $("room-sub").textContent = conv().sub;
+  });
+  $("i-leave").addEventListener("click", leaveConversation);
+  $("i-clear").addEventListener("click", clearHistory);
+  $("i-relogin").addEventListener("click", async () => {
+    const c = conv()?.contact;
+    $("dlg-info").close();
+    if (!c) return;
+    toast("Logging in to " + contactName(c) + "…");
+    try {
+      await roomLogin(c, c.room.password || "");
+    } catch (e) {
+      toast("Couldn't log in: " + e.message);
+    }
+  });
+  $("i-copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText($("i-secret").value);
+      toast("Copied.");
+    } catch {
+      $("i-secret").select();
+    }
+  });
+  $("advert").addEventListener("click", () => $("dlg-advert").showModal());
+  for (const b of document.querySelectorAll("[data-advert]")) b.addEventListener("click", () => advertise(b.dataset.advert));
+  for (const b of document.querySelectorAll("[data-close]")) b.addEventListener("click", () => b.closest("dialog").close());
+  $("logout").addEventListener("click", () => {
+    const s = loadSettings();
+    const forget = s.remember && confirm("Also forget your saved key on this device? (Your channels and messages are kept.)");
+    if (forget) {
+      const { url, name, gifs, theme, otherServer, pathHash } = s;
+      saveSettings({ url, name, gifs, theme, otherServer, pathHash, remember: false });
+    }
+    logout();
+  });
+  $("toggle-side").addEventListener("click", () => $("sidebar").classList.toggle("open"));
+  document.addEventListener("click", (e) => {
+    if (!$("react-pop").hidden && !e.target.closest("#react-pop, .react-btn")) closeReactPicker();
+    // (by the path the click took: a tab redraws itself, so its button may have left the page by now)
+    const inside = e.composedPath().some((n) => ["pick-pop", "emoji-btn", "gif-btn", "react-pop"].includes(n.id));
+    if (picker && !inside) closePicker();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && picker) { closePicker(); $("text").focus(); } });
+  for (const [id, kind] of [["emoji-btn", "emoji"], ["gif-btn", "gif"]]) {
+    $(id).addEventListener("mousedown", (e) => e.preventDefault());    // (the message box keeps focus, and the keyboard)
+    $(id).addEventListener("click", () => openPicker(kind, $("composer")));
+  }
+  $("gif-q").addEventListener("input", () => { clearTimeout(gifTimer); gifTimer = setTimeout(searchGifs, 350); });
+  $("pick-pop").addEventListener("mousedown", (e) => { if (e.target.closest("button")) e.preventDefault(); });
+  $("messages").addEventListener("scroll", closeReactPicker);
+  $("reply-cancel").addEventListener("click", () => setReply(null));
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && app.active && app.unread[app.active]) {
+      delete app.unread[app.active];
+      renderSidebar();
+      updateTitle();
+    }
+  });
+  window.addEventListener("pagehide", flushSave);
+}
+
+wire();
+applyTheme();
+fitToKeyboard();
+initLogin();
+
+return {  };
+})();
+</script>
+</head>
+<body>
+
+<main id="login" class="login" hidden>
+  <form id="login-form" class="card" autocomplete="off" novalidate>
+    <h1>MeshCore Web</h1>
+    <p class="sub">Chat on MeshCore channels through a pyMeshRoom radio. Your private key stays in this browser:
+      every message is encrypted and signed here.</p>
+    <p class="sub">Anyone can log in and read. You can send once this radio has heard your node on the mesh: the public
+      key that goes with your private key, in an advert from your MeshCore app (a flood advert reaches it from
+      further away).</p>
+
+    <p class="server-auto" id="url-auto" hidden>Server: <b id="url-host"></b>
+      <button type="button" id="url-change" class="linkish">Use another server</button></p>
+    <div id="url-box">
+      <label for="f-url">pyMeshRoom URL</label>
+      <input id="f-url" type="url" placeholder="https://meshroom.example.com" spellcheck="false" required>
+    </div>
+
+    <div id="unlock-box" hidden>
+      <label for="f-unlock">Passphrase</label>
+      <input id="f-unlock" type="password" placeholder="Unlocks the key saved on this device" autocomplete="current-password">
+      <p class="hint">Your private key is saved here, protected by this passphrase.
+        <button type="button" id="unlock-other" class="linkish">Use a different key</button></p>
+    </div>
+    <div id="priv-box">
+      <label for="f-priv">Private key</label>
+      <div class="row">
+        <input id="f-priv" type="password" placeholder="128 hex characters (or a 32-byte seed)" spellcheck="false" required>
+        <button type="button" id="f-priv-show" class="ghost" aria-label="Show private key">Show</button>
+        <button type="button" id="f-priv-gen" class="ghost">New</button>
+      </div>
+      <p class="hint" id="f-pub">Exported from a MeshCore app, or press New to make one. Keep a copy: a new key is a new node.</p>
+    </div>
+
+    <label for="f-name">Your name</label>
+    <input id="f-name" type="text" maxlength="31" placeholder="Shown before your messages" required>
+
+    <div id="sitepw-box" hidden>
+      <label for="f-sitepw">Server page password</label>
+      <input id="f-sitepw" type="password" placeholder="The password for this server's MeshCore Web" autocomplete="off">
+      <p class="hint">This server's MeshCore Web has a password, set by its admin.</p>
+    </div>
+
+
+    <label class="check"><input id="f-remember" type="checkbox" checked> Remember me on this device, and connect by myself next time</label>
+    <div id="pass-box" hidden>
+      <label for="f-pass">Passphrase <span class="opt">(optional)</span></label>
+      <input id="f-pass" type="password" placeholder="Protects the saved key" autocomplete="new-password">
+      <p class="hint">With a passphrase the saved key is encrypted, and you type the passphrase instead of the key next
+        time. Without one, anyone using this browser can use your key.</p>
+    </div>
+
+    <p class="error" id="login-error" role="alert" hidden></p>
+    <button type="submit" id="login-go" class="primary">Connect</button>
+  </form>
+</main>
+
+<div id="chat" class="chat" hidden>
+  <aside id="sidebar" class="sidebar">
+    <header class="side-head">
+      <div class="identity">
+        <span class="dot" id="conn-dot" title="Disconnected"></span>
+        <div>
+          <div class="me-name" id="me-name"></div>
+          <div class="me-key" id="me-key"></div>
+        </div>
+      </div>
+    </header>
+    <div class="side-scroll">
+      <h2 class="sect">Channels <button type="button" id="add-channel" class="sect-add" title="Join a channel" aria-label="Join a channel">+</button></h2>
+      <nav class="channels" id="channel-list" aria-label="Channels"></nav>
+      <h2 class="sect">Direct messages <button type="button" id="new-dm" class="sect-add" title="Message someone" aria-label="Message someone">+</button></h2>
+      <nav class="channels" id="dm-list" aria-label="Direct messages"></nav>
+      <h2 class="sect">Rooms <button type="button" id="join-room" class="sect-add" title="Join a room" aria-label="Join a room">+</button></h2>
+      <nav class="channels" id="room-list" aria-label="Rooms"></nav>
+    </div>
+    <div class="side-actions">
+      <div class="two">
+        <button type="button" id="open-contacts" class="ghost">Contacts</button>
+        <button type="button" id="open-map" class="ghost">Map</button>
+      </div>
+      <button type="button" id="advert" class="ghost wide">Advertise me</button>
+      <label class="check side-check"><input id="show-gifs" type="checkbox"> Show GIFs from Giphy</label>
+      <label class="side-check side-select" title="How many bytes of each repeater's id the floods you send collect in their path (MeshCore's path hash mode). Longer ids mix up fewer repeaters, so the routes learned from them are surer; very old repeater firmware only knows 1 byte">Path ids
+        <select id="path-hash"><option value="1">1 byte</option><option value="2">2 bytes</option><option value="3">3 bytes</option></select>
+      </label>
+      <label class="side-check side-select">Theme
+        <select id="theme"><option value="dark">Dark</option><option value="light">Light</option><option value="system">Follow the system</option></select>
+      </label>
+      <button type="button" id="logout" class="ghost wide">Log out</button>
+    </div>
+    <footer class="server" id="server-info"></footer>
+  </aside>
+
+  <section class="room">
+    <header class="room-head">
+      <button type="button" id="toggle-side" class="ghost icon" aria-label="Channels">☰</button>
+      <div class="room-title">
+        <h2 id="room-name"></h2>
+        <div class="room-sub" id="room-sub"></div>
+      </div>
+      <button type="button" id="channel-info" class="ghost">Details</button>
+    </header>
+    <div class="banner" id="banner" hidden></div>
+    <div class="messages" id="messages" aria-live="polite"></div>
+    <div class="gif-preview" id="gif-preview" hidden></div>
+    <div class="mentions" id="mentions" role="listbox" aria-label="Mention someone" hidden></div>
+    <div class="reply-bar" id="reply-bar" hidden>
+      <span class="reply-label">Replying to <b id="reply-name"></b> <span id="reply-quote" class="dim"></span></span>
+      <button type="button" id="reply-cancel" class="ghost icon" aria-label="Don't reply" title="Don't reply">×</button>
+    </div>
+    <form class="composer" id="composer" autocomplete="off">
+      <button type="button" id="emoji-btn" class="ghost tool" aria-label="Emoji" title="Emoji">😊</button>
+      <button type="button" id="gif-btn" class="ghost tool gif-tool" aria-label="GIF" title="GIFs from Giphy" hidden>GIF</button>
+      <textarea id="text" rows="1" placeholder="Message" aria-label="Message" autocomplete="off" autocapitalize="sentences"
+        enterkeyhint="send" inputmode="text" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"></textarea>
+      <span class="count" id="count"></span>
+      <button type="submit" id="send" class="primary">Send</button>
+    </form>
+  </section>
+</div>
+
+<dialog id="dlg-add">
+  <form method="dialog" id="add-form" class="card" novalidate>
+    <h3>Join a channel</h3>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-kind="hashtag" class="tab on">Hashtag</button>
+      <button type="button" role="tab" data-kind="private" class="tab">Private</button>
+    </div>
+    <div data-pane="hashtag">
+      <label for="a-tag">Hashtag</label>
+      <input id="a-tag" type="text" placeholder="#weather" spellcheck="false">
+      <p class="hint">Anyone who knows the name can read a hashtag channel: its key comes from the name.</p>
+    </div>
+    <div data-pane="private" hidden>
+      <label for="a-name">Name</label>
+      <input id="a-name" type="text" placeholder="Ops" maxlength="32">
+      <label for="a-secret">Secret</label>
+      <div class="row">
+        <input id="a-secret" type="text" placeholder="32 hex characters" spellcheck="false">
+        <button type="button" id="a-gen" class="ghost">New</button>
+      </div>
+      <p class="hint">Paste the secret you were given, or press New to make a channel and share its secret.</p>
+    </div>
+    <p class="error" id="add-error" role="alert" hidden></p>
+    <div class="buttons">
+      <button type="button" class="ghost" data-close>Cancel</button>
+      <button type="submit" class="primary" id="add-go">Join</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-motd" aria-labelledby="motd-title">
+  <div class="card">
+    <h3 id="motd-title">From this server</h3>
+    <p class="motd" id="motd-text"></p>
+    <label class="check"><input type="checkbox" id="motd-hide"> Don't show this again</label>
+    <div class="buttons">
+      <button type="button" class="primary" id="motd-ok">OK</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="dlg-info">
+  <div class="card">
+    <h3 id="i-name"></h3>
+    <p id="i-kind"></p>
+    <div id="i-secret-box" hidden>
+      <label for="i-secret" id="i-secret-label">Secret</label>
+      <div class="row">
+        <input id="i-secret" type="text" readonly spellcheck="false">
+        <button type="button" id="i-copy" class="ghost">Copy</button>
+      </div>
+      <p class="hint" id="i-secret-hint">Anyone with this secret can read and send on the channel.</p>
+    </div>
+    <div id="i-route-box" class="route-box" hidden>
+      <label>Route</label>
+      <div class="route-modes">
+        <label class="check"><input type="radio" name="i-route" value="auto"> Automatic</label>
+        <label class="check"><input type="radio" name="i-route" value="manual"> Set by hand</label>
+        <label class="check"><input type="radio" name="i-route" value="flood"> Flood</label>
+      </div>
+      <p class="hint">Automatic: the path learned from their answers, else the server's suggestions, and a flood as the
+        last try. A path that gets through is kept; one that fails is dropped.</p>
+      <div class="row">
+        <input id="i-manual" type="text" placeholder="Repeater ids: a1,b2,c3" spellcheck="false" autocomplete="off">
+        <button type="button" id="i-manual-set" class="ghost">Set</button>
+      </div>
+      <p class="hint"><span id="i-learned"></span> <button type="button" id="i-forget" class="linkish">Forget it</button></p>
+      <label>The server suggests</label>
+      <ul class="suggested" id="i-suggested"></ul>
+    </div>
+    <div class="buttons">
+      <button type="button" class="danger" id="i-leave">Leave channel</button>
+      <button type="button" class="ghost" id="i-relogin" hidden>Log in again</button>
+      <button type="button" class="ghost" id="i-clear">Clear history</button>
+      <button type="button" class="primary" data-close>Done</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="dlg-contacts" class="wide">
+  <div class="card">
+    <h3>Contacts</h3>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-ctab="chat" class="tab on">People</button>
+      <button type="button" role="tab" data-ctab="room" class="tab">Rooms</button>
+      <button type="button" role="tab" data-ctab="repeater" class="tab">Repeaters</button>
+    </div>
+    <input id="c-search" type="search" placeholder="Search by name or key" spellcheck="false" aria-label="Search contacts">
+    <div class="contact-list" id="c-list"></div>
+    <p class="hint" id="c-note"></p>
+    <div class="buttons"><button type="button" class="primary" data-close>Done</button></div>
+  </div>
+</dialog>
+
+<dialog id="dlg-map" class="wide">
+  <div class="card">
+    <h3>Map</h3>
+    <div class="map" id="map-box"></div>
+    <p class="hint" id="map-note"></p>
+    <div class="buttons"><button type="button" class="primary" data-close>Done</button></div>
+  </div>
+</dialog>
+
+<dialog id="dlg-room">
+  <form method="dialog" id="room-form" class="card" novalidate>
+    <h3 id="r-title">Join a room</h3>
+    <div id="r-pick">
+      <label for="r-key">Room</label>
+      <input id="r-key" type="text" list="r-known" placeholder="Its name, or public key in hex" spellcheck="false">
+      <datalist id="r-known"></datalist>
+    </div>
+    <label for="r-pass">Password</label>
+    <input id="r-pass" type="password" maxlength="15" placeholder="The room's password (empty for none)">
+    <p class="hint">Rooms keep their posts and send you the ones you missed. The password is saved on this device to
+      log in again next time.</p>
+    <p class="error" id="r-error" role="alert" hidden></p>
+    <div class="buttons">
+      <button type="button" class="ghost" data-close>Cancel</button>
+      <button type="submit" class="primary" id="r-go">Join</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-advert">
+  <div class="card">
+    <h3>Advertise me</h3>
+    <p>An advert tells other nodes your name and public key, so their apps can show who you are and DM you.
+      It is signed with your private key, here in the browser.</p>
+    <div class="buttons stack">
+      <button type="button" class="primary" data-advert="flood">To the whole mesh (flood)</button>
+      <button type="button" class="ghost" data-advert="zero">Only to nodes near the radio</button>
+      <button type="button" class="ghost" data-close>Cancel</button>
+    </div>
+  </div>
+</dialog>
+
+<div class="react-pop" id="react-pop" role="menu" aria-label="React" hidden></div>
+<div class="pick-pop" id="pick-pop" hidden>
+  <div class="pick-tabs" id="pick-tabs" role="tablist"></div>
+  <input id="gif-q" type="search" placeholder="Search Giphy" aria-label="Search Giphy" autocomplete="off" hidden>
+  <div class="pick-grid" id="pick-grid"></div>
+  <div class="pick-foot" id="pick-foot"></div>
+</div>
+<div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

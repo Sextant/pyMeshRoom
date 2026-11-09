@@ -23,7 +23,9 @@ Usage:
 import argparse
 import hashlib
 import heapq
+import itertools
 import hmac
+import ipaddress
 import collections
 import gzip
 import json
@@ -35,12 +37,15 @@ import math
 import os
 import queue
 import random
+import re
 import signal
 import sqlite3
 import struct
 import sys
 import threading
 import time
+import types
+import urllib.parse
 
 try:
     import serial
@@ -55,7 +60,7 @@ except ImportError:
     sys.exit("cryptography missing:  sudo apt install python3-cryptography")
 
 log = logging.getLogger("meshroom")
-FIRMWARE_VERSION = "meshroom-py 4.8"
+FIRMWARE_VERSION = "meshroom-py 4.9"
 FIRMWARE_VER_LEVEL = 1
 
 # ============================================================================
@@ -65,7 +70,7 @@ FIRMWARE_VER_LEVEL = 1
 DEFAULT_CONFIG = {
     "serial": "/dev/ttyACM0",
     "baud": 115200,
-    "name": "Pi Room",
+    "name": "pyMeshRoom",           # this server's name on its dashboard (each room has its own)
     "lat": 0.0,
     "lon": 0.0,
     # Empty means disabled for admin, and open for the room.  Never give a
@@ -88,6 +93,14 @@ DEFAULT_CONFIG = {
     "radio_sf": 7,
     "radio_cr": 5,
     "radio_tx_power_dbm": None,     # None = leave the modem's default
+    "tx_duty_pct": 50,              # airtime ceiling: all this radio sends together, % of the time (see Airtime)
+    "tx_weight_control": 10,        #   weights: each class's guaranteed share of it is its weight over the sum of all
+    "tx_weight_relay": 15,          #   that are on. Control: ACKs, replies and path returns; relay: the virtual repeater
+    "tx_weight_room": 10,           #   (when on); room: message delivery to members (all rooms);
+    "tx_weight_web": 5,             #   web: MeshCore Web users;
+    "tx_weight_companion": 2,       #   companion: the virtual companion (when on);
+    "tx_weight_kaas": 3,            #   kaas: API clients;
+    "tx_weight_background": 5,      #   background: adverts and traces
     "route_halflife_h": 6,          # how fast route/member-location evidence fades (nodes move)
     "topology_halflife_h": 24,      # how fast the repeater map fades (repeaters rarely move)
     "routes_per_member": 6,         # proven routes kept per member
@@ -100,7 +113,8 @@ DEFAULT_CONFIG = {
     "trace_min_interval_s": 120,    # ... but never more often than this
     "extra_acks": 1,                # ACKs for posts: 1 = send a second ACK (on a 2nd confident route if there is one), 0 = single
     "mqtt_enabled": False,          # MQTT augmentation: also listen to the observer network (RF stays the fallback)
-    "mqtt_ack_ingest": True,        #   ACK ingestion: observers' ACKs confirm deliveries (no route credit)
+    "mqtt_ack_ingest": False,       #   ACK ingestion: observers' ACKs confirm deliveries (no route credit). Off by
+                                    #   default: anyone who can publish to the feed could mark a post delivered
     "mqtt_msg_ingest": True,        #   message ingestion: posts to the room captured by observers
     "mqtt_topo_ingest": True,       #   topology ingestion: links + SNR between repeaters we already know (never routes)
     "mqtt_advert_ingest": True,     #   advert ingestion: names, positions, where companions are (half weight)
@@ -129,7 +143,8 @@ DEFAULT_CONFIG = {
     # MQTT observer is opt-in.  Disabled keeps MeshRoom's normal runtime free
     # of both the MQTT dependency and all observer activity.
     "observer_enabled": False,
-    "observer_iata": "SJC",
+    "observer_identity": "",        #   who it reports as: "repeater" (the virtual repeater) or a room's public key (hex)
+    "observer_iata": "",
     "observer_status": True,
     "observer_packets": True,
     "observer_rx": True,
@@ -150,9 +165,221 @@ DEFAULT_CONFIG = {
     "repeater_flood_advert_interval_h": 12,   # flood advert (0 = off)
     "repeater_scope_mode": "allow", #   scoped (region) floods: "allow" = relay only these regions, "deny" = all but these
     "repeater_regions": [],         #   region names ("#name" or "name"); unscoped floods are always relayed
-    "repeater_airtime_pct": 10,     #   relays may use at most this share of airtime (100 = no cap)
     "repeater_loop_detect": "minimal",        # off / minimal / moderate / strict (the firmware's loop.detect)
+    "companion_enabled": False,     # virtual companion: a chat node on the room's radio that MeshCore apps connect to over TCP
+    "companion_name": "pyMeshRoom Companion",
+    "companion_key": "",            #   private key, hex: 32-byte seed or 64-byte MeshCore key ("" = make one, saved here)
+    "companion_port": 5000,         #   TCP port (as WiFi companion firmware); only open while the companion is enabled
+    "companion_bind": "0.0.0.0",    #   address the port listens on ("127.0.0.1" = this machine only)
+    "companion_allow": [],          #   IP addresses / networks allowed to connect ([] = anyone who can reach the port)
+    "companion_lat": 0.0,           #   its position (set from the app; shared in adverts only if the app says so)
+    "companion_lon": 0.0,
+    "companion_auto_advert": False, #   advert on its own every companion_advert_interval_min
+    "companion_advert_interval_min": 60,
+    "companion_advert_flood": False,          # auto adverts: flood (whole mesh) instead of zero-hop
+    "tenant_rooms": [],             # tenant rooms: [{"name", "path", "public_key"}]; everything else is in tenants/{key}.db
+    "kaas_keys": [],                # KaaS API keys (made on the dashboard): only a hash of each key is kept, never the key
+    "kaas_send_burst": 3,           #   per key: at most this many packets...
+    "kaas_send_window_s": 20,       #   ...in any this many seconds (ACKs and path returns excepted)
+    "web_login": False,             # MeshCore Web: people log in by signing with their node's private key (no API key)
+    "web_max_clients": 32,          #   web sessions at once (bots' API keys have their own limit)
+    "web_approved": [],             #   public keys (hex) the admin let send although never heard on this radio
+    "web_banned": [],               #   [{"pub", "name", "ts"}]: may not log in
+    "web_banned_ips": [],           #   [{"ip", "name", "ts"}]: addresses refused MeshCore Web logins and sessions
+    "web_unknown_key_message":      #   what a web user whose key may not send yet is told
+        "Your key must be heard on RF before you can send messages. Please send a flood advert.",
+    "web_motd_enabled": False,      #   show web users a message of the day when they log in...
+    "web_motd": "",                 #   ...this one (plain text, line breaks kept; at most 1000 characters)
+    "web_hosts": [],                #   the names MeshCore Web is reached by (a domain, a proxy): logins signed for others are refused
+    "web_page_password": "",        #   a password for the MeshCore Web page and its logins (hashed; "" = none)
+    "web_giphy_key": "",            #   a Giphy API key for MeshCore Web's GIF picker ("" = no picker; links still show)
+    "web_backlog_days": 30,         #   keep channel messages and DMs this many days, so web users catch up (0 = off)
+    "web_backlog_mqtt": False,      #   ...including those MQTT observers reported (each packet is kept once)
 }
+
+
+# The dashboard's headers. Its scripts are inline (and so are its handlers), so the policy can't pin them by hash; it
+# keeps everything else to this server: no script, stylesheet, connection or form target elsewhere, except Leaflet
+# (from unpkg when it isn't installed locally) and the map tiles. Never framed.
+DASHBOARD_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; "
+                               "style-src 'self' 'unsafe-inline' https://unpkg.com; "
+                               "img-src 'self' data: https://unpkg.com https://tile.openstreetmap.org "
+                               "https://*.tile.openstreetmap.org; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+                               "form-action 'self'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "strict-origin-when-cross-origin"}
+
+HTTP_TIMEOUT_S = 30                   # a dashboard / API connection idle (or trickling) this long is closed
+HTTP_MAX_BODY = 64 * 1024             # a request body larger than this is refused (413)
+FAIL_LIMIT = 20                       # wrong passwords / keys / tickets from one address within FAIL_WINDOW_S...
+FAIL_WINDOW_S = 600                   # ...and its POSTs and websockets get 429 until the oldest is this old
+CROSS_SITE_POSTS = {"/api/v1/web/challenge", "/api/v1/web/login", "/api/v1/web/ticket"}   # (CORS: any origin)
+HTTP_MAX_THREADS = 400                # connections beyond this many threads in the process are closed at once
+# per visitor's address (not for private addresses: the LAN, or a proxy that doesn't say who it forwarded for)
+LAN_NETS = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")]
+IP_LOGINS_PER_MIN = 10                # web login challenges an address may ask for a minute
+IP_WS_PER_MIN = 30                    # websockets an address may open a minute (web logins and API keys)
+IP_WEB_SESSIONS = 4                   # web sessions open at once from an address
+KAAS_MSG_RATE = 20                    # messages a second a websocket client may send, on average...
+KAAS_MSG_BURST = 40                   # ...in bursts of up to this many; one this far over the limit is disconnected
+
+REPEATERS_MAX = 2000                  # repeaters known by key (heard, or from MQTT): beyond it the longest silent go
+
+
+class RepeaterTable(dict):
+    """The repeater table: adding a new one past REPEATERS_MAX drops the tenth that advertised longest ago (never the
+    one keep() says is ours), so neither the air nor an MQTT feed can grow it without end."""
+
+    def __init__(self, keep):
+        super().__init__()
+        self.keep = keep
+
+    def __setitem__(self, k, v):
+        new = k not in self
+        super().__setitem__(k, v)
+        if new and len(self) > REPEATERS_MAX:
+            old = sorted((r.get("last_advert") or 0, pub) for pub, r in self.items() if pub != k and not self.keep(pub))
+            for _, pub in old[:len(self) - REPEATERS_MAX + REPEATERS_MAX // 10]:
+                del self[pub]
+
+
+TX_CLASSES = ("control", "relay", "room", "web", "companion", "kaas", "background")
+TX_BUCKET_S = 60                      # each share saves up at most this many seconds' worth, so a burst goes at once
+TX_STALE_S = {"relay": 20.0, "web": 120.0, "companion": 120.0, "kaas": 120.0}   # held this long past due by the
+                                      # airtime limits: dropped (a late relay is useless)
+TX_USAGE_S = 600                      # airtime used, as the dashboard shows it: over the last 10 minutes
+TX_CONTROL_OVER_MS = 10000            # the rooms' ACKs and replies may go this far over the ceiling before they wait too
+
+
+def tx_class(pkt, deferrable, relay, src, tag):
+    """Which share of airtime a packet comes out of."""
+    if relay:
+        return "relay"
+    if src == "vc":
+        return "companion"
+    if tag is not None:                                     # (conn, request id) of a KaaS client
+        return "web" if getattr(tag[0], "web", None) else "kaas"
+    if pkt.ptype in (PT_ADVERT, PT_TRACE):
+        return "background"
+    return "room" if deferrable else "control"
+
+
+class Airtime:
+    """One ceiling for everything this radio sends (tx_duty_pct of the time), and a guaranteed share of it for each
+    class of traffic, in proportion to its weight among the classes that are on (off() names those that aren't: the
+    virtual repeater or companion when disabled), like Linux's HTB: a class spends its own share first, then borrows what the others leave unused,
+    up to the ceiling. So a class alone on the air may use the whole ceiling; when all are busy, each still gets its
+    share. Token buckets in ms of airtime, refilled at their rates and holding TX_BUCKET_S worth. Sending always
+    charges the ceiling's bucket (down to minus its depth); borrowing needs it positive. The rooms' ACKs and replies
+    (control), useless late, may also go over the ceiling by up to TX_CONTROL_OVER_MS, a burst; only after that do
+    they wait like the rest."""
+
+    def __init__(self, cfg, off=lambda: ()):
+        self.cfg, self.off = cfg, off
+        self.t = self.start = time.monotonic()
+        self.own = dict.fromkeys(TX_CLASSES)
+        self.pool = None
+        self.used = collections.deque()                     # (monotonic, class, ms), the last TX_USAGE_S
+        self.dropped = dict.fromkeys(TX_CLASSES, 0)
+
+    def weights(self):
+        """{class: weight}, 0 for a class that's off."""
+        off = set(self.off())
+        return {k: 0.0 if k in off else max(0.0, float(getattr(self.cfg, "tx_weight_" + k, 0) or 0)) for k in TX_CLASSES}
+
+    def rates(self):
+        """(ceiling, {class: guaranteed share}) as fractions of the time: the ceiling split by weight."""
+        ceiling = max(1.0, min(100.0, float(getattr(self.cfg, "tx_duty_pct", 50) or 0))) / 100.0
+        w = self.weights()
+        total = sum(w.values())
+        return ceiling, {k: ceiling * v / total if total else 0.0 for k, v in w.items()}
+
+    def refill(self):
+        now = time.monotonic()
+        dt, self.t = max(0.0, now - self.t) * 1000.0, now
+        ceiling, shares = self.rates()
+        cap = ceiling * TX_BUCKET_S * 1000.0
+        self.pool = cap if self.pool is None else min(cap, self.pool + dt * ceiling)
+        for k, r in shares.items():
+            depth = r * TX_BUCKET_S * 1000.0
+            self.own[k] = depth if self.own[k] is None else min(depth, self.own[k] + dt * r)
+        return cap
+
+    def can(self, cls, ms):
+        """May a packet of this class, ms long, go now? (A full bucket lets even a packet longer than it go.)"""
+        cap = self.refill()
+        if cls == "control":
+            return self.own[cls] >= ms or self.pool >= min(ms, cap) - TX_CONTROL_OVER_MS
+        return self.own[cls] >= ms or self.pool >= min(ms, cap)
+
+    def charge(self, cls, ms):
+        cap = self.refill()
+        _, shares = self.rates()
+        if self.own[cls] >= ms:
+            self.own[cls] -= ms
+        self.pool = max(self.pool - ms, -cap - TX_CONTROL_OVER_MS)
+        now = time.monotonic()
+        self.used.append((now, cls, ms))
+        while self.used and now - self.used[0][0] > TX_USAGE_S:
+            self.used.popleft()
+
+    def state(self):
+        ceiling, shares = self.rates()
+        now = time.monotonic()
+        span = max(60.0, min(float(TX_USAGE_S), now - self.start)) * 1000.0
+        used = dict.fromkeys(TX_CLASSES, 0.0)
+        for t, k, ms in self.used:
+            if now - t <= TX_USAGE_S:
+                used[k] += ms
+        r = lambda x: round(100.0 * x, 1)
+        w, off = self.weights(), set(self.off())
+        return dict(ceiling_pct=r(ceiling), share_pct={k: r(v) for k, v in shares.items()},
+                    weight={k: getattr(self.cfg, "tx_weight_" + k, 0) for k in TX_CLASSES}, off=sorted(off),
+                    weight_total=round(sum(w.values()), 2),
+                    used_pct={k: r(v / span) for k, v in used.items()}, total_pct=r(sum(used.values()) / span),
+                    dropped=dict(self.dropped), window_s=int(span / 1000))
+
+
+def airtime_changes(body):
+    """Dashboard airtime settings -> {config key: value}, validated."""
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    ch = {}
+
+    def pct(v, what, lo):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("%s: not a number" % what)
+        if not lo <= v <= 100:
+            raise ValueError("%s: %g to 100 %%" % (what, lo))
+        return int(v) if v == int(v) else v
+    if "duty_pct" in body:
+        ch["tx_duty_pct"] = pct(body["duty_pct"], "ceiling", 1)
+    weights = body.get("weight") or {}
+    if not isinstance(weights, dict):
+        raise ValueError("bad request")
+    for k, v in weights.items():
+        if k not in TX_CLASSES:
+            raise ValueError("unknown class %r" % k)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("%s: not a number" % k)
+        if not 0 <= v <= 10000:
+            raise ValueError("%s: a weight of 0 to 10000" % k)
+        ch["tx_weight_" + k] = int(v) if v == int(v) else v
+    return ch
+
+
+def valid_iata(code):
+    """An observer's region code: three letters (an airport code, like SJC)."""
+    return isinstance(code, str) and len(code) == 3 and code.isascii() and code.isalpha() and code.isupper()
+
+
+# settings older versions had: ignored quietly
+RETIRED_SETTINGS = {"web_trust_observers", "repeater_airtime_pct", "kaas_airtime_pct", "tx_share_control_pct",
+                    "tx_share_relay_pct", "tx_share_room_pct", "tx_share_users_pct", "tx_share_background_pct"}
 
 
 class Config:
@@ -182,6 +409,8 @@ class Config:
             log.warning("created default config %s - edit passwords and serial port", path)
 
     def _take(self, k, v, section):
+        if k in RETIRED_SETTINGS:
+            return                                          # (no longer a setting: left in the file, unused)
         if k not in DEFAULT_CONFIG:
             log.warning("config: '%s'%s is not a setting this version uses (ignored)", k, " in section '%s'" % section if section else "")
         self.data[k] = v
@@ -193,7 +422,8 @@ class Config:
         except KeyError:
             raise AttributeError(k)
 
-    def set(self, k, v):
+    def set(self, k, v, save=True):
+        """Change a setting, and write the file (unless save=False: the caller saves later, see save())."""
         self.data[k] = v
         sec = self.where.get(k)
         if sec is not None and isinstance(self.layout.get(sec), dict):
@@ -201,7 +431,8 @@ class Config:
         else:
             self.layout[k] = v
             self.where[k] = None
-        self.save()
+        if save:
+            self.save()
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -251,18 +482,34 @@ POST_SYNC_DELAY_SECS = 6
 MAX_POST_TEXT_LEN = 160 - 9
 SYNC_SKIP_INTERVAL = 0.15
 
-PUSH_ATTEMPTS = 4                 # current route x2, best other route, flood
+PLAN_ROUTES = 4                   # attempt plan: the top routes, then PLAN_FLOODS floods
+PLAN_FLOODS = 2
 ROUTES_PER_MEMBER = 3
 ROUTE_DROP_FAILS = 2
 ROUTE_HALFLIFE_H = 24
 ROUTE_MAX_AGE_D = 7
-FLOOD_ACK_MIN = 25.0
-RETRY_BEFORE_SUSPEND_S = 60      # one retry (best route + flood) a minute after a plan fails, then suspension
+FLOOD_ACK_S = 30.0               # wait for a flood's ACK
+DIRECT_ACK_MAX_S = 60.0          # cap on a direct attempt's wait (firmware formula, see ack_wait)
+LATE_ACK_S = 120                 # an attempt's ACK still credits its route this long after its own timeout
+PACE_MAX_HOPS = 2                # only pushes over routes this short count toward the shared pace (local congestion)
+RETRY_BEFORE_SUSPEND_S = 60      # one retry (best route + floods) a minute after a plan fails, then suspension
 SUSPENDED_PROBE_S = 6 * 3600     # while suspended: a single flood this often, in case they listen but never transmit
 MAX_NEIGHBOURS = 50
 NAME_CACHE_MAX = 1000
+NODES_MAX = 5000                 # every node heard advertising (any type), kept with its full key: the oldest go first
+NODES_ANSWER_MAX = 2000                # a KaaS "nodes" answer: at most this many, the most recently heard
+ROOM_ANSWER_MAX = 500                 # posts in one "room" answer (a web login reading a room on this server)
 
 SLOT_FLOOD = "flood"
+
+
+def ack_wait(plen, airtime_ms):
+    """Seconds to wait for an ACK. Direct: the firmware's own timeout (SEND_TIMEOUT_BASE_MILLIS 500 +
+    (DIRECT_SEND_PERHOP_FACTOR 6 x airtime + DIRECT_SEND_PERHOP_EXTRA_MILLIS 250) per leg, hops + 1 legs), capped.
+    Flood (plen None): FLOOD_ACK_S."""
+    if plen is None:
+        return FLOOD_ACK_S
+    return min((500 + (airtime_ms * 6 + 250) * ((plen & 63) + 1)) / 1000.0, DIRECT_ACK_MAX_S)
 
 
 def path_bytes(path_len):
@@ -283,6 +530,9 @@ def hexs(b):
 
 def now_s():
     return int(time.time())
+
+
+MAP_MAX_AGE_S = 72 * 3600             # repeaters not heard for this long are left off the map
 
 
 # ============================================================================
@@ -438,7 +688,7 @@ _ED_B = _ed_base()
 
 
 class RepeaterIdentity:
-    """The virtual repeater's own key, from the config: a 32-byte seed or a 64-byte MeshCore private key."""
+    """The virtual repeater's (or companion's) own key, from the config: a 32-byte seed or a 64-byte MeshCore private key."""
 
     def __init__(self, key):
         if len(key) == 32:
@@ -450,12 +700,17 @@ class RepeaterIdentity:
         self._a = int.from_bytes(key[:32], "little") & ((1 << 255) - 1)
         self._prefix = key[32:]
         self.pub_key = _ed_encode(_ed_mul(self._a, _ED_B))
+        self._x = X25519PrivateKey.from_private_bytes(key[:32])   # (the virtual companion's key exchange)
 
     def sign(self, msg):
         r = int.from_bytes(hashlib.sha512(self._prefix + msg).digest(), "little") % _ED_L
         big_r = _ed_encode(_ed_mul(r, _ED_B))
         h = int.from_bytes(hashlib.sha512(big_r + self.pub_key + msg).digest(), "little") % _ED_L
         return big_r + ((r + h * self._a) % _ED_L).to_bytes(32, "little")
+
+    def shared_secret(self, other_pub):
+        """ed25519_key_exchange: X25519 with the key's scalar and the peer's Ed25519 key converted (as LocalIdentity)."""
+        return self._x.exchange(X25519PublicKey.from_public_bytes(ed25519_pub_to_x25519(other_pub)))
 
 
 def transport_key(region):
@@ -739,10 +994,14 @@ class Store:
         "member_inroutes": ("key8 BLOB", "plen INT", "path BLOB", "w REAL", "t INT", "PRIMARY KEY (key8, plen, path)"),
         "edges": ("a BLOB", "b BLOB", "w REAL", "t INT", "snr REAL", "PRIMARY KEY (a, b)"),
         "repeaters": ("pubkey BLOB PRIMARY KEY", "name TEXT", "lat REAL", "lon REAL", "adv_ts INT", "last_advert INT"),
+        "nodes": ("pubkey BLOB PRIMARY KEY", "type INT", "name TEXT", "lat REAL", "lon REAL", "adv_ts INT", "rf INT", "obs INT"),
+        "backlog": ("seq INTEGER PRIMARY KEY", "hash BLOB UNIQUE", "ts INT", "raw BLOB", "src TEXT", "snr REAL", "ptype INT",
+                    "ch INT", "dst INT"),
         "heard": ("hash BLOB PRIMARY KEY", "last INT", "w REAL", "t INT", "last_direct INT", "snr REAL", "disc INT", "out_snr REAL"),
         "bans": ("pubkey BLOB PRIMARY KEY", "name TEXT", "ts INT"),
         "probes": ("hash BLOB PRIMARY KEY", "data TEXT"),
         "obs_edges": ("a BLOB", "b BLOB", "w REAL", "t INT", "snr REAL", "PRIMARY KEY (a, b)"),
+        "settings": ("k TEXT PRIMARY KEY", "v TEXT"),     # (a tenant room's own settings)
     }
 
     def __init__(self, path):
@@ -966,11 +1225,11 @@ def repeater_changes(body):
             if len(r) > 30 or r.startswith("$") or not all(c in "-$#" or "0" <= c <= "9" or c >= "A" for c in r):
                 raise ValueError("region %r: letters, digits and - only (private $ regions aren't supported)" % r)
         ch["repeater_regions"] = regs
-    if "airtime_cap" in body:
+    if "airtime_cap" in body:                               # (its airtime weight: see Airtime)
         v = num("airtime_cap")
-        if not 1 <= v <= 100:
-            raise ValueError("airtime cap: 1 to 100 %")
-        ch["repeater_airtime_pct"] = v
+        if not 0 <= v <= 10000:
+            raise ValueError("airtime weight: 0 to 10000")
+        ch["tx_weight_relay"] = v
     if "loop_detect" in body:
         if body["loop_detect"] not in ("off", "minimal", "moderate", "strict"):
             raise ValueError("loop detection: off, minimal, moderate or strict")
@@ -1126,14 +1385,16 @@ class Member:
         self.ack_timeout = 0.0
         self.push_failures = 0
         self.push_post_ts = 0
+        self.push_private = False         # the post being pushed is a private message (doesn't move sync_since)
+        self.push_delivered = False       # the post being pushed was delivered (its other attempts' ACKs only credit routes)
         self.push_sent = 0.0
         self.push_hops = 0xFF
-        self.prev_acks = [None, None]
+        self.attempt_no = 0               # attempts on the current post so far: picks the attempt bits (0..3, in turn)
+        self.ack_map = {}                 # expected ACK -> its attempt (see push_post), kept LATE_ACK_S past its timeout
         self.routes = []                  # ProvenRoute list
         self.plan = None                  # attempt plan for the post being delivered
-        self.plan_retry = False           # plan is a backoff retry (best route, then flood)
+        self.plan_retry = False           # plan is a backoff retry (best route, then floods)
         self.inflight = None              # plan entry of the attempt in flight
-        self.prev_entries = [None, None]  # plan entries of earlier attempts, parallel to prev_acks
         self.backoff = 0
         self.retry_at = 0.0
         self.stuck_since = 0.0
@@ -1146,7 +1407,6 @@ class Member:
         self.obs_confirmed = None         # a push an observer confirmed first: its RF ACK is still credited (2 min)
         self.suspended_at = 0             # when they were suspended (wall clock)
         self.pace_sample = None           # the push in flight counts toward the shared pace: {"p": expected, "ok": ...}
-        self.timed_sample = None          # its sample if it timed out (a late ACK turns it back into a success)
         self.attempts_avg = None          # recency-weighted attempts per delivered post (1.0 = always first try)
         self.deliveries = 0
         self.attempts_cur = 0             # attempts on the post being delivered
@@ -1162,6 +1422,8 @@ class Member:
 # ============================================================================
 
 class RoomServer:
+    TENANT = False
+
     def __init__(self, cfg, modem, identity, store):
         self.cfg, self.modem, self.id, self.store = cfg, modem, identity, store
         self.self_hash = identity.pub_key[0]
@@ -1186,11 +1448,14 @@ class RoomServer:
         self.next_discovery = time.monotonic() + 60        # first one a minute after start
         self.disc_due_since = 0.0
         self.posts = []                   # [(ts, author32, text)], oldest first
+        self.login_fails = {}             # member key -> recent wrong passwords (monotonic): see login_failed
         self.max_issued = 0
         self.names = {}                   # key8 -> (ts, name)
         self.neighbours = {}              # pubkey -> dict(advert_ts, heard, snr4, name)
         self.seen = {}                    # packet hash -> None (insertion ordered)
-        self.txq = []                     # heap (due, prio, seq, raw, ptype, is_flood)
+        self.txq = []                     # heap (due, prio, seq, raw, ptype, is_flood, deferrable, relay, tag, class)
+        self.air = Airtime(cfg, lambda: [k for k, node in (("relay", getattr(self, "vr", None)),
+                                                            ("companion", getattr(self, "vc", None))) if node is None])
         self.txseq = 0
         self.tx_busy_until = 0.0
         self.next_push = 0.0
@@ -1223,7 +1488,10 @@ class RoomServer:
         self.rroutes = {}                 # target hash -> {(plen, path): RptRoute}
         self.mrpts = {}                   # companion directory, locations: key8 -> {repeater hash (b"" = direct): [w, t]}
         self.edges = {}                   # (a_hash, b_hash) -> [w, t, snr]   b"" = the room
-        self.repeaters = {}               # repeater pubkey -> dict(name, lat, lon, adv_ts, last_advert)
+        self.repeaters = RepeaterTable(lambda pub: self.vr is not None and pub == self.vr.pub)
+        #                                   repeater pubkey -> dict(name, lat, lon, adv_ts, last_advert), at most REPEATERS_MAX
+        self.nodes = {}                   # pubkey -> dict(type, name, lat, lon, adv_ts, rf, obs): every node heard
+        self.nodes_dirty, self.nodes_gone = set(), set()     # advertising; rf/obs: when, by this radio / an observer
         self.heard = {}                   # repeater hash -> dict(last, w, t, last_direct, snr)
         self.next_topo_flush = time.monotonic() + 60
         self.last_rx_mono = 0.0
@@ -1246,8 +1514,15 @@ class RoomServer:
         self.web_clients = (0, 0)         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
         self.observer = None            # attached by main when explicitly enabled
         self.vr = None                    # VirtualRepeater while repeater_enabled
+        self.vc = None                    # VirtualCompanion while companion_enabled (started by main: needs the event queue)
+        self.web_vc_admin = {}
+        self.tenants = {}                 # public key -> TenantRoom (main room only)
+        self.bus = []                     # heap: tenants' packets, offered to the other nodes on this radio when due
+        self.push_gate, self.push_turn, self.push_owner = 0.0, 0, None   # one push at a time across all rooms (one radio)
+        self.web_tenants, self.web_tenant_rows = {}, []    # for the web thread: path -> TenantRoom, admin list
         self.consumed = False             # set while handling a packet that turned out to be for the room
         self.feed = None                  # ObserverFeed while MQTT augmentation is on         # (dashboard viewers, of which admins) in the last 15 s (set by the web thread)
+        self.kaas = None if self.TENANT else KaasHub(self)   # API clients (websocket): the main room only
         self.web_port_active = bool(cfg.web_port)
         self.web_last_request = 0.0
         self.web_dirty = False
@@ -1309,8 +1584,16 @@ class RoomServer:
             self.edges[(bytes(a), bytes(b))] = [w, t, snr]
         for pub, name, lat, lon, adv_ts, last in st.read("SELECT pubkey, name, lat, lon, adv_ts, last_advert FROM repeaters"):
             self.repeaters[bytes(pub)] = dict(name=name, lat=lat, lon=lon, adv_ts=adv_ts, last_advert=last)
+        for pub, typ, name, lat, lon, adv_ts, rf, obs in st.read("SELECT pubkey, type, name, lat, lon, adv_ts, rf, obs FROM nodes"):
+            self.nodes[bytes(pub)] = dict(type=typ, name=name or "", lat=lat, lon=lon, adv_ts=adv_ts or 0, rf=rf, obs=obs)
         for h, last, w, t, last_direct, snr, disc, out_snr in st.read("SELECT hash, last, w, t, last_direct, snr, disc, out_snr FROM heard"):
             self.heard[bytes(h)] = dict(last=last, w=w, t=t, last_direct=last_direct, snr=snr, disc=disc or 0, out_snr=out_snr)
+        if not self.TENANT and (self.members or self.posts):
+            # the main room is the host now: rooms are all Rooms (tenants). An older main room's data stays in
+            # room.db, untouched, but isn't served
+            log.warning("room.db still holds a room of its own (%d members, %d posts): the server hosts Rooms only "
+                        "now, so they're kept in room.db but not used", len(self.members), len(self.posts))
+            self.members, self.posts = {}, []
         for m in self.members.values():
             self.update_current(m, mark=False)
         self.max_issued = max((p[0] for p in self.posts), default=0)
@@ -1369,6 +1652,9 @@ class RoomServer:
 
     # ------------------------------------------------------------------ clock / ids
 
+    def radio_stats(self):
+        return self.stats
+
     def unique_time(self):
         t = now_s()
         if t <= self.max_issued:
@@ -1393,14 +1679,24 @@ class RoomServer:
 
     # ------------------------------------------------------------------ TX queue
 
-    def queue_tx(self, pkt, prio, delay=0.0, deferrable=False, relay=False):
+    def queue_tx(self, pkt, prio, delay=0.0, deferrable=False, relay=False, src=None, tag=None):
+        if self.vc is not None and src is None:          # (tenants' and the companion's were offered already)
+            if self.vc.claims(pkt):                         # for the companion on this radio: handed over, never on the air
+                if not relay:
+                    self.seen_mark(pkt)
+                if self.vr is not None:
+                    self.vr.seen_mark(pkt)
+                self.vc.deliver(pkt.copy(), delay)
+                return
+            self.vc.deliver(pkt.copy(), delay)              # it hears everything this radio sends
         raw = pkt.encode()
         if not relay:
             self.seen_mark(pkt)
         if self.vr is not None:
             self.vr.seen_mark(pkt)                          # the virtual repeater never relays what this radio sent
         self.txseq += 1
-        heapq.heappush(self.txq, (time.monotonic() + delay, prio, self.txseq, raw, pkt.ptype, pkt.is_flood, deferrable, relay))
+        heapq.heappush(self.txq, (time.monotonic() + delay, prio, self.txseq, raw, pkt.ptype, pkt.is_flood, deferrable, relay,
+                                  tag, tx_class(pkt, deferrable, relay, src, tag)))
 
     def service_tx(self):
         now = time.monotonic()
@@ -1409,21 +1705,37 @@ class RoomServer:
         quiet = now - self.last_rx_mono >= self.cfg.push_quiet_ms / 1000.0
         # pushes aren't urgent: they wait for a quiet gap (floods arrive as bursts of rebroadcasts);
         # ACKs and replies go straight out. The modem's own CSMA still guards the instant of transmit.
-        due = [e for e in self.txq if e[0] <= now and (quiet or not e[6])]
+        late = [e for e in self.txq if e[9] in TX_STALE_S and now - e[0] > TX_STALE_S[e[9]]]
+        if late:                                            # relays and clients' packets the airtime limits held too long
+            self.txq[:] = [e for e in self.txq if e not in late]
+            heapq.heapify(self.txq)
+            for e in late:
+                self.air.dropped[e[9]] += 1
+                if e[7] and self.vr is not None:
+                    self.vr.stats["drop_airtime"] += 1
+                if e[8] is not None and self.kaas is not None:
+                    self.kaas.dropped(e[8], "held too long by the airtime limits (the channel is busy)")
+        # within the airtime ceiling, and each class's share of it (borrowing what others leave unused)
+        due = [e for e in self.txq if e[0] <= now and (quiet or not e[6]) and self.air.can(e[9], self.airtime_ms(len(e[3])))]
         if not due:
             return
-        # the room's own ACKs and replies first, then the virtual repeater's relays, then pushes;
+        # the room's own ACKs and replies first, then the virtual repeater's relays, then pushes, then API clients';
         # within each, highest priority, then FIFO
-        best = min(due, key=lambda e: (2 if e[6] else 1 if e[7] else 0, e[1], e[2]))
+        best = min(due, key=lambda e: (3 if e[8] is not None else 2 if e[6] else 1 if e[7] else 0, e[1], e[2]))
         self.txq.remove(best)
         heapq.heapify(self.txq)
-        _, _, _, raw, ptype, is_flood, _, _ = best
+        raw, is_flood, tag = best[3], best[5], best[8]
         self.modem.send_packet(raw)
+        if self.kaas is not None:
+            if tag is not None:
+                self.kaas.sent(tag)
+            self.kaas.publish("tx", raw)
         at = self.airtime_ms(len(raw))
         self.tx_busy_until = now + at / 1000.0 + 3.0       # cleared early by TxDone
         self.stats["sent"] += 1
         self.stats["sent_flood" if is_flood else "sent_direct"] += 1
         self.stats["airtime_ms"] += at
+        self.air.charge(best[9], at)
 
     def wanted_radio(self):
         c = self.cfg
@@ -1538,6 +1850,8 @@ class RoomServer:
     # ------------------------------------------------------------------ receive
 
     def on_rx(self, raw, snr, rssi):
+        if self.kaas is not None:
+            self.kaas.publish("rx", raw, snr, rssi)
         pkt = Packet.parse(raw)
         self.stats["recv"] += 1
         if pkt is None:
@@ -1548,7 +1862,16 @@ class RoomServer:
         self.last_rx_mono = time.monotonic()
         self.rx_airtime_ms += self.airtime_ms(len(raw))
         self.stats["recv_flood" if pkt.is_flood else "recv_direct"] += 1
+        if pkt.ptype == PT_ADVERT:
+            a = self.parse_advert(pkt)
+            if a is not None:
+                self.note_node(a, "rf")                     # heard on the air here (not a packet a node here made)
         consumed = self._room_rx(pkt)
+        for t in self.tenants.values():
+            if t.wants(pkt):
+                consumed = t._room_rx(pkt.copy()) or consumed
+        if self.vc is not None:
+            consumed = self.vc.on_rx(pkt.copy(), raw) or consumed
         if self.vr is not None:
             self.vr.on_rx(pkt, consumed)
 
@@ -1556,7 +1879,11 @@ class RoomServer:
         """A packet the virtual repeater is about to send on its last hop: the room gets it first, internally.
         True if it was for the room (then it isn't transmitted)."""
         pkt.snr, pkt.rssi = VIRTUAL_LINK_SNR, 0
-        return self._room_rx(pkt)
+        consumed = self._room_rx(pkt.copy())
+        for t in self.tenants.values():
+            if t.wants(pkt):
+                consumed = t._room_rx(pkt.copy()) or consumed
+        return consumed
 
     def _room_rx(self, pkt):
         """The room's own handling of a packet. Returns True if it was for the room (it decrypted as ours, or it is
@@ -1646,6 +1973,8 @@ class RoomServer:
 
     def on_anon_req(self, pkt):
         p = pkt.payload
+        if not self.TENANT:
+            return                                          # the host takes no logins: Rooms do
         if len(p) <= 1 + PUB_KEY_SIZE + 2 or self.check_dup(pkt) or p[0] != self.self_hash:
             return
         sender = p[1:1 + PUB_KEY_SIZE]
@@ -1671,15 +2000,18 @@ class RoomServer:
                 self.member_active(m, pkt)
                 self.mark_dirty()
         if m is None:
+            if self.login_blocked(sender):
+                return                                      # too many wrong passwords from this key lately: no answer
             # An empty admin password disables RF admin access; without this
             # guard, a blank login would accidentally become an admin login.
-            if self.cfg.admin_password and password == self.cfg.admin_password:
+            if self.cfg.admin_password and same_text(password, self.cfg.admin_password):
                 perm = PERM_ADMIN
-            elif password == self.cfg.room_password:
+            elif same_text(password, self.cfg.room_password):
                 perm = PERM_READ_WRITE
             elif self.cfg.allow_read_only:
                 perm = PERM_GUEST
             else:
+                self.login_failed(sender)
                 return                                      # no response: client times out
             m = self.members.get(sender) or self.put_member(sender)
             if sender_ts <= m.last_timestamp:
@@ -1715,6 +2047,22 @@ class RoomServer:
             self.send_flood(pr, SERVER_RESPONSE_DELAY, pkt.hash_size)
         else:
             self.send_to(m, self.make_datagram(PT_RESPONSE, sender, secret, reply), SERVER_RESPONSE_DELAY, pkt)
+
+    def login_blocked(self, pub):
+        q = self.login_fails.get(pub)
+        now = time.monotonic()
+        while q and now - q[0] >= ROOM_LOGIN_FAIL_WINDOW_S:
+            q.popleft()
+        return bool(q) and len(q) >= ROOM_LOGIN_FAILS
+
+    def login_failed(self, pub):
+        """A wrong room / admin password from this key: after ROOM_LOGIN_FAILS in ROOM_LOGIN_FAIL_WINDOW_S, its logins
+        go unanswered until they age (a key is free to make, but each try costs airtime, or a web key's send budget)."""
+        self.login_fails.setdefault(pub, collections.deque(maxlen=ROOM_LOGIN_FAILS)).append(time.monotonic())
+        if len(self.login_fails) > 4096:
+            now = time.monotonic()
+            for k in [k for k, q in self.login_fails.items() if not q or now - q[-1] >= ROOM_LOGIN_FAIL_WINDOW_S]:
+                del self.login_fails[k]
 
     def suggest_route(self, pub, hops):
         """Admin-suggested route (list of repeater id bytes, room side first): stored as a proven-route
@@ -1775,11 +2123,10 @@ class RoomServer:
         airtime = self.airtime_ms(pkt.raw_length() + (path_bytes(n["plen"]) if n["plen"] is not None else 0))
         if n["plen"] is not None and n["tries"] < 2:
             self.send_direct(pkt, n["path"], n["plen"])
-            hops = n["plen"] & 63
-            wait = max(4.0 + 2.0 * (hops + 1), (500 + (airtime * 6 + 250) * (hops + 1)) / 1000.0)
+            wait = ack_wait(n["plen"], airtime)
         else:
             self.send_flood(pkt)
-            wait = max(FLOOD_ACK_MIN, (500 + 32 * airtime) / 1000.0)
+            wait = ack_wait(None, airtime)
         n["tries"] += 1
         n["next_at"] = time.monotonic() + wait
         log.info("sent to %s (attempt %d of 3): %s", n["label"], n["tries"], n["text"])
@@ -1931,6 +2278,9 @@ class RoomServer:
             prune = public[-self.cfg.max_posts][0]          # private messages are kept until delivered
             self.posts = [p for p in self.posts if p[3] is not None or p[0] >= prune]
         self.store.add_post(ts, author, text, to, prune)    # written by the db thread
+        hub = (self.host if self.TENANT else self).kaas
+        if hub is not None:
+            hub.room_post_added(self, (ts, author, text, to))
         if to is None:
             self.stats["posted"] += 1
         self.next_push = time.monotonic() + PUSH_NOTIFY_DELAY
@@ -1979,10 +2329,7 @@ class RoomServer:
             force_since = struct.unpack_from("<I", data, 5)[0] if len(data) >= 9 else 0
             if force_since:
                 m.sync_since = force_since
-            if m.pending_ack:                               # keep the abandoned attempt's ACK
-                m.prev_acks = [m.pending_ack, m.prev_acks[0]]
-                m.prev_entries = [m.inflight, m.prev_entries[0]]
-            m.pending_ack = None
+            m.pending_ack = None                            # (the abandoned attempt's ACK still counts: ack_map)
             m.inflight = None
             if m.out_path_len is not None:
                 body = data[:9] if len(data) >= 9 else data[:5] + bytes(4)
@@ -2004,7 +2351,7 @@ class RoomServer:
     def handle_request(self, m, sender_ts, p):
         head = struct.pack("<I", sender_ts)
         if p[0] == REQ_GET_STATUS:
-            s = self.stats
+            s = self.radio_stats()
             up = int(time.monotonic() - self.boot)
             stats = struct.pack("<HHhhIIIIIIIIHhHHHH",
                                 self.batt_mv, min(len(self.txq), 0xFFFF), int(self.noise_floor), int(self.last_rssi),
@@ -2061,49 +2408,54 @@ class RoomServer:
                 self.notices.remove(n)
                 log.info("%s received: %s", n["label"], n["text"])
                 return True
+        now = time.monotonic()
         for m in self.members.values():
-            late = None
-            match = m.pending_ack is not None and ack == m.pending_ack
-            if not match:
-                for j in (0, 1):
-                    if m.prev_acks[j] is not None and ack == m.prev_acks[j]:
-                        match, late = True, j
-                        break
-            if not match:
-                oc = m.obs_confirmed
-                if oc and time.monotonic() < oc["until"] and ack in oc["acks"]:
-                    self.rf_after_observer(m, ack)
-                    return True
+            rec = m.ack_map.get(ack)
+            if rec is not None and now >= rec["until"]:
+                rec = None
+            cur = m.pending_ack is not None and ack == m.pending_ack
+            if not cur and rec is None:
                 continue
+            if rec is not None and rec["credited"]:
+                return True                                 # this attempt's ACK again: already counted
+            oc = m.obs_confirmed
+            if oc and now < oc["until"] and ack in oc["acks"]:
+                self.rf_after_observer(m, ack)
+                return True
+            if not cur and (rec["post"] != m.push_post_ts or m.push_delivered):
+                self.late_credit(m, rec)                    # another attempt of a post already delivered
+                return True
             self.heard_from(m)                              # their ACK: heard from them
             lat_ms = None
-            if late is None and m.push_sent:
-                lat_ms = int((time.monotonic() - m.push_sent) * 1000)
+            if cur and m.push_sent:
+                lat_ms = int((now - m.push_sent) * 1000)
                 b = 5 if m.push_hops == 0xFF else min(m.push_hops, 4)
                 self.lat_sum[b] += lat_ms
                 self.lat_cnt[b] += 1
-            self.stats["late_acks" if late is not None else "acks"] += 1
-            entry = m.prev_entries[late] if late is not None else m.inflight
+            self.stats["acks" if cur else "late_acks"] += 1
+            if rec is not None:
+                rec["credited"] = True
+            entry = m.inflight if cur else rec["entry"]
             self.attempt_result(m, entry, True, lat_ms)
-            if late is None and m.pace_sample is not None:
+            if cur and m.pace_sample is not None:
                 m.pace_sample["ok"] = True
                 self.pace_outcome(m.pace_sample)
-            elif late is not None and m.timed_sample is not None:
-                m.timed_sample["ok"] = True                 # a late ACK: that "timeout" was delivered after all
-            m.pace_sample = m.timed_sample = None
-            if late is None and m.pub == self.last_pushed and self.last_push_flood:
-                self.next_push = min(self.next_push, time.monotonic() + 0.5)   # flood ACK back: the wave is done
+            elif not cur and rec["timed"] is not None:
+                rec["timed"]["ok"] = True                   # a late ACK: that "timeout" was delivered after all
+            m.pace_sample = None
+            if cur and m.pub == self.last_pushed and self.last_push_flood:
+                self.next_push = min(self.next_push, now + 0.5)   # flood ACK back: the wave is done
             if m.attempts_cur:
                 self.delivery_sample(m, m.attempts_cur)
                 m.deliveries += 1
                 m.attempts_cur = 0
             self.stats["delivered"] += 1
             m.obs_confirmed = None
-            m.pending_ack = None
+            m.pending_ack = None                            # (the other attempts' ACKs still credit their routes)
             m.inflight = None
-            m.prev_acks = [None, None]
-            m.prev_entries = [None, None]
-            m.sync_since = m.push_post_ts
+            m.push_delivered = True
+            if not m.push_private:                          # (a private message is delivered out of order)
+                m.sync_since = m.push_post_ts
             self.drop_private(m.pub, m.push_post_ts)            # private message delivered: no longer needed
             m.push_failures = 0
             m.plan, m.plan_retry = None, False
@@ -2113,6 +2465,17 @@ class RoomServer:
             self.mark_dirty()
             return True
         return False
+
+    def late_credit(self, m, rec):
+        """The ACK of an earlier attempt of a post that was already delivered: that route delivered too. Route credit
+        (and its pace sample, if it timed out) only; the delivery itself was already counted."""
+        rec["credited"] = True
+        self.heard_from(m)
+        self.stats["late_acks"] += 1
+        self.attempt_result(m, rec["entry"], True)
+        if rec["timed"] is not None:
+            rec["timed"]["ok"] = True
+        self.mark_dirty()
 
     # ------------------------------------------------------------------ routes: proven (per member)
 
@@ -2479,6 +2842,115 @@ class RoomServer:
         scored = sorted(((rr, rr.confidence(now, self.thalf())) for rr in tab.values()), key=lambda x: -x[1])
         return scored[:n]
 
+    def link_graph(self):
+        """link_graph_build(), at most every LINK_GRAPH_TTL_S: rebuilding it on every route question cost tens of ms,
+        and its weights fade over hours (callers only read it)."""
+        now = time.monotonic()
+        cached = getattr(self, "_link_graph", None)
+        if cached is None or now - cached[0] >= LINK_GRAPH_TTL_S:
+            cached = self._link_graph = (now, self.link_graph_build())
+        return cached[1]
+
+    def link_graph_build(self):
+        """Repeater links for route suggestions: a -> {b: confidence 0..1} (b hears a). From what this radio traced
+        and what the observers reported. A busy link is seen hundreds of times, so what counts is how it compares
+        with a's other links: a's strongest link scores 1, one with a quarter of its traffic 0.5. Links seen only once
+        or twice, weak ones (SNR below 0 dB, where known) and ones seen only the other way count for less, and every
+        hop costs a little, so shorter routes win ties. b"" is this radio, a usable hop only while its virtual
+        repeater relays."""
+        now, th = now_s(), self.thalf()
+        seen = {}                                           # (a, b) -> [weight, snr]
+        for tab in (self.edges, self.obs_edges):
+            for (a, b), e in tab.items():
+                w = fade(e[0], e[1], now, th)
+                if w < 0.05 or a == b or len(a) not in (0, 2) or len(b) not in (0, 2):
+                    continue                                # (suggested paths use 2-byte ids)
+                old = seen.get((a, b))
+                if old is None or w > old[0]:
+                    seen[(a, b)] = [w, e[2] if e[2] is not None else (old[1] if old else None)]
+        strongest = {}
+        for (a, b), (w, snr) in seen.items():
+            strongest[a] = max(strongest.get(a, 0.0), w)
+        relay = self.vr is not None and self.cfg.repeater_relay
+        g = {}
+        for (a, b), (w, snr) in seen.items():
+            if not relay and b"" in (a, b):
+                continue
+            c = (1.0 - 0.5 ** w) * math.sqrt(w / strongest[a]) * ROUTE_HOP_COST
+            if snr is not None and snr < 0:
+                c *= max(0.5, 1.0 + snr / 30.0)
+            g.setdefault(a, {})[b] = max(g.get(a, {}).get(b, 0.0), c)
+            if (b, a) not in seen:
+                g.setdefault(b, {})[a] = max(g.get(b, {}).get(a, 0.0), c * 0.5)
+        return g
+
+    def suggest_routes(self, src, dst, k=3, max_hops=10):
+        """The k best repeater chains from a node near the src repeaters to one near the dst repeaters.
+        src, dst: {repeater hash (b"" = this radio): share}. Returns [(hops, score 0..1)], best first: a score is the
+        chance the ends use those repeaters times each link's confidence. Yen's k shortest paths over -log(score)."""
+        g = self.link_graph()
+        relay = self.vr is not None and self.cfg.repeater_relay
+        src = {h: s for h, s in src.items() if s > 0 and (h or relay)}
+        dst = {h: s for h, s in dst.items() if s > 0 and (h or relay)}
+        S, T = ("src",), ("dst",)                           # virtual ends
+
+        def nbrs(u, banned_nodes, banned_edges):
+            if u == S:
+                items = src.items()
+            else:
+                items = list(g.get(u, {}).items()) + ([(T, dst[u])] if u in dst else [])
+            for v, c in items:
+                if v not in banned_nodes and (u, v) not in banned_edges and c > 0:
+                    yield v, -math.log(c)
+
+        def shortest(start, banned_nodes, banned_edges, depth0):
+            dist, prev, n_hops = {start: 0.0}, {}, {start: depth0}
+            heap, seq = [(0.0, 0, start)], itertools.count(1)
+            while heap:
+                d, _, u = heapq.heappop(heap)
+                if u == T:
+                    path = [u]
+                    while path[-1] != start:
+                        path.append(prev[path[-1]])
+                    return d, path[::-1]
+                if d > dist.get(u, float("inf")):
+                    continue
+                for v, w in nbrs(u, banned_nodes, banned_edges):
+                    hops = n_hops[u] + (0 if v == T else 1)
+                    if hops > max_hops:
+                        continue
+                    if d + w < dist.get(v, float("inf")):
+                        dist[v], prev[v], n_hops[v] = d + w, u, hops
+                        heapq.heappush(heap, (d + w, next(seq), v))
+            return None
+
+        def cost(path):
+            return sum(dict(nbrs(u, (), ()))[v] for u, v in zip(path, path[1:]))
+        first = shortest(S, set(), set(), 0)
+        if first is None:
+            return []
+        found, cands = [first[1]], []
+        while len(found) < k:
+            last = found[-1]
+            for i in range(len(last) - 2):                  # spur from each node but the last real hop
+                root = last[:i + 1]
+                banned_edges = {(p[i], p[i + 1]) for p in found if p[:i + 1] == root}
+                spur = shortest(root[-1], set(root[:-1]), banned_edges, i)
+                if spur is None:
+                    continue
+                path = root[:-1] + spur[1]
+                if path not in found and all(path != c[1] for c in cands):
+                    cands.append((cost(path), path))
+            if not cands:
+                break
+            cands.sort(key=lambda x: x[0])
+            found.append(cands.pop(0)[1])
+        out = []
+        for path in found:
+            hops = path[1:-1]
+            out.append(([(self.vr.pub[:2] if h == b"" else h) for h in hops], math.exp(-cost(path))))
+        return out
+
     def best_rpt_route(self, target):
         tab = self.rroutes.get(target)
         if not tab:
@@ -2561,7 +3033,11 @@ class RoomServer:
 
     def member_locations(self, m):
         """[(repeater hash or b"", share 0..1)] most likely first."""
-        tab = self.mrpts.get(m.pub[:8])
+        return self.locations(m.pub[:8])
+
+    def locations(self, k8):
+        """Where a companion is: [(repeater hash or b"", share 0..1)] most likely first."""
+        tab = self.mrpts.get(k8)
         if not tab:
             return []
         now = now_s()
@@ -2639,26 +3115,15 @@ class RoomServer:
         return plan
 
     def _build_plan(self, m, retry=False):
-        """Attempts for one post: best route, best built route (if different), best again,
-        next distinct route, flood. Straight to flood if nothing scores at least 35%."""
-        flood = dict(plen=None, path=None, score=0.0, proven=None, built=None)
+        """Attempts for one post: the top PLAN_ROUTES distinct routes (the rest only if they score at least 20%),
+        then PLAN_FLOODS floods. Straight to the floods if nothing scores at least 35%. Retry: best route, floods."""
+        floods = [dict(plen=None, path=None, score=0.0, proven=None, built=None) for _ in range(PLAN_FLOODS)]
         cands = self.candidates(m)
         if not cands or cands[0]["score"] < 0.35:
-            return [flood]
-        best = cands[0]
+            return floods
         if retry:
-            return [best, flood]
-        plan = [best]
-        second = next((c for c in cands[1:] if c["built"] == "shortcut"), None) \
-            or next((c for c in cands[1:] if c["built"] is not None), None) or (cands[1] if len(cands) > 1 else None)
-        if second is not None and second["score"] >= 0.2:
-            plan.append(second)
-        plan.append(best)
-        nxt = next((c for c in cands[1:] if c is not second and c["score"] >= 0.2), None)
-        if nxt is not None:
-            plan.append(nxt)
-        plan.append(flood)
-        return plan
+            return [cands[0]] + floods
+        return [cands[0]] + [c for c in cands[1:] if c["score"] >= 0.2][:PLAN_ROUTES - 1] + floods
 
     # ------------------------------------------------------------------ observer feed (MQTT augmentation)
 
@@ -2675,6 +3140,8 @@ class RoomServer:
             self.observer_group(ev[2])
         elif k == "topo" and self.cfg.mqtt_topo_ingest:
             self.observer_topology(ev[2], ev[3], ev[4])
+        elif k == "backlog" and self.kaas is not None:
+            self.kaas.backlog_mqtt(ev[2], ev[3])
 
     def observer_ack(self, ack):
         """An ACK some observer heard. If it confirms one of our pushes: delivered. No route credit, no pace or
@@ -2684,24 +3151,27 @@ class RoomServer:
                 self.notices.remove(n)
                 self.stats["obs_acks"] += 1
                 return True
+        now = time.monotonic()
         for m in self.members.values():
             cur = m.pending_ack is not None and ack == m.pending_ack
-            late = any(a is not None and ack == a for a in m.prev_acks)
+            rec = m.ack_map.get(ack)
+            late = (rec is not None and now < rec["until"] and rec["post"] == m.push_post_ts and m.push_post_ts
+                    and not m.push_delivered)
             if not (cur or late):
                 continue
             # keep every attempt of this post: its RF ACK may still arrive, and RF stays the source of route credit
-            acks = {}
+            acks = {a: (r["entry"], False) for a, r in m.ack_map.items()
+                    if r["post"] == m.push_post_ts and now < r["until"] and not r["credited"]}
             if m.pending_ack is not None:
                 acks[m.pending_ack] = (m.inflight, True)
-            for j in (0, 1):
-                if m.prev_acks[j] is not None:
-                    acks[m.prev_acks[j]] = (m.prev_entries[j], False)
-            m.obs_confirmed = dict(acks=acks, sent=m.push_sent, hops=m.push_hops, pace=m.pace_sample, timed=m.timed_sample,
-                                   attempts=m.attempts_cur, until=time.monotonic() + 120)
-            m.sync_since = max(m.sync_since, m.push_post_ts)
+            m.obs_confirmed = dict(acks=acks, sent=m.push_sent, hops=m.push_hops, pace=m.pace_sample,
+                                   attempts=m.attempts_cur, until=now + 120)
+            m.push_delivered = True
+            if not m.push_private:
+                m.sync_since = max(m.sync_since, m.push_post_ts)
             self.drop_private(m.pub, m.push_post_ts)
-            m.pending_ack, m.inflight, m.prev_acks, m.prev_entries = None, None, [None, None], [None, None]
-            m.pace_sample = m.timed_sample = None
+            m.pending_ack, m.inflight = None, None
+            m.pace_sample = None
             m.push_failures, m.plan, m.plan_retry = 0, None, False
             m.backoff, m.retry_at, m.stuck_since, m.attempts_cur = 0, 0.0, 0.0, 0
             self.stats["obs_acks"] += 1
@@ -2717,6 +3187,9 @@ class RoomServer:
         delivery score, pace, last heard). The delivery itself was already counted."""
         oc = m.obs_confirmed
         entry, latest = oc["acks"][ack]
+        rec = m.ack_map.get(ack)
+        if rec is not None:
+            rec["credited"] = True
         self.heard_from(m)
         lat_ms = int((time.monotonic() - oc["sent"]) * 1000) if latest and oc["sent"] else None
         self.stats["acks" if latest else "late_acks"] += 1
@@ -2725,8 +3198,8 @@ class RoomServer:
         if latest and oc["pace"] is not None:
             oc["pace"]["ok"] = True
             self.pace_outcome(oc["pace"])
-        elif not latest and oc["timed"] is not None:
-            oc["timed"]["ok"] = True
+        elif not latest and rec is not None and rec["timed"] is not None:
+            rec["timed"]["ok"] = True
         if oc["attempts"]:
             self.delivery_sample(m, oc["attempts"])
             m.deliveries += 1
@@ -2858,6 +3331,7 @@ class RoomServer:
                                            lon=a["lon"] if a["lon"] is not None else old.get("lon"),
                                            adv_ts=a["ts"], last_advert=old.get("last_advert") or now_s())
                 self._rpt_idx = None
+            self.note_node(a, "obs")
             if atype == ADV_TYPE_CHAT:
                 if pkt.hop_count and pkt.hash_size >= 2:
                     self.observe_near(pub, pkt.path[:pkt.hash_size], weight=0.5)
@@ -2982,11 +3456,280 @@ class RoomServer:
         c = self.cfg
         out = dict(enabled=self.vr is not None, relay=bool(c.repeater_relay), name=c.repeater_name, lat=float(c.repeater_lat or 0), lon=float(c.repeater_lon or 0),
                    scope_mode=c.repeater_scope_mode, regions=list(c.repeater_regions or []),
-                   airtime_cap=c.repeater_airtime_pct, loop_detect=c.repeater_loop_detect,
+                   airtime_cap=c.tx_weight_relay, loop_detect=c.repeater_loop_detect,
                    advert_min=c.repeater_advert_interval_min, flood_advert_h=c.repeater_flood_advert_interval_h)
         if self.vr is not None:
             out.update(self.vr.state(), key=hexs(self.vr.pub), id=hexs(self.vr.pub[:2]))
         return out
+
+    def companion_apply(self):
+        """Start, stop or update the virtual companion from the config (startup and every settings change). Its TCP
+        port is open only while it is enabled."""
+        c = self.cfg
+        if not c.companion_enabled:
+            if self.vc is not None:
+                self.vc.close()
+                log.info("virtual companion off (TCP port closed)")
+            self.vc = None
+            return
+        if not c.companion_key:                             # first start: a random identity, saved in the config
+            while True:
+                seed = os.urandom(32)
+                if RepeaterIdentity(seed).pub_key[0] not in (0x00, 0xFF):   # (reserved hashes)
+                    break
+            c.set("companion_key", seed.hex())
+        try:
+            ident = RepeaterIdentity(bytes.fromhex(str(c.companion_key)))
+        except ValueError as e:
+            log.error("companion_key: %s - the virtual companion stays off until the config has its key", e)
+            if self.vc is not None:
+                self.vc.close()
+            self.vc = None
+            return
+        if self.vc is None or self.vc.pub != ident.pub_key:
+            if self.vc is not None:
+                self.vc.close()
+            self.vc = VirtualCompanion(self, ident, CompanionStore(os.path.join(c.data_dir, "companion.db")))
+            log.info("virtual companion %r on, id %s", c.companion_name, hexs(ident.pub_key[:2]))
+            try:                                            # introduce the Rooms (and repeater) and the companion to each other
+                for t in list(self.tenants.values()):
+                    self.vc.deliver(t.make_advert())
+                if self.vr is not None:
+                    lat, lon = self.vr.position()
+                    self.vc.deliver(make_advert(self.vr.id, ADV_TYPE_REPEATER, c.repeater_name, lat, lon))
+                adv = self.vc.make_self_advert()
+                adv.header = (adv.header & ~0x03) | ROUTE_DIRECT
+                adv.snr = VIRTUAL_LINK_SNR
+                self._room_rx(adv)
+            except Exception as e:
+                log.warning("virtual companion: introductions failed: %s", e)
+        self.vc.listen()
+
+    def companion_tx(self, pkt, prio):
+        """A packet from the virtual companion. The room hears it first, internally (and the virtual repeater, for
+        traces and discovery); it goes on the air unless it was only for them."""
+        consumed = self.offer(pkt, self.vc)
+        if consumed and (pkt.is_flood or pkt.hop_count == 0 or pkt.ptype == PT_TRACE):
+            self.vc.stats["internal_out"] += 1
+            return
+        self.queue_tx(pkt, prio, 0.0, src="vc")
+
+    def companion_event(self, ev):
+        """vc_conn / vc_disc / vc_cmd from the TCP threads, and vc_cfg from the dashboard."""
+        if ev[0] == "vc_cfg":
+            for k, v in ev[1].items():
+                self.cfg.set(k, v)
+            self.companion_apply()
+        elif self.vc is not None:
+            self.vc.app_event(ev)
+        if ev[0] != "vc_cmd":
+            self.web_dirty = True                           # (not per command: an app syncing sends hundreds)
+
+    def vc_state(self):
+        """For everyone viewing the dashboard: no addresses (those are in vc_admin_state)."""
+        c = self.cfg
+        out = dict(enabled=self.vc is not None, name=c.companion_name, port=c.companion_port,
+                   auto_advert=bool(c.companion_auto_advert), advert_min=c.companion_advert_interval_min,
+                   advert_flood=bool(c.companion_advert_flood))
+        if self.vc is not None:
+            out.update(self.vc.state(), key=hexs(self.vc.pub), id=hexs(self.vc.pub[:2]))
+        return out
+
+    def vc_admin_state(self):
+        link = self.vc.link if self.vc is not None else None
+        return dict(bind=self.cfg.companion_bind, allow=list(self.cfg.companion_allow or []),
+                    client=link.peer if link is not None else None)
+
+    # ------------------------------------------------------------------ the other nodes on this radio
+
+    def offer(self, pkt, src):
+        """A packet from a node on this radio (a tenant room or the companion): every other node here hears it first,
+        internally (and the virtual repeater takes traces and discovery meant for it). True if it was for one of them;
+        then it doesn't go on the air."""
+        rx = pkt.copy()
+        rx.snr, rx.rssi = VIRTUAL_LINK_SNR, 0
+        consumed = False
+        if src is not self:
+            consumed = self._room_rx(rx.copy())
+        for t in list(self.tenants.values()):
+            if t is not src and t.wants(rx):
+                consumed = t._room_rx(rx.copy()) or consumed
+        vc = self.vc
+        if vc is not None and src is not vc:
+            if vc.claims(pkt):
+                consumed = True
+            vc.deliver(pkt.copy())
+        t, p = pkt.ptype, pkt.payload
+        if t == PT_TRACE and pkt.is_direct and len(p) >= 9:
+            es = 1 << (p[8] & 3)
+            nxt = p[9 + pkt.path_len * es:9 + (pkt.path_len + 1) * es]
+            if nxt == self.id.pub_key[:es] or any(nxt == x.id.pub_key[:es] for x in self.tenants.values() if x is not src):
+                consumed = True                             # its first hop is a room here: relayed (or not) by it
+            elif self.vr is not None and nxt == self.vr.pub[:es]:
+                v = pkt.copy()
+                v.snr = VIRTUAL_LINK_SNR
+                self.vr.on_rx(v, False)
+                consumed = True
+        elif t == PT_CONTROL and self.vr is not None:
+            v = pkt.copy()
+            v.snr = VIRTUAL_LINK_SNR
+            self.vr.on_rx(v, consumed)                      # e.g. node discovery: the repeater next to it answers
+        return consumed
+
+    def bus_send(self, src, pkt, prio, delay, deferrable):
+        self.txseq += 1
+        heapq.heappush(self.bus, (time.monotonic() + delay, self.txseq, src, pkt, prio, deferrable))
+
+    def service_bus(self):
+        """Tenant rooms' packets, when due: offered here first, then on the air unless they were only for us."""
+        now = time.monotonic()
+        while self.bus and self.bus[0][0] <= now:
+            _, _, src, pkt, prio, deferrable = heapq.heappop(self.bus)
+            if self.tenants.get(src.id.pub_key) is not src:
+                continue                                    # (the room was deleted)
+            if self.offer(pkt, src) and (pkt.is_flood or pkt.hop_count == 0 or pkt.ptype == PT_TRACE):
+                continue
+            self.queue_tx(pkt, prio, 0.0, deferrable, src=src)
+
+    def push_rooms(self):
+        """Every room on this radio shares its airtime: one push at a time, rooms taking turns."""
+        now = time.monotonic()
+        rooms = [self] + list(self.tenants.values())
+        owner = self.push_owner
+        gate_open = now >= self.push_gate or (owner is not None and owner.flood_gap_done(now))
+        start = self.push_turn % len(rooms)
+        for i in range(len(rooms)):
+            r = rooms[(start + i) % len(rooms)]
+            if r.push_tick(allow=gate_open):
+                gate_open = False
+                self.push_gate, self.push_owner = r.next_push, r
+                self.push_turn = (start + i + 1) % len(rooms)
+
+    # ------------------------------------------------------------------ tenant rooms
+
+    def tenant_db(self, key_hex):
+        return os.path.join(self.cfg.data_dir, TENANT_DIR, key_hex + ".db")
+
+    def tenants_load(self):
+        """Start the tenant rooms listed in the config (startup)."""
+        for e in list(self.cfg.tenant_rooms or []):
+            try:
+                pub = bytes.fromhex(str(e["public_key"]))
+                path = self.tenant_db(hexs(pub))
+                if not os.path.exists(path):
+                    log.error("tenant room %r: its database %s is missing - not started", e.get("name"), path)
+                    continue
+                t = TenantRoom(self, Store(path))
+                if t.id.pub_key != pub:
+                    log.error("tenant room %r: the key in %s doesn't match the config - not started", e.get("name"), path)
+                    t.store.close()
+                    continue
+                self.tenants[pub] = t
+                log.info("tenant room %r on /%s/, id %s, %d members", t.cfg.name, t.cfg.path, hexs(pub[:2]), len(t.members))
+            except (KeyError, ValueError, TypeError, sqlite3.Error) as ex:
+                log.error("tenant room %r: %s - not started", e.get("name") if isinstance(e, dict) else e, ex)
+        self.tenants_changed()
+
+    def tenants_changed(self):
+        self.web_tenants = {t.cfg.path: t for t in self.tenants.values()}
+        self.web_tenant_rows = [t.admin_row() for t in self.tenants.values()]
+        self.web_dirty = True
+
+    def tenant_create(self, spec):
+        if len(self.tenants) >= TENANT_MAX:
+            return log.error("tenant room %r not created: the limit is %d rooms", spec["name"], TENANT_MAX)
+        if spec["path"] in {t.cfg.path for t in self.tenants.values()}:
+            return log.error("tenant room %r not created: path /%s/ is taken", spec["name"], spec["path"])
+        taken = self.own_node_keys()
+        if spec["private_key"]:
+            key = bytes.fromhex(spec["private_key"])
+        else:
+            while True:                                     # a random identity (not a reserved or used hash)
+                key = os.urandom(32)
+                pub = RepeaterIdentity(key).pub_key
+                if pub[0] not in (0x00, 0xFF) and pub not in taken:
+                    break
+        ident = RepeaterIdentity(key)
+        if ident.pub_key in taken:
+            return log.error("tenant room %r not created: its key is already used here", spec["name"])
+        os.makedirs(os.path.join(self.cfg.data_dir, TENANT_DIR), mode=0o700, exist_ok=True)
+        path = self.tenant_db(hexs(ident.pub_key))
+        for f in (path, path + "-wal", path + "-shm"):      # (left over from an earlier room with this key)
+            if os.path.exists(f):
+                os.remove(f)
+        store = Store(path)
+        tcfg = TenantConfig(self.cfg, store)
+        for k in ("name", "path", "room_password", "admin_password", "web_password_hash"):
+            tcfg.set(k, spec[k])
+        tcfg.set("lat", float(spec.get("lat") or 0.0))
+        tcfg.set("lon", float(spec.get("lon") or 0.0))
+        tcfg.set("private_key", key.hex())
+        t = TenantRoom(self, store, tcfg)
+        t.next_zero_advert, t.next_flood_advert = time.monotonic() + 3, time.monotonic() + 10   # announce it now
+        self.tenants[ident.pub_key] = t
+        if self.vc is not None:
+            self.vc.deliver(t.make_advert())                # (the companion's app lists it at once)
+        self.cfg.set("tenant_rooms", list(self.cfg.tenant_rooms or []) +
+                     [dict(name=spec["name"], path=spec["path"], public_key=hexs(ident.pub_key))])
+        log.info("tenant room %r created on /%s/, id %s", spec["name"], spec["path"], hexs(ident.pub_key[:2]))
+        self.tenants_changed()
+
+    def tenant_delete(self, pub):
+        """Remove a tenant room and erase everything it kept (members, posts, settings, key)."""
+        t = self.tenants.pop(pub, None)
+        if t is None:
+            return
+        t.store.close()
+        path = self.tenant_db(hexs(pub))
+        for f in (path, path + "-wal", path + "-shm"):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+        self.cfg.set("tenant_rooms", [e for e in (self.cfg.tenant_rooms or []) if str(e.get("public_key", "")).upper() != hexs(pub)])
+        if self.push_owner is t:
+            self.push_owner = None
+        log.info("tenant room %r deleted (%d members, %d posts erased)", t.cfg.name, len(t.members), len(t.posts))
+        self.tenants_changed()
+
+    def tenant_event(self, ev):
+        """t_create / t_delete / t_webpw / t_loc from the main admin, t_act / t_say / t_advert from a tenant's page."""
+        kind = ev[0]
+        if kind == "t_create":
+            return self.tenant_create(ev[1])
+        t = self.tenants.get(bytes.fromhex(ev[1]))
+        if t is None:
+            return
+        if kind == "t_delete":
+            self.tenant_delete(t.id.pub_key)
+        elif kind == "t_webpw":
+            t.cfg.set("web_password_hash", ev[2])
+            log.info("tenant room %r: web UI password reset", t.cfg.name)
+        elif kind == "t_loc":
+            t.cfg.set("lat", ev[2])
+            t.cfg.set("lon", ev[3])
+            now = time.monotonic()                          # tell neighbours and the maps soon
+            t.next_zero_advert, t.next_flood_advert = min(t.next_zero_advert, now + 3), min(t.next_flood_advert, now + 10)
+            self.tenants_changed()
+            log.info("tenant room %r: location set to %s, %s", t.cfg.name, ev[2], ev[3])
+        elif kind == "t_say":
+            t.room_say(ev[2])
+        elif kind == "t_welcome":
+            for k, v in ev[2].items():
+                t.cfg.set(k, v)
+            log.info("room %r: welcome DM settings changed", t.cfg.name)
+        elif kind == "t_advert":
+            t.dashboard_advert(ev[2])
+        elif kind == "t_act":
+            verb, pub = ev[2], ev[3]
+            if verb == "suggest":
+                t.suggest_route(pub, ev[4])
+            elif verb == "resync":
+                t.force_resync(pub)
+            elif verb in ("kick", "ban", "unban"):
+                getattr(t, verb)(pub)
+        t.web_dirty = True
+        t.next_web = 0.0
 
     def heard_from(self, m):
         """Any packet we can attribute to m: the 'Last heard' time (saved with the member)."""
@@ -3067,7 +3810,7 @@ class RoomServer:
         self.pace_hist.append(sample)
         lo, hi = self.cfg.push_pace_min_ms / 1000.0, self.cfg.push_pace_max_ms / 1000.0
         n = len(self.pace_hist)
-        if n < 12 or len({x["who"] for x in self.pace_hist}) < 3:
+        if n < 12 or len({x["who"] for x in self.pace_hist}) < 2:
             return                                          # not enough evidence (and no single member can swing it)
         delivered = sum(1 for x in self.pace_hist if x["ok"])
         expected = sum(x["p"] for x in self.pace_hist)
@@ -3142,19 +3885,22 @@ class RoomServer:
     def check_ack_timeouts(self):
         now = time.monotonic()
         for m in self.members.values():
+            if m.ack_map:
+                for a in [a for a, r in m.ack_map.items() if now >= r["until"]]:
+                    del m.ack_map[a]
             if m.pending_ack is None or now < m.ack_timeout:
                 continue
             entry = m.inflight
+            rec = m.ack_map.get(m.pending_ack)              # (its late ACK still counts until rec["until"])
             m.push_failures += 1
-            m.prev_acks = [m.pending_ack, m.prev_acks[0]]   # late ACKs still count
-            m.prev_entries = [entry, m.prev_entries[0]]
             m.pending_ack = None
             m.inflight = None
             self.stats["timeouts"] += 1
             self.attempt_result(m, entry, False)
             if m.pace_sample is not None:
                 m.pace_sample["ok"] = False
-                m.timed_sample = m.pace_sample              # kept: a late ACK can still correct it
+                if rec is not None:
+                    rec["timed"] = m.pace_sample            # kept: a late ACK can still correct it
                 self.pace_outcome(m.pace_sample)
                 m.pace_sample = None
             if m.plan is not None and m.push_failures >= len(m.plan):
@@ -3175,13 +3921,17 @@ class RoomServer:
 
     # ------------------------------------------------------------------ push loop
 
-    def push_tick(self):
+    def push_tick(self, allow=True):
+        """One step of the push round. allow=False (another room on this radio is pushing): only check ACK timeouts.
+        Returns True if it pushed."""
         now = time.monotonic()
         if not self.members:
-            return
+            return False
         if now < self.next_push and not self.flood_gap_done(now):
-            return
+            return False
         self.check_ack_timeouts()
+        if not allow:
+            return False
         if not self.round:
             self.maybe_trace()                              # end of a full round through the members
             # new round: members who take the fewest attempts first (new members neutral at 1.5),
@@ -3193,57 +3943,71 @@ class RoomServer:
         did_push = False
         if m and self.push_eligible(m):
             t = now_s()
-            for ts, author, text, to in self.posts:
-                if t >= ts + POST_SYNC_DELAY_SECS and ts > m.sync_since and (to is None or to == m.pub) \
-                        and author[:4] != m.pub[:4]:
-                    self.push_post(m, ts, author, text)
-                    did_push = True
-                    break
+            mine = next((p for p in self.posts if p[3] == m.pub), None)
+            if mine is not None:
+                # private messages (the welcome DM) go first, before any catch-up history. They're stamped just before
+                # the first history post (so apps list them first too) and delivering one doesn't move sync_since
+                # (that would skip the history)
+                ts, author, text, _ = mine
+                first = next((p[0] for p in self.posts if p[3] is None and p[0] > m.sync_since and p[1][:4] != m.pub[:4]), None)
+                self.push_post(m, ts, author, text, wire_ts=min(ts, first - 1) if first else ts)
+                did_push = True
+            else:
+                for ts, author, text, to in self.posts:
+                    if t >= ts + POST_SYNC_DELAY_SECS and ts > m.sync_since and to is None and author[:4] != m.pub[:4]:
+                        self.push_post(m, ts, author, text)
+                        did_push = True
+                        break
         self.next_push = now + (self.gap_for(m.push_hops) if did_push else SYNC_SKIP_INTERVAL)
         if did_push:
             self.last_pushed = m.pub
             self.last_push_at = now
             self.last_push_flood = m.push_hops == 0xFF
+        return did_push
 
-    def push_post(self, m, ts, author, text):
+    def push_post(self, m, ts, author, text, wire_ts=None):
         if ts != m.push_post_ts:
-            m.prev_acks = [None, None]                      # different post: earlier attempts' ACKs no longer apply
+            m.attempt_no = 0                                # different post: attempt bits start again at 0
+            m.push_delivered = False
             if not m.plan_retry or m.plan is None:
                 m.plan, m.push_failures = None, 0
         if m.given_up:                                      # suspended probe: a single flood
             m.plan, m.plan_retry, m.push_failures = [dict(plen=None, path=None, score=0.0, proven=None, built=None)], True, 0
         elif m.plan is None:
             m.plan, m.plan_retry, m.push_failures = self.build_plan(m), False, 0
-        elif m.push_failures >= len(m.plan):                # the one retry: best route, then flood
+        elif m.push_failures >= len(m.plan):                # the one retry: best route, then floods
             m.plan, m.plan_retry, m.push_failures = self.build_plan(m, retry=True), True, 0
         entry = m.plan[m.push_failures]
         r_ = entry.get("proven")
         online = now_s() - max(m.last_heard or 0, m.last_activity or 0) < 900
         first = m.push_failures == 0 and not m.plan_retry
+        local = entry["plen"] is not None and path_hops(entry["plen"]) <= PACE_MAX_HOPS
         m.pace_sample = (dict(ok=None, p=max(0.05, min(0.95, r_.rate(now_s(), self.rhalf()))), who=m.pub[:4])
-                         if (online and first and not m.given_up and entry["plen"] is not None and r_ is not None) else None)
+                         if (online and first and not m.given_up and local and r_ is not None) else None)
         m.attempts_cur += 1
-        data = struct.pack("<I", ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | random.randrange(4)]) \
+        # the attempt bits count 0, 1, 2, 3, 0...: each of a post's 4 possible ACKs names its latest attempt
+        data = struct.pack("<I", ts if wire_ts is None else wire_ts) + bytes([(TXT_TYPE_SIGNED_PLAIN << 2) | (m.attempt_no & 3)]) \
             + author[:4] + text.encode()
+        m.attempt_no += 1
         m.pending_ack = sha256(data, m.pub)[:4]
         m.push_post_ts = ts
+        m.push_private = any(p[0] == ts and p[3] is not None for p in self.posts)
         m.push_sent = time.monotonic()
         m.inflight = entry
         plen, path = entry["plen"], entry["path"]
         m.push_hops = path_hops(plen)
         pkt = self.make_datagram(PT_TXT_MSG, m.pub, self.secret_for(m), data)
         airtime = self.airtime_ms(pkt.raw_length() + (path_bytes(plen) if plen is not None else 0))
+        wait = ack_wait(plen, airtime)
         if plen is None:
             self.send_flood(pkt, deferrable=True)
-            m.ack_timeout = time.monotonic() + max(12.0, FLOOD_ACK_MIN, (500 + 32 * airtime) / 1000.0)
         else:
             self.send_direct(pkt, path, plen, deferrable=True)
-            hops = plen & 63
-            formula = max(4.0 + 2.0 * (hops + 1), (500 + (airtime * 6 + 250) * (hops + 1)) / 1000.0)
             r = entry["proven"]
             if r is not None and r.lat_n >= 3:              # learned from this route's own ACK times
-                formula = min(max(3.0, r.lat * 2.5 / 1000.0 + 1.5), formula * 1.5)
-            m.ack_timeout = time.monotonic() + formula
+                wait = min(max(3.0, r.lat * 2.5 / 1000.0 + 1.5), wait * 1.5)
+        m.ack_timeout = time.monotonic() + wait
+        m.ack_map[m.pending_ack] = dict(entry=entry, post=ts, until=m.ack_timeout + LATE_ACK_S, timed=None, credited=False)
         self.stats["pushes"] += 1
         log.debug("push %s -> %s attempt %d/%d via %s", ts, m.key6, m.push_failures + 1, len(m.plan),
                   "flood" if plen is None else "%d hops" % (plen & 63))
@@ -3359,15 +4123,86 @@ class RoomServer:
         self.names[k8] = (ts, name)
         self.mark_dirty()
 
-    def dashboard_advert(self, flood):
-        """The dashboard's advert buttons: the room's advert, and the virtual repeater's too when it's on."""
-        self.send_advert(flood)
+    def note_node(self, a, via):
+        """A signed advert (parse_advert's dict), heard on this radio (via "rf") or by an MQTT observer ("obs"):
+        the node directory. Name and position come from its newest advert; rf/obs say when it was last heard."""
+        pub = a["pub"]
+        if pub in self.own_node_keys():
+            return
+        n = self.nodes.get(pub)
+        if n is None:
+            if len(self.nodes) >= NODES_MAX:
+                old = min(self.nodes, key=lambda k: max(self.nodes[k]["rf"] or 0, self.nodes[k]["obs"] or 0))
+                del self.nodes[old]
+                self.nodes_dirty.discard(old)
+                self.nodes_gone.add(old)
+            n = self.nodes[pub] = dict(type=a["type"], name="", lat=None, lon=None, adv_ts=-1, rf=None, obs=None)
+            self.nodes_gone.discard(pub)
+        if a["ts"] >= n["adv_ts"]:
+            n.update(type=a["type"], name=a["name"] or n["name"], adv_ts=a["ts"])
+            if a["lat"] is not None:
+                n["lat"], n["lon"] = a["lat"], a["lon"]
+        n[via] = now_s()
+        self.nodes_dirty.add(pub)
+
+    def observer_choices(self):
+        """Who the MQTT observer may report as: the virtual repeater (while on) or a room."""
+        out = [dict(id="repeater", label="Virtual repeater: %s" % self.cfg.repeater_name, key=hexs(self.vr.pub))] \
+            if self.vr is not None else []
+        return out + [dict(id=hexs(t.id.pub_key), label="Room: %s" % t.cfg.name, key=hexs(t.id.pub_key))
+                      for t in list(self.tenants.values())]
+
+    def observer_who(self):
+        """(identity, name) the observer reports as, or None while what was chosen doesn't exist."""
+        sel = str(self.cfg.observer_identity or "")
+        if sel == "repeater":
+            return (self.vr.id, self.cfg.repeater_name) if self.vr is not None else None
+        try:
+            t = self.tenants.get(bytes.fromhex(sel)) if sel else None
+        except ValueError:
+            t = None
+        return (t.id, t.cfg.name) if t is not None else None
+
+    def own_node_keys(self):
+        """Every node identity this server has: the room, tenants, and the virtual repeater and companion (their
+        configured keys too, while they're off: turning one back on mustn't give two nodes one key)."""
+        keys = {self.id.pub_key} | {t.id.pub_key for t in self.tenants.values()}
         if self.vr is not None:
-            self.vr.send_advert(flood)
-        log.info("%s sent from the dashboard%s", "flood advert" if flood else "advert (zero-hop)",
-                 " (room and virtual repeater)" if self.vr is not None else "")
+            keys.add(self.vr.pub)
+        if self.vc is not None:
+            keys.add(self.vc.pub)
+        for k in (self.cfg.repeater_key, self.cfg.companion_key):
+            try:
+                keys.add(RepeaterIdentity(bytes.fromhex(str(k))).pub_key) if k else None
+            except ValueError:
+                pass
+        return keys
+
+    def heard_on_rf(self, pub, trust_observers=False):
+        """When this radio last heard the node advertise (or an observer did, if trusted), or None. Any thread."""
+        n = self.nodes.get(bytes(pub))
+        if n is None:
+            return None
+        return n["rf"] or (n["obs"] if trust_observers else None)
+
+    def node_by_name(self, name):
+        """key8 of the node advertising this name (ignoring case). Several: the one with known repeaters, then the
+        newest advert."""
+        want = name.casefold()
+        hits = [k for k, (ts, nm) in self.names.items() if nm.strip().casefold() == want]
+        return max(hits, key=lambda k: (bool(self.mrpts.get(k)), self.names[k][0]), default=None)
+
+    def dashboard_advert(self, flood, node="repeater"):
+        """The host dashboard's advert buttons: the virtual repeater's or the companion's (a room's page sends the
+        room's)."""
+        n = self.vr if node == "repeater" else self.vc if node == "companion" else None
+        if n is not None:
+            n.send_advert(flood)
+            log.info("virtual %s: %s sent from the dashboard", node, "flood advert" if flood else "advert (zero-hop)")
 
     def send_advert(self, flood):
+        if not self.TENANT:
+            return                                          # the host isn't a room: only Rooms advertise
         try:
             pkt = self.make_advert()
         except Exception as e:
@@ -3489,6 +4324,8 @@ class RoomServer:
             self.next_flood_advert = now + self.cfg.flood_advert_interval_h * 3600
         if self.vr is not None:
             self.vr.periodic()
+        if self.vc is not None:
+            self.vc.periodic()
         if self.cfg.discovery_interval_min and now >= self.next_discovery:
             if not self.disc_due_since:
                 self.disc_due_since = now
@@ -3547,7 +4384,12 @@ class RoomServer:
         ed_rows = [(a, b, e[0], e[1], e[2]) for (a, b), e in self.edges.items()]
         rp_rows = [(pub, r["name"], r["lat"], r["lon"], r["adv_ts"], r["last_advert"]) for pub, r in self.repeaters.items()]
         hd_rows = [(h, d["last"], d["w"], d["t"], d["last_direct"], d["snr"], d.get("disc", 0), d.get("out_snr")) for h, d in self.heard.items()]
+        nd_rows = [(pub, n["type"], n["name"], n["lat"], n["lon"], n["adv_ts"], n["rf"], n["obs"])
+                   for pub, n in ((k, self.nodes.get(k)) for k in self.nodes_dirty) if n is not None]
+        nd_gone = [(pub,) for pub in self.nodes_gone]
+        self.nodes_dirty, self.nodes_gone = set(), set()
         self.store.execmany([
+            ("DELETE FROM nodes WHERE pubkey = ?", nd_gone), ("INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)", nd_rows),
             ("DELETE FROM rpt_routes", None), ("INSERT OR REPLACE INTO rpt_routes VALUES (?,?,?,?,?,?,?)", rr_rows),
             ("DELETE FROM member_rpts", None), ("INSERT OR REPLACE INTO member_rpts VALUES (?,?,?,?)", mr_rows),
             ("DELETE FROM member_inroutes", None), ("INSERT OR REPLACE INTO member_inroutes VALUES (?,?,?,?,?)", ir_rows),
@@ -3699,16 +4541,17 @@ class RoomServer:
         def has_pos(h):
             hit = self.rpt_lookup(h)
             return bool(hit and hit[1].get("lat") is not None and (hit[1].get("lat") or hit[1].get("lon")))
-        positioned = {h for h in self.heard if has_pos(h)}
+        positioned = {h for h in self.heard if has_pos(h) and t - (self.heard[h]["last"] or 0) <= MAP_MAX_AGE_S}
         act = {h: fade(d["w"], d["t"], t, 6 * 3600.0) for h, d in self.heard.items()}
         shown = sorted(self.heard, key=lambda h: -act[h])[:200]
-        shown += [h for h in positioned if h not in set(shown)]         # everything that can go on the map
+        shown += [h for h in positioned if h not in set(shown)]         # everything that can go on the map (heard in 72 h)
         rpts = []
         for h in shown:
             d = self.heard[h]
             hit = self.rpt_lookup(h)
             info_pub, info = hit if hit else (None, None)
             rpts.append(dict(hash=hexs(h), name=(info or {}).get("name") or "", lat=(info or {}).get("lat"), lon=(info or {}).get("lon"),
+                             on_map=h in positioned,
                              key=hexs(info_pub) if info_pub else None, last_advert=(info or {}).get("last_advert"),
                              last=d["last"], last_direct=d["last_direct"], activity=round(act[h], 1),
                              disc=d.get("disc") or 0, out_snr=None if d.get("out_snr") is None else round(d["out_snr"], 1),
@@ -3725,7 +4568,7 @@ class RoomServer:
                   for (a, b), e in self.obs_edges.items()
                   if (a, b) not in self.edges and a in positioned and b in positioned and fade(e[0], e[1], t, th) >= 0.5]
         # the map's *shape* (positions + drawable links): its version only changes when the drawing would
-        shape = repr((sorted((r["hash"], r["lat"], r["lon"]) for r in rpts if r["lat"] is not None),
+        shape = repr((sorted((r["hash"], r["lat"], r["lon"]) for r in rpts if r["on_map"]),
                       sorted((e["a"], e["b"]) for e in edges), self.cfg.lat, self.cfg.lon))
         if shape != self.map_shape:
             self.map_shape = shape
@@ -3742,13 +4585,18 @@ class RoomServer:
         for m in self.members.values():
             nm = self.names.get(m.pub[:8])
             in_backoff = m.plan is not None and m.push_failures >= len(m.plan) and time.monotonic() < m.retry_at
+            outstanding = self.unsynced_count(m)
+            # synced: nothing to send; queued: posts waiting, none tried yet; sent: first attempt out; retry: the
+            # latest attempt on this post is retry number tries - 1 (in flight, or waiting its turn)
+            tries = m.attempt_no if m.push_post_ts and not m.push_delivered else 0
+            push = ("suspended" if m.given_up else "backoff" if in_backoff else "retry" if tries > 1
+                    else "sent" if tries == 1 else "queued" if outstanding else "synced")
             members.append(dict(
                 pub=hexs(m.pub), key=m.key6, name=nm[1] if nm else "",
                 delivery=self.delivery_score(m), avg_attempts=None if m.attempts_avg is None else round(m.attempts_avg, 2),
                 deliveries=m.deliveries, role={PERM_ADMIN: "admin", PERM_GUEST: "guest"}.get(m.role, "member"),
-                last_activity=m.last_activity, last_heard=max(m.last_heard or 0, m.last_activity or 0), sync_since=m.sync_since, outstanding=self.unsynced_count(m),
-                push="suspended" if m.given_up else "waiting" if m.pending_ack else "backoff" if in_backoff
-                     else "retrying" if m.push_failures else "idle",
+                last_activity=m.last_activity, last_heard=max(m.last_heard or 0, m.last_activity or 0), sync_since=m.sync_since, outstanding=outstanding,
+                push=push, retries=max(0, tries - 1),
                 retry_in=int(m.retry_at - time.monotonic()) if in_backoff else 0,
                 route=self.path_names(m.out_path_len, m.out_path), route_hex=self.path_hex(m.out_path_len, m.out_path),
                 in_route_hex=self.path_hex(m.in_path_len, m.in_path) if m.in_ts else None, suspended_at=m.suspended_at,
@@ -3762,6 +4610,7 @@ class RoomServer:
         s = self.stats
         self.web_state = dict(
             room=dict(name=self.cfg.name, key=hexs(self.id.pub_key), lat=self.cfg.lat, lon=self.cfg.lon, fw=FIRMWARE_VERSION,
+                      host=not self.TENANT, rooms=len(self.tenants) if not self.TENANT else None,
                       radio=list(self.radio) if self.radio else None, uptime=int(time.monotonic() - self.boot), time=t,
                       clock_ok=t > 1735689600, noise_floor=self.noise_floor, batt_mv=self.batt_mv),
             stats=dict(s, posts_held=sum(1 for p in self.posts if p[3] is None), names_known=len(self.names),
@@ -3770,14 +4619,17 @@ class RoomServer:
             bans=[dict(pub=hexs(k), key=hexs(k[:6]), name=v["name"], ts=v["ts"]) for k, v in sorted(self.bans.items(), key=lambda x: -x[1]["ts"])],
             top_links=self.top_links(), discovery_min=self.cfg.discovery_interval_min, hour=self.hour_stats(),
             map_version=self.map_version, web=dict(viewers=self.web_clients[0], admins=self.web_clients[1]),
-            sys=self.sys_stats(), observer=self.observer.status() if self.observer else dict(
+            sys=self.sys_stats(), observer=dict(self.observer.status() if self.observer else dict(
                 enabled=bool(self.cfg.observer_enabled), iata=str(self.cfg.observer_iata).upper(),
                 status=bool(self.cfg.observer_status), packets=bool(self.cfg.observer_packets), rx=bool(self.cfg.observer_rx),
-                public_key=hexs(self.id.pub_key), queue_depth=0, queue_max=int(self.cfg.observer_queue_max), dropped=0,
+                public_key="", queue_depth=0, queue_max=int(self.cfg.observer_queue_max), dropped=0,
                 uptime=0, last_rx=0, last_error="", brokers={
                     "gomesh": dict(enabled=bool(self.cfg.observer_gomesh), connected=False, last_publish=0, last_error=""),
-                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}),
-            mqtt=self.mqtt_state(), repeater=self.vr_state())
+                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}), identity=str(self.cfg.observer_identity or ""), choices=self.observer_choices()),
+            mqtt=self.mqtt_state(), repeater=self.vr_state(), companion=self.vc_state(), airtime=self.air.state())
+        self.web_vc_admin = self.vc_admin_state()          # (served to admins only)
+        if self.tenants:
+            self.web_tenant_rows = [t.admin_row() for t in self.tenants.values()]
 
     def member_inroutes(self, m, n=5):
         """Other paths the member's floods took to reach us (member side first), most seen first, excluding the current."""
@@ -3790,8 +4642,9 @@ class RoomServer:
         return [dict(path=self.path_names(plen, path), hex=self.path_hex(plen, path), share=round(100 * w / tot))
                 for (plen, path), w in top if w > 0.05]
 
-    def top_links(self, n=10):
-        """Neighbours ranked by trace packet loss (lowest first, more traces first), untraced ones after."""
+    def top_links(self, n=25):
+        """Neighbours ranked by trace reliability (most reliable first, more traces first), untraced ones after; at
+        most n, our own virtual repeater (first, when it's on) among them."""
         rows = []
         f24 = lambda st: 0.5 ** (max(0, now_s() - st["tr_t"]) / (24 * 3600.0))
         for h, st in self.probes.items():
@@ -3809,14 +4662,15 @@ class RoomServer:
                 few=round(traces, 1) < 5,
                 in_last=st["in_last"], in_avg=None if st["in_avg"] is None else round(st["in_avg"], 1),
                 out_last=st["out_last"], out_avg=None if st["out_avg"] is None else round(st["out_avg"], 1),
-                rtt=None if st["rtt"] is None else int(st["rtt"]), last_ok=st["last_ok"])))
+                rtt=None if st["rtt"] is None else int(st["rtt"]), last_ok=st["last_ok"],
+                last_test=st["tr_t"] if st["tr_n"] > 0 else st["last_ok"])))     # last trace (or discovery reply)
         rows.sort(key=lambda r: r[0])
-        out = [r[1] for r in rows[:n]]
+        out = [r[1] for r in rows[:n - (self.vr is not None)]]
         if self.vr is not None:                             # our own repeater: the same radio, a perfect link
             snr = VIRTUAL_LINK_SNR
             out.insert(0, dict(name="%s (virtual)" % self.rpt_label(self.vr.pub[:2]), hash=hexs(self.vr.pub[:2]), loss=0.0,
                                traces=0, few=False, in_last=snr, in_avg=snr, out_last=snr, out_avg=snr, rtt=None,
-                               last_ok=now_s(), virtual=True))
+                               last_ok=now_s(), last_test=None, virtual=True))
         return out
 
     @staticmethod
@@ -3841,8 +4695,19 @@ class RoomServer:
             self.check_trace_timeout()
         if not self.members and self.cfg.trace_neighbours:
             self.maybe_trace()                              # (no member rounds to hang it on)
-        self.push_tick()
+        if self.tenants:
+            self.push_rooms()
+        else:
+            self.push_tick()
+        if self.vc is not None:
+            self.vc.service()                               # packets between the companion and the room, when due
+        for t in list(self.tenants.values()):
+            t.run_once()
+        if self.bus:
+            self.service_bus()
         self.service_tx()
+        if self.kaas is not None:
+            self.kaas.periodic()
         self.periodic()
 
 
@@ -3872,7 +4737,6 @@ class VirtualRepeater:
         self.stats = dict(flood=0, direct=0, acks=0, traces=0, discovery=0, internal=0, adverts=0, dups=0,
                           drop_scope=0, drop_hops=0, drop_loop=0, drop_airtime=0, drop_queue=0, drop_off=0)
         self.recent = collections.deque()                   # (monotonic, airtime ms) of each relay, last 10 minutes
-        self.budget_ms, self.budget_t = None, time.monotonic()
         self.disc_window = [0, 0]                           # discovery answers: window start (s), count
         self.started = now_s()                              # the firmware's discovery_mod_timestamp
         self.next_zero_advert = time.monotonic() + 8
@@ -3944,28 +4808,12 @@ class VirtualRepeater:
         t = int(self.room.airtime_ms(path_bytes(pkt.path_len) + len(pkt.payload) + 2) * factor)
         return random.randint(0, 5 * t) / 1000.0
 
-    def airtime_ok(self, airtime):
-        """Relays share an airtime budget: refills at repeater_airtime_pct of the time, holds a minute's worth."""
-        pct = max(0.0, min(100.0, float(self.cfg.repeater_airtime_pct or 0)))
-        if pct >= 100:
-            return True
-        now = time.monotonic()
-        cap = 60000.0 * pct / 100.0
-        if self.budget_ms is None:
-            self.budget_ms = cap
-        self.budget_ms = min(cap, self.budget_ms + (now - self.budget_t) * 1000.0 * pct / 100.0)
-        self.budget_t = now
-        if self.budget_ms < airtime:
-            return False
-        self.budget_ms -= airtime
-        return True
-
     def transmit(self, fwd, prio, delay, kind):
         if sum(1 for e in self.room.txq if e[7]) >= RPT_MAX_QUEUED:
             self.stats["drop_queue"] += 1
             return False
         at = self.room.airtime_ms(fwd.raw_length())
-        if not self.airtime_ok(at):
+        if not self.room.air.can("relay", at):             # (its share, or what others leave unused, is spent)
             self.stats["drop_airtime"] += 1
             return False
         self.room.queue_tx(fwd, prio, delay, relay=True)
@@ -4174,6 +5022,2002 @@ class VirtualRepeater:
         relayed = sum(self.stats[k] for k in ("flood", "direct", "acks", "traces"))
         return dict(self.stats, relayed=relayed, per_min=round(len(recent) / (span / 60.0), 1),
                     airtime_used=round(100.0 * sum(x[1] for x in recent) / (span * 1000.0), 1))
+
+# ============================================================================
+# Virtual companion: a chat node on the room's radio that MeshCore apps reach over TCP
+# ============================================================================
+
+VC_FIRMWARE_VER_CODE = 10             # companion protocol level answered (v10: repeat flag + path hash mode in DEVICE_INFO)
+VC_MAX_CONTACTS = 350                 # as the firmware's larger builds
+VC_MAX_CHANNELS = 40
+VC_QUEUE_MAX = 64                     # messages waiting for the app (firmware: 16)
+VC_MAX_FRAME = 176                    # BaseSerialInterface MAX_FRAME_SIZE
+VC_MAX_TEXT_LEN = 160                 # BaseChatMesh MAX_TEXT_LEN
+VC_ACK_TABLE = 8
+VC_ACK_COPY_S = 30                    # an ACK's other copies (multipart, plain, retries) are still its for this long
+VC_ADVERT_PATHS = 16
+VC_MAX_SIGN = 8 * 1024
+VC_PUBLIC_PSK = base64.b64decode("izOH6cXN6mrJ5e26oRXNcg==")
+PT_RAW_CUSTOM = 0x0F
+REQ_GET_TELEMETRY_DATA = 0x03
+
+# app -> companion commands (companion_radio MyMesh.cpp)
+CMD_APP_START, CMD_SEND_TXT_MSG, CMD_SEND_CHANNEL_TXT_MSG, CMD_GET_CONTACTS, CMD_GET_DEVICE_TIME = 1, 2, 3, 4, 5
+CMD_SET_DEVICE_TIME, CMD_SEND_SELF_ADVERT, CMD_SET_ADVERT_NAME, CMD_ADD_UPDATE_CONTACT = 6, 7, 8, 9
+CMD_SYNC_NEXT_MESSAGE, CMD_SET_RADIO_PARAMS, CMD_SET_RADIO_TX_POWER, CMD_RESET_PATH = 10, 11, 12, 13
+CMD_SET_ADVERT_LATLON, CMD_REMOVE_CONTACT, CMD_SHARE_CONTACT, CMD_EXPORT_CONTACT, CMD_IMPORT_CONTACT = 14, 15, 16, 17, 18
+CMD_REBOOT, CMD_GET_BATT_AND_STORAGE, CMD_SET_TUNING_PARAMS, CMD_DEVICE_QUERY = 19, 20, 21, 22
+CMD_EXPORT_PRIVATE_KEY, CMD_IMPORT_PRIVATE_KEY, CMD_SEND_RAW_DATA, CMD_SEND_LOGIN, CMD_SEND_STATUS_REQ = 23, 24, 25, 26, 27
+CMD_HAS_CONNECTION, CMD_LOGOUT, CMD_GET_CONTACT_BY_KEY, CMD_GET_CHANNEL, CMD_SET_CHANNEL = 28, 29, 30, 31, 32
+CMD_SIGN_START, CMD_SIGN_DATA, CMD_SIGN_FINISH, CMD_SEND_TRACE_PATH, CMD_SET_DEVICE_PIN = 33, 34, 35, 36, 37
+CMD_SET_OTHER_PARAMS, CMD_SEND_TELEMETRY_REQ, CMD_GET_CUSTOM_VARS, CMD_SET_CUSTOM_VAR = 38, 39, 40, 41
+CMD_GET_ADVERT_PATH, CMD_GET_TUNING_PARAMS = 42, 43
+CMD_SEND_BINARY_REQ, CMD_FACTORY_RESET, CMD_SEND_PATH_DISCOVERY_REQ = 50, 51, 52
+CMD_SET_FLOOD_SCOPE_KEY, CMD_SEND_CONTROL_DATA, CMD_GET_STATS, CMD_SEND_ANON_REQ = 54, 55, 56, 57
+CMD_SET_AUTOADD_CONFIG, CMD_GET_AUTOADD_CONFIG, CMD_GET_ALLOWED_REPEAT_FREQ, CMD_SET_PATH_HASH_MODE = 58, 59, 60, 61
+CMD_SEND_CHANNEL_DATA, CMD_SET_DEFAULT_FLOOD_SCOPE, CMD_GET_DEFAULT_FLOOD_SCOPE, CMD_SEND_RAW_PACKET = 62, 63, 64, 65
+CMD_RUN_CLI_COMMAND = 66
+VC_TX_CMDS = {CMD_SEND_TXT_MSG, CMD_SEND_CHANNEL_TXT_MSG, CMD_SEND_CHANNEL_DATA, CMD_SEND_SELF_ADVERT, CMD_SEND_LOGIN,
+              CMD_SEND_ANON_REQ, CMD_SEND_STATUS_REQ, CMD_SEND_PATH_DISCOVERY_REQ, CMD_SEND_TELEMETRY_REQ,
+              CMD_SEND_BINARY_REQ, CMD_SEND_TRACE_PATH, CMD_SEND_CONTROL_DATA}   # app commands that transmit
+VC_TX_BURST = 10                      # ...at most this many at once,
+VC_TX_EVERY_S = 3.0                   # then one more every this long (about 20 a minute)
+VC_SAVE_EVERY_S = 30                  # an app's name / position changes reach the config file at most this often
+VC_ADVERT_EVERY_S = 10                # and an advert at most this often (as the dashboard's button)
+
+# companion -> app replies
+RESP_OK, RESP_ERR, RESP_CONTACTS_START, RESP_CONTACT, RESP_END_OF_CONTACTS, RESP_SELF_INFO, RESP_SENT = 0, 1, 2, 3, 4, 5, 6
+RESP_CONTACT_MSG_RECV, RESP_CHANNEL_MSG_RECV, RESP_CURR_TIME, RESP_NO_MORE_MESSAGES, RESP_EXPORT_CONTACT = 7, 8, 9, 10, 11
+RESP_BATT_AND_STORAGE, RESP_DEVICE_INFO, RESP_PRIVATE_KEY, RESP_DISABLED = 12, 13, 14, 15
+RESP_CONTACT_MSG_RECV_V3, RESP_CHANNEL_MSG_RECV_V3, RESP_CHANNEL_INFO, RESP_SIGN_START, RESP_SIGNATURE = 16, 17, 18, 19, 20
+RESP_CUSTOM_VARS, RESP_ADVERT_PATH, RESP_TUNING_PARAMS, RESP_STATS, RESP_AUTOADD_CONFIG = 21, 22, 23, 24, 25
+RESP_ALLOWED_REPEAT_FREQ, RESP_CHANNEL_DATA_RECV, RESP_DEFAULT_FLOOD_SCOPE, RESP_CLI_REPLY = 26, 27, 28, 29
+
+# companion -> app pushes (sent at any time)
+PUSH_ADVERT, PUSH_PATH_UPDATED, PUSH_SEND_CONFIRMED, PUSH_MSG_WAITING, PUSH_RAW_DATA = 0x80, 0x81, 0x82, 0x83, 0x84
+PUSH_LOGIN_SUCCESS, PUSH_LOGIN_FAIL, PUSH_STATUS_RESPONSE, PUSH_LOG_RX_DATA, PUSH_TRACE_DATA = 0x85, 0x86, 0x87, 0x88, 0x89
+PUSH_NEW_ADVERT, PUSH_TELEMETRY_RESPONSE, PUSH_BINARY_RESPONSE, PUSH_PATH_DISCOVERY_RESPONSE = 0x8A, 0x8B, 0x8C, 0x8D
+PUSH_CONTROL_DATA, PUSH_CONTACT_DELETED, PUSH_CONTACTS_FULL = 0x8E, 0x8F, 0x90
+
+ERR_UNSUPPORTED_CMD, ERR_NOT_FOUND, ERR_TABLE_FULL, ERR_BAD_STATE, ERR_FILE_IO, ERR_ILLEGAL_ARG = 1, 2, 3, 4, 5, 6
+
+# settings an app may send that belong to the whole radio (or to hardware the companion doesn't have): acknowledged
+# so the app is happy, never applied
+VC_IGNORED = {CMD_SET_RADIO_PARAMS: "radio parameters", CMD_SET_RADIO_TX_POWER: "TX power",
+              CMD_SET_TUNING_PARAMS: "tuning parameters", CMD_SET_DEVICE_PIN: "Bluetooth PIN",
+              CMD_SET_PATH_HASH_MODE: "path hash mode", CMD_REBOOT: "reboot", CMD_FACTORY_RESET: "factory reset",
+              CMD_IMPORT_PRIVATE_KEY: "private key import", CMD_SET_DEVICE_TIME: "clock",
+              CMD_RUN_CLI_COMMAND: "CLI command"}
+
+
+def snr4(snr):
+    return struct.pack("b", max(-128, min(127, int(snr * 4))))
+
+
+def channel_hash(secret16):
+    return hashlib.sha256(secret16).digest()[0]
+
+
+def utf8_cut(b, n):
+    """At most n bytes of UTF-8, never ending mid-character."""
+    b = b[:n]
+    while b:
+        try:
+            b.decode()
+            return b
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return b
+
+
+def companion_changes(body):
+    """Dashboard companion settings -> {config key: value}, validated. Raises ValueError with a readable message."""
+    import ipaddress
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    ch = {}
+    for j, k in (("enabled", "companion_enabled"), ("auto_advert", "companion_auto_advert"),
+                 ("advert_flood", "companion_advert_flood")):
+        if j in body:
+            ch[k] = bool(body[j])
+    if "private_key" in body:
+        key = str(body["private_key"]).strip().lower()
+        if len(key) not in (64, 128) or any(c not in "0123456789abcdef" for c in key):
+            raise ValueError("private key must be 64 or 128 hexadecimal characters")
+        RepeaterIdentity(bytes.fromhex(key))                # never returned through dashboard state or logs
+        ch["companion_key"] = key
+    if "name" in body:
+        name = str(body["name"]).strip()
+        if not name or len(name.encode()) > 31:
+            raise ValueError("name: 1 to 31 bytes")
+        ch["companion_name"] = name
+    if "port" in body:
+        try:
+            port = int(body["port"])
+        except (TypeError, ValueError):
+            raise ValueError("port: not a number")
+        if not 1 <= port <= 65535:
+            raise ValueError("port: 1 to 65535")
+        ch["companion_port"] = port
+    if "advert_min" in body:
+        try:
+            v = int(body["advert_min"])
+        except (TypeError, ValueError):
+            raise ValueError("advert interval: not a number")
+        if not 1 <= v <= 10080:
+            raise ValueError("advert interval: 1 to 10080 minutes")
+        ch["companion_advert_interval_min"] = v
+    if "allow" in body:
+        allow = body["allow"]
+        if isinstance(allow, str):
+            allow = allow.replace(";", ",").split(",")
+        allow = [str(a).strip() for a in allow if str(a).strip()]
+        for a in allow:
+            try:
+                ipaddress.ip_network(a, strict=False)
+            except ValueError:
+                raise ValueError("allowed address %r: an IP address or network such as 192.168.1.0/24" % a)
+        ch["companion_allow"] = allow
+    return ch
+
+
+class VCContact:
+    __slots__ = ("pub", "type", "flags", "out_len", "out_path", "name", "adv_ts", "lat", "lon", "lastmod",
+                 "sync_since", "advert", "secret")
+
+    def __init__(self, pub):
+        self.pub = pub
+        self.type = self.flags = self.adv_ts = self.lat = self.lon = self.lastmod = self.sync_since = 0
+        self.out_len = None                                 # None = no known route (flood)
+        self.out_path = b""
+        self.name = ""
+        self.advert = b""                                   # last advert, raw (export / share)
+        self.secret = None
+
+    def frame(self, code):
+        """writeContactRespFrame."""
+        return bytes([code]) + self.pub + bytes([self.type, self.flags, 0xFF if self.out_len is None else self.out_len]) \
+            + self.out_path[:MAX_PATH_SIZE].ljust(MAX_PATH_SIZE, b"\0") + utf8_cut(self.name.encode(), 31).ljust(32, b"\0") \
+            + struct.pack("<IiiI", self.adv_ts & 0xFFFFFFFF, self.lat, self.lon, self.lastmod & 0xFFFFFFFF)
+
+
+class CompanionStore:
+    """companion.db: the virtual companion's contacts, channels, settings and the messages waiting for the app. Kept
+    apart from room.db: made the first time the companion is enabled, and deleting it resets only the companion."""
+
+    TABLES = {
+        "contacts": ("pubkey BLOB PRIMARY KEY", "type INT", "flags INT", "out_len INT", "out_path BLOB", "name TEXT",
+                     "adv_ts INT", "lat INT", "lon INT", "lastmod INT", "sync_since INT", "advert BLOB"),
+        "channels": ("idx INT PRIMARY KEY", "name TEXT", "secret BLOB"),
+        "prefs": ("k TEXT PRIMARY KEY", "v TEXT"),
+        "queue": ("id INTEGER PRIMARY KEY AUTOINCREMENT", "frame BLOB"),
+    }
+
+    def __init__(self, path):
+        self.path = path
+        if not os.path.exists(path):
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))   # holds private messages: owner-only from the start
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        self.db = sqlite3.connect(path)
+        for table, cols in self.TABLES.items():
+            self.db.execute("CREATE TABLE IF NOT EXISTS %s (%s)" % (table, ", ".join(cols)))
+        self.db.commit()
+
+    def contacts(self):
+        out = []
+        for r in self.db.execute("SELECT pubkey, type, flags, out_len, out_path, name, adv_ts, lat, lon, lastmod, sync_since, "
+                                 "advert FROM contacts ORDER BY rowid"):
+            c = VCContact(bytes(r[0]))
+            c.type, c.flags = r[1] or 0, r[2] or 0
+            c.out_len = r[3] if r[3] is not None and r[3] >= 0 and path_valid(r[3]) else None
+            c.out_path = bytes(r[4] or b"")
+            c.name, c.adv_ts, c.lat, c.lon, c.lastmod, c.sync_since = r[5] or "", r[6] or 0, r[7] or 0, r[8] or 0, r[9] or 0, r[10] or 0
+            c.advert = bytes(r[11] or b"")
+            out.append(c)
+        return out
+
+    def save_contacts(self, cs):
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO contacts (pubkey, type, flags, out_len, out_path, name, adv_ts, lat, lon, "
+                                "lastmod, sync_since, advert) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                [(c.pub, c.type, c.flags, -1 if c.out_len is None else c.out_len, c.out_path, c.name, c.adv_ts,
+                                  c.lat, c.lon, c.lastmod, c.sync_since, c.advert) for c in cs])
+
+    def delete_contact(self, pub):
+        with self.db:
+            self.db.execute("DELETE FROM contacts WHERE pubkey=?", (pub,))
+
+    def channels(self):
+        return {r[0]: (r[1] or "", bytes(r[2] or bytes(16))) for r in self.db.execute("SELECT idx, name, secret FROM channels")}
+
+    def save_channel(self, idx, name, secret):
+        with self.db:
+            if not name and not any(secret):
+                self.db.execute("DELETE FROM channels WHERE idx=?", (idx,))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO channels VALUES (?,?,?)", (idx, name, secret))
+
+    def prefs(self):
+        out = {}
+        for k, v in self.db.execute("SELECT k, v FROM prefs"):
+            try:
+                out[k] = json.loads(v)
+            except ValueError:
+                pass
+        return out
+
+    def save_prefs(self, prefs):
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO prefs VALUES (?,?)", [(k, json.dumps(v)) for k, v in prefs.items()])
+
+    def queued(self):
+        return [(r[0], bytes(r[1])) for r in self.db.execute("SELECT id, frame FROM queue ORDER BY id")]
+
+    def queue_add(self, frame):
+        with self.db:
+            return self.db.execute("INSERT INTO queue (frame) VALUES (?)", (frame,)).lastrowid
+
+    def queue_remove(self, qid):
+        with self.db:
+            self.db.execute("DELETE FROM queue WHERE id=?", (qid,))
+
+    def close(self):
+        try:
+            self.db.close()
+        except sqlite3.Error:
+            pass
+
+
+VC_OUT_MAX_FRAMES = 2048              # replies queued for the app, unread, before it's disconnected...
+VC_OUT_MAX_BYTES = 512 * 1024         # ...or this many bytes of them
+
+
+class _CompanionOut:
+    """Replies waiting for the companion's writer thread."""
+
+    def __init__(self):
+        self.q, self.size, self.cv = collections.deque(), 0, threading.Condition()
+
+
+class CompanionLink:
+    """The companion's TCP port, as WiFi companion firmware: one app at a time (a new connection replaces the old one),
+    frames "<" + u16 length + payload in and ">" + u16 length + payload out. Accepting and reading run on their own
+    threads and hand each command to the main loop as an event; replies are written from the main loop."""
+
+    ids = iter(range(1, 1 << 62))                          # connection ids, unique across links (a port change)
+
+    def __init__(self, bind, port, put, allowed):
+        self.bind, self.port, self.put, self.allowed = bind, port, put, allowed
+        self.lock = threading.Lock()
+        self.client, self.peer, self.client_id, self.out = None, None, 0, None
+        self.backlog = {}                                   # connection id -> commands handed to the main loop, not yet handled
+        self.running = True
+        fam = socket.AF_INET6 if ":" in bind else socket.AF_INET
+        self.sock = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind((bind, port))
+            self.sock.listen(2)
+        except OSError:
+            self.sock.close()
+            raise
+        self.port = self.sock.getsockname()[1]              # (port 0 in tests: the one the OS picked)
+        threading.Thread(target=self._accept, name="companion-accept", daemon=True).start()
+
+    def connected(self):
+        return self.client is not None
+
+    def _accept(self):
+        while self.running:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError:
+                break
+            ip = addr[0]
+            if not self.allowed(ip):
+                log.warning("virtual companion: refused a connection from %s (not in companion_allow)", ip)
+                conn.close()
+                continue
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 3, 0))  # a stalled app can't block the room
+            except (OSError, struct.error):
+                pass
+            out = _CompanionOut()
+            with self.lock:
+                old = self.client
+                cid = self.client_id = next(CompanionLink.ids)
+                self.client, self.peer, self.out = conn, ip, out
+            if old is not None:
+                self._close(old)
+            self.put(("vc_conn", cid, ip))
+            threading.Thread(target=self._read, args=(conn, cid), name="companion-read", daemon=True).start()
+            threading.Thread(target=self._write, args=(conn, out), name="companion-write", daemon=True).start()
+
+    def _read(self, conn, cid):
+        buf = b""
+        try:
+            while self.running:
+                d = conn.recv(4096)
+                if not d:
+                    break
+                buf += d
+                while True:
+                    i = buf.find(b"<")
+                    if i < 0:
+                        buf = b""
+                        break
+                    buf = buf[i:]
+                    if len(buf) < 3:
+                        break
+                    n = struct.unpack_from("<H", buf, 1)[0]
+                    if not 0 < n <= VC_MAX_FRAME:
+                        buf = buf[1:]                       # not a frame start: resynchronise
+                        continue
+                    if len(buf) < 3 + n:
+                        break
+                    frame, buf = buf[3:3 + n], buf[3 + n:]
+                    while self.backlog.get(cid, 0) > 64 and self.running and self.client is conn:
+                        time.sleep(0.01)                    # an app flooding commands waits; the room doesn't
+                    with self.lock:
+                        self.backlog[cid] = self.backlog.get(cid, 0) + 1
+                    self.put(("vc_cmd", cid, frame))
+        except OSError:
+            pass
+        finally:
+            with self.lock:
+                if self.client is conn:
+                    self.client, self.peer = None, None
+                self.backlog.pop(cid, None)
+            self._close(conn)
+            self.put(("vc_disc", cid))
+
+    def done(self, cid):
+        """The main loop handled one of this connection's commands."""
+        with self.lock:
+            if self.backlog.get(cid):
+                self.backlog[cid] -= 1
+
+    @staticmethod
+    def _close(conn):
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        conn.close()
+
+    def send(self, frame):
+        """Queue a reply for the app (the main loop never waits on the socket: a writer thread sends it). An app that
+        lets VC_OUT_MAX_BYTES / VC_OUT_MAX_FRAMES pile up unread is disconnected."""
+        with self.lock:
+            conn, out = self.client, self.out
+        if conn is None:
+            return False
+        data = b">" + struct.pack("<H", len(frame)) + frame
+        with out.cv:
+            full = len(out.q) >= VC_OUT_MAX_FRAMES or out.size + len(data) > VC_OUT_MAX_BYTES
+            if not full:
+                out.q.append(data)
+                out.size += len(data)
+                out.cv.notify()
+        if full:
+            log.warning("virtual companion: disconnected %s, which wasn't reading its replies", self.peer)
+            self._drop(conn)
+            return False
+        return True
+
+    def _write(self, conn, out):
+        try:
+            while True:
+                with out.cv:
+                    while not out.q and self.client is conn and self.running:
+                        out.cv.wait(1.0)
+                    if self.client is not conn or not self.running:
+                        return
+                    data = out.q.popleft()
+                    out.size -= len(data)
+                conn.sendall(data)                          # (SO_SNDTIMEO: an app stalled 3 s is dropped)
+        except OSError:
+            self._drop(conn)
+
+    def _drop(self, conn):
+        with self.lock:
+            if self.client is conn:
+                self.client, self.peer = None, None
+        self._close(conn)
+
+    def stop(self):
+        self.running = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)            # wakes the blocked accept() (close alone leaves it listening)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        with self.lock:
+            conn, self.client, self.peer = self.client, None, None
+        if conn is not None:
+            self._close(conn)
+
+
+class VirtualCompanion:
+    """A MeshCore chat node (companion_radio firmware: MyMesh.cpp + BaseChatMesh.cpp) with its own key, sharing the
+    room's radio, that phone apps drive over TCP. It doesn't repeat. The room and the virtual repeater are on the same
+    radio, so traffic between them and the companion never goes on the air: what the room or repeater sends that is for
+    the companion is handed to it, what the companion sends hears the room first, and anything that was only for the
+    room isn't transmitted. Radio-wide settings from the app are acknowledged and ignored (VC_IGNORED)."""
+
+    PREFS = dict(manual_add=0, autoadd_config=0, autoadd_max_hops=0, telem_base=0, telem_loc=0, telem_env=0,
+                 advert_loc_policy=0, multi_acks=0, app_ver=3, scope_name="", scope_key="")
+
+    def __init__(self, room, ident, store):
+        self.room, self.id, self.pub, self.store = room, ident, ident.pub_key, store
+        self.contacts = collections.OrderedDict((c.pub, c) for c in store.contacts())
+        self.anon = {}                                      # transient contacts for requests to non-contacts (not kept)
+        self.channels = store.channels()                    # idx -> (name, 16-byte secret)
+        if not self.channels:
+            self.channels[0] = ("Public", VC_PUBLIC_PSK)
+            store.save_channel(0, "Public", VC_PUBLIC_PSK)
+        self.prefs = dict(self.PREFS)
+        self.prefs.update({k: v for k, v in store.prefs().items() if k in self.PREFS})
+        self.queue = store.queued()                         # [(row id, frame)], oldest first
+        self.seen = {}
+        self.inbox, self.outbox, self.seq = [], [], 0      # heaps: packets to/from the room, due when the radio would send
+        self.expected = collections.deque(maxlen=VC_ACK_TABLE)   # [ack, sent (monotonic), contact pub]
+        self.acked = collections.deque(maxlen=VC_ACK_TABLE)      # (ack, monotonic) matched lately: its other copies
+        self.pending = dict(login=None, status=None, telemetry=None, req=None, discovery=None)
+        self.traces = {}                                    # tag -> expiry: our own traces (their results go to the app)
+        self.connections = {}                               # server pub -> keep-alive state (logins with keep-alive)
+        self.advert_paths = collections.OrderedDict()       # pub[:7] -> (recv ts, path_len, path)
+        self.send_scope, self.send_unscoped = None, False
+        self.sign_buf = None
+        self.last_unique = 0
+        self.link, self.link_error, self.link_addr = None, "", None
+        self.dirty = set()
+        self.next_flush = time.monotonic() + 15
+        self.next_advert = time.monotonic() + 10
+        self.ignored_logged = set()
+        self.stats = dict(rx=0, internal_in=0, internal_out=0, msgs_in=0, msgs_out=0, frames=0, ignored=0)
+
+    cfg = property(lambda s: s.room.cfg)
+
+    # ---------------------------------------------------------------- app link
+
+    def listen(self):
+        """Open (or move) the TCP port. Only called while the companion is enabled: the port is closed otherwise."""
+        want = (str(self.cfg.companion_bind or "0.0.0.0"), int(self.cfg.companion_port))
+        if self.link is not None and self.link_addr == want:
+            return
+        if self.link is not None:
+            self.link.stop()
+            self.link = None
+        put = getattr(self.room, "events_put", None) or (lambda ev: None)
+        try:
+            self.link = CompanionLink(want[0], want[1], put, self.allowed)
+            self.link_addr, self.link_error = want, ""
+            log.info("virtual companion: listening on %s:%d", want[0], self.link.port)
+        except OSError as e:
+            self.link_addr, self.link_error = None, str(e.strerror or e)
+            log.error("virtual companion: can't open TCP port %d on %s: %s", want[1], want[0], self.link_error)
+
+    def allowed(self, ip):
+        import ipaddress
+        nets = self.cfg.companion_allow or []
+        if isinstance(nets, str):                           # (hand-edited config: "a, b")
+            nets = [n.strip() for n in nets.split(",") if n.strip()]
+        if not nets:
+            return True
+        try:
+            a = ipaddress.ip_address(ip.split("%")[0])
+            if getattr(a, "ipv4_mapped", None):
+                a = a.ipv4_mapped
+            return any(a in ipaddress.ip_network(str(n), strict=False) for n in nets)
+        except ValueError:
+            return False
+
+    def close(self):
+        if self.link is not None:
+            self.link.stop()
+            self.link = None
+        if getattr(self, "cfg_dirty", False):
+            self.cfg_dirty = False
+            self.cfg.save()                                 # (a name / position the app set, not saved yet)
+        self.flush()
+        self.store.close()
+
+    connected = property(lambda s: s.link is not None and s.link.connected())
+
+    def write(self, frame):
+        if self.link is not None:
+            self.link.send(frame[:VC_MAX_FRAME])
+
+    def ok(self):
+        self.write(bytes([RESP_OK]))
+
+    def err(self, code):
+        self.write(bytes([RESP_ERR, code]))
+
+    def app_event(self, ev):
+        kind, cid = ev[0], ev[1]
+        link = self.link
+        if link is not None and kind == "vc_cmd":
+            link.done(cid)
+        if link is None or cid != link.client_id:
+            return                                          # from a connection that has since been replaced
+        if kind == "vc_conn":
+            self.sign_buf = None
+            log.info("virtual companion: app connected from %s", ev[2])
+        elif kind == "vc_disc":
+            log.info("virtual companion: app disconnected")
+        elif kind == "vc_cmd":
+            self.on_frame(ev[2])
+
+    # ---------------------------------------------------------------- helpers
+
+    def unique_time(self):
+        self.last_unique = max(now_s(), self.last_unique + 1)
+        return self.last_unique
+
+    def secret(self, c):
+        if c.secret is None:
+            try:
+                c.secret = self.id.shared_secret(c.pub)
+            except ValueError:                              # not a usable public key: nothing decrypts with it
+                c.secret = bytes(32)
+        return c.secret
+
+    def find(self, prefix):
+        for tab in (self.contacts, self.anon):
+            for pub, c in tab.items():
+                if pub[:len(prefix)] == prefix:
+                    return c
+        return None
+
+    def contact(self, pub):
+        return self.contacts.get(pub) or self.anon.get(pub)
+
+    def touch(self, c):
+        if c.pub in self.contacts:
+            self.dirty.add(c.pub)
+
+    def save_prefs(self):
+        self.store.save_prefs(self.prefs)
+
+    def was_seen(self, pkt):
+        return pkt.packet_hash() in self.seen
+
+    def seen_mark(self, pkt):
+        self.seen[pkt.packet_hash()] = None
+        while len(self.seen) > 512:
+            self.seen.pop(next(iter(self.seen)))
+
+    def check_dup(self, pkt):
+        if self.was_seen(pkt):
+            return True
+        self.seen_mark(pkt)
+        return False
+
+    def flush(self):
+        if self.dirty:
+            self.store.save_contacts([self.contacts[k] for k in self.dirty if k in self.contacts])
+            self.dirty.clear()
+
+    def position(self):
+        if self.prefs["advert_loc_policy"] == 0:            # ADVERT_LOC_NONE (the app's "share position" setting)
+            return 0.0, 0.0
+        return float(self.cfg.companion_lat or 0), float(self.cfg.companion_lon or 0)
+
+    def make_self_advert(self):
+        lat, lon = self.position()
+        return make_advert(self.id, ADV_TYPE_CHAT, self.cfg.companion_name, lat, lon)
+
+    # ---------------------------------------------------------------- sending
+
+    def scope_key(self):
+        if self.send_unscoped:
+            return None
+        if self.send_scope:
+            return self.send_scope
+        return bytes.fromhex(self.prefs["scope_key"]) if self.prefs["scope_key"] else None
+
+    def send_flood(self, pkt, delay=0.0, scope=None):
+        key = self.scope_key() if scope is None else scope
+        pkt.path_len, pkt.path = int(self.cfg.path_hash_mode or 0) << 6, b""
+        if key:
+            pkt.header = (pkt.header & ~0x03) | ROUTE_TRANSPORT_FLOOD
+            pkt.transport_codes = (transport_code(key, pkt), 0)
+        else:
+            pkt.header = (pkt.header & ~0x03) | ROUTE_FLOOD
+        self._out(pkt, 2 if pkt.ptype == PT_PATH else 3 if pkt.ptype == PT_ADVERT else 1, delay)
+
+    def send_direct(self, pkt, path, plen, delay=0.0):
+        if self.room.vr is not None and plen & 63:
+            path, plen = self.room.vr.strip_first_hops(path, plen)   # our own repeater is this radio: skip it
+        pkt.header = (pkt.header & ~0x03) | ROUTE_DIRECT
+        pkt.path_len, pkt.path = plen, path[:path_bytes(plen)]
+        self._out(pkt, 1 if pkt.ptype == PT_PATH else 0, delay)
+
+    def send_zero_hop(self, pkt, delay=0.0):
+        pkt.header = (pkt.header & ~0x03) | ROUTE_DIRECT
+        pkt.path_len, pkt.path = 0, b""
+        self._out(pkt, 0, delay)
+
+    def send_to(self, c, pkt, delay=0.0):
+        if c.out_len is None:
+            self.send_flood(pkt, delay)
+        else:
+            self.send_direct(pkt, c.out_path, c.out_len, delay)
+
+    def _out(self, pkt, prio, delay):
+        self.seen_mark(pkt)
+        self.seq += 1
+        heapq.heappush(self.outbox, (time.monotonic() + delay, self.seq, pkt, prio))
+
+    def deliver(self, pkt, delay=0.0):
+        """Something the room or the virtual repeater is sending: this node hears it (internally), when it's sent."""
+        self.seq += 1
+        heapq.heappush(self.inbox, (time.monotonic() + delay, self.seq, pkt))
+
+    def service(self):
+        now = time.monotonic()
+        if getattr(self, "cfg_dirty", False) and now - getattr(self, "cfg_saved", 0.0) >= VC_SAVE_EVERY_S:
+            self.cfg_dirty, self.cfg_saved = False, now
+            self.cfg.save()
+        while self.inbox and self.inbox[0][0] <= now:
+            pkt = heapq.heappop(self.inbox)[2]
+            pkt.snr, pkt.rssi = VIRTUAL_LINK_SNR, 0
+            self.on_rx(pkt)
+        while self.outbox and self.outbox[0][0] <= now:
+            _, _, pkt, prio = heapq.heappop(self.outbox)
+            self.room.companion_tx(pkt, prio)
+
+    def est_timeout(self, pkt):
+        t = self.room.airtime_ms(pkt.raw_length())
+        if pkt.is_flood:
+            return int(500 + 16 * t)
+        return int(500 + (t * 6 + 250) * ((pkt.path_len & 63) + 1))
+
+    def sent_frame(self, pkt, tag):
+        return bytes([RESP_SENT, 1 if pkt.is_flood else 0]) + tag + struct.pack("<I", self.est_timeout(pkt))
+
+    def make_datagram(self, ptype, c, data):
+        return Packet(ptype, bytes([c.pub[0], self.pub[0]]) + encrypt_then_mac(self.secret(c), data))
+
+    def make_path_return(self, c, path, plen, extra_type=None, extra=b""):
+        if path_bytes(plen) + len(extra) + 5 > MAX_PACKET_PAYLOAD - 2 - CIPHER_BLOCK_SIZE:
+            return None
+        data = bytes([plen]) + path[:path_bytes(plen)]
+        data += bytes([extra_type]) + extra if extra else b"\xFF" + os.urandom(4)
+        return Packet(PT_PATH, bytes([c.pub[0], self.pub[0]]) + encrypt_then_mac(self.secret(c), data))
+
+    def send_advert(self, flood):
+        pkt = self.make_self_advert()
+        if flood:
+            key = bytes.fromhex(self.prefs["scope_key"]) if self.prefs["scope_key"] else None
+            self.send_flood(pkt, scope=key or b"")
+        else:
+            self.send_zero_hop(pkt)
+        log.info("virtual companion: sent %s advert", "flood" if flood else "zero-hop")
+
+    # ---------------------------------------------------------------- what the room hands over
+
+    def expects_ack(self, ack):
+        """An ACK for this node: one it waits for, or another copy of one it just got (a room acknowledges twice,
+        multipart then plain: both are for this node, and neither belongs on the air)."""
+        now = time.monotonic()
+        return any(e[0] == ack for e in self.expected) or any(cn["ack"] == ack for cn in self.connections.values()) \
+            or any(a == ack and now - t < VC_ACK_COPY_S for a, t in self.acked)
+
+    def claims(self, pkt):
+        """Is this packet, about to be sent by the room or the virtual repeater, for this node? Then it's handed over
+        instead of going on the air. Decides without changing anything (the packet is processed when it's due)."""
+        t, p = pkt.ptype, pkt.payload
+        if t == PT_TRACE:
+            return pkt.is_direct and len(p) >= 9 and p[:4] in self.traces \
+                and (pkt.path_len << (p[8] & 3)) >= len(p) - 9
+        if pkt.is_direct and pkt.hop_count > 0:
+            return False
+        if t == PT_ACK:
+            return len(p) >= 4 and self.expects_ack(p[:4])
+        if t == PT_MULTIPART:
+            return len(p) >= 5 and (p[0] & 0x0F) == PT_ACK and self.expects_ack(p[1:5])
+        if t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG):
+            if len(p) <= 2 + CIPHER_MAC_SIZE or p[0] != self.pub[0]:
+                return False
+            return any(mac_then_decrypt(self.secret(c), p[2:]) is not None
+                       for tab in (self.contacts, self.anon) for c in tab.values() if c.pub[0] == p[1])
+        return False
+
+    # ---------------------------------------------------------------- receive (Mesh::onRecvPacket, no forwarding)
+
+    def on_rx(self, pkt, raw=None):
+        """A packet heard on the radio (raw given) or handed over internally. True if it was for this node (then the
+        virtual repeater doesn't relay it)."""
+        try:
+            if raw is not None:
+                self.stats["rx"] += 1
+                if self.connected and len(raw) + 3 <= VC_MAX_FRAME:
+                    self.write(bytes([PUSH_LOG_RX_DATA]) + snr4(pkt.snr) + struct.pack("b", max(-128, min(127, int(pkt.rssi)))) + raw)
+            else:
+                self.stats["internal_in"] += 1
+            return self._rx(pkt)
+        except Exception:
+            log.exception("virtual companion")
+            return False
+
+    def _rx(self, pkt):
+        t, p = pkt.ptype, pkt.payload
+        if pkt.is_direct and t == PT_TRACE:
+            return self.rx_trace(pkt)
+        if pkt.is_direct and t == PT_CONTROL and p[:1] and p[0] & 0x80:
+            if pkt.hop_count == 0:
+                self.write(bytes([PUSH_CONTROL_DATA]) + snr4(pkt.snr) + struct.pack("b", max(-128, min(127, int(pkt.rssi))))
+                           + bytes([pkt.path_len]) + p)
+            return False
+        if pkt.is_direct and pkt.hop_count > 0:
+            if t == PT_ACK and len(p) >= 4:
+                self.process_ack(p[:4])                     # an ACK on its way past us (firmware does this too)
+            return False
+        if t == PT_ACK:
+            return len(p) >= 4 and not self.check_dup(pkt) and self.process_ack(p[:4], pkt)
+        if t == PT_MULTIPART:
+            if len(p) >= 5 and (p[0] & 0x0F) == PT_ACK:
+                tmp = Packet(PT_ACK, p[1:])
+                tmp.header, tmp.path_len, tmp.path = pkt.header, pkt.path_len, pkt.path
+                return not self.check_dup(tmp) and self.process_ack(p[1:5], tmp)
+            return False
+        if t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG):
+            return self.rx_peer(pkt)
+        if t in (PT_GRP_TXT, PT_GRP_DATA):
+            self.rx_group(pkt)
+        elif t == PT_ADVERT:
+            self.rx_advert(pkt)
+        elif t == PT_RAW_CUSTOM and pkt.is_direct and not self.check_dup(pkt):
+            self.write(bytes([PUSH_RAW_DATA]) + snr4(pkt.snr) + struct.pack("b", max(-128, min(127, int(pkt.rssi)))) + b"\xFF" + p)
+        return False
+
+    def rx_trace(self, pkt):
+        p = pkt.payload
+        if len(p) < 9 or pkt.path_len >= MAX_PATH_SIZE:
+            return False
+        flags = p[8]
+        sz = flags & 3
+        hashes = p[9:]
+        if (pkt.path_len << sz) < len(hashes) or p[:4] not in self.traces:
+            return False                                    # not at its end yet, or not one of ours
+        del self.traces[p[:4]]
+        self.write(bytes([PUSH_TRACE_DATA, 0, len(hashes), flags]) + p[:8] + hashes + pkt.path[:len(hashes) >> sz] + snr4(pkt.snr))
+        return True
+
+    def rx_peer(self, pkt):
+        p = pkt.payload
+        if len(p) <= 2 + CIPHER_MAC_SIZE or self.check_dup(pkt) or p[0] != self.pub[0]:
+            return False
+        for c in [c for tab in (self.contacts, self.anon) for c in tab.values() if c.pub[0] == p[1]]:
+            data = mac_then_decrypt(self.secret(c), p[2:])
+            if data is None:
+                continue
+            self.mark_active(c)
+            if pkt.ptype == PT_PATH:
+                self.rx_path(pkt, c, data)
+            else:
+                self.rx_data(pkt, c, data)
+            return True
+        return False
+
+    def rx_path(self, pkt, c, data):
+        plen = data[0]
+        if not path_valid(plen):
+            return
+        k = 1 + path_bytes(plen)
+        path = bytes(data[1:k])
+        extra_type = data[k] & 0x0F if k < len(data) else 0xFF
+        extra = data[k + 1:]
+        if extra_type == PT_RESPONSE and len(extra) > 4 and extra[:4] == self.pending["discovery"]:
+            self.pending["discovery"] = None                # path discovery answered: report both ways, no reciprocal path
+            if path_valid(pkt.path_len):
+                self.write(bytes([PUSH_PATH_DISCOVERY_RESPONSE, 0]) + c.pub[:6] + bytes([plen]) + path
+                           + bytes([pkt.path_len]) + pkt.path[:path_bytes(pkt.path_len)])
+            return
+        c.out_len, c.out_path = plen, path
+        c.lastmod = now_s()
+        self.touch(c)
+        self.write(bytes([PUSH_PATH_UPDATED]) + c.pub)
+        if extra_type == PT_ACK and len(extra) >= 4:
+            self.process_ack(extra[:4])
+        elif extra_type == PT_RESPONSE and extra:
+            self.on_response(c, extra)
+        if pkt.is_flood:                                    # reciprocal path, sent direct on the path we were given
+            pr = self.make_path_return(c, pkt.path, pkt.path_len)
+            if pr:
+                self.send_direct(pr, path, plen, 0.5)
+
+    def rx_data(self, pkt, c, data):
+        t = pkt.ptype
+        if t == PT_TXT_MSG and len(data) > 5:
+            ts = struct.unpack_from("<I", data, 0)[0]
+            flags = data[4] >> 2
+            text = data[5:].split(b"\0", 1)[0]
+            if flags == TXT_TYPE_PLAIN:
+                c.lastmod = now_s()
+                self.touch(c)
+                self.queue_msg(c, TXT_TYPE_PLAIN, pkt, ts, b"", text)
+                tail = data[5 + len(text) + 1:5 + len(text) + 2] or b"\0"
+                self.reply_ack(pkt, c, sha256(data[:5 + len(text)], c.pub)[:4] + tail + os.urandom(1))
+            elif flags == TXT_TYPE_CLI_DATA:
+                self.queue_msg(c, TXT_TYPE_CLI_DATA, pkt, ts, b"", text)
+                if pkt.is_flood:
+                    pr = self.make_path_return(c, pkt.path, pkt.path_len)
+                    if pr:
+                        self.send_flood(pr)
+            elif flags == TXT_TYPE_SIGNED_PLAIN and len(data) > 9:
+                if ts > c.sync_since:
+                    c.sync_since = ts                       # room posts: where to resume after the next login
+                c.lastmod = now_s()
+                self.touch(c)
+                text = data[9:].split(b"\0", 1)[0]
+                self.queue_msg(c, TXT_TYPE_SIGNED_PLAIN, pkt, ts, data[5:9], text)
+                self.reply_ack(pkt, c, sha256(data[:9 + len(text)], self.pub)[:4])
+        elif t == PT_REQ and len(data) > 4:
+            reply = self.on_request(c, data[:4], data[4:])
+            if reply:
+                if pkt.is_flood:
+                    pr = self.make_path_return(c, pkt.path, pkt.path_len, PT_RESPONSE, reply)
+                    if pr:
+                        self.send_flood(pr, SERVER_RESPONSE_DELAY)
+                else:
+                    self.send_to(c, self.make_datagram(PT_RESPONSE, c, reply), SERVER_RESPONSE_DELAY)
+        elif t == PT_RESPONSE and data:
+            self.on_response(c, data)
+            if pkt.is_flood and c.out_len is not None:
+                self.return_path_retry(c, pkt)
+
+    def return_path_retry(self, c, pkt):
+        """They still flood though we have a route: they may have missed our path return, so send it again."""
+        pr = self.make_path_return(c, pkt.path, pkt.path_len)
+        if pr:
+            self.send_direct(pr, c.out_path, c.out_len, 3.0)
+
+    def reply_ack(self, pkt, c, ack):
+        if pkt.is_flood:                                    # tell them the path to us, carrying the ACK
+            pr = self.make_path_return(c, pkt.path, pkt.path_len, PT_ACK, ack)
+            if pr:
+                self.send_flood(pr, TXT_ACK_DELAY)
+        elif c.out_len is None:
+            self.send_flood(Packet(PT_ACK, ack), TXT_ACK_DELAY)
+        else:
+            d = TXT_ACK_DELAY
+            if self.prefs["multi_acks"]:
+                self.send_direct(Packet(PT_MULTIPART, bytes([(1 << 4) | PT_ACK]) + ack), c.out_path, c.out_len, d)
+                d += 0.3
+            self.send_direct(Packet(PT_ACK, ack), c.out_path, c.out_len, d)
+
+    def on_request(self, c, tag, req):
+        """Requests to us: telemetry only, as allowed by the app's telemetry settings (per-contact flags or all)."""
+        if req[0] != REQ_GET_TELEMETRY_DATA:
+            return None
+        cp = c.flags >> 1
+        perm = 0
+        for mode, bit in ((self.prefs["telem_base"], 1), (self.prefs["telem_loc"], 2)):
+            if mode == 2:
+                perm |= bit
+            elif mode == 1:
+                perm |= cp & bit
+        if len(req) > 1:
+            perm &= ~req[1]                                 # the requester's inverse mask
+        if not perm & 1:
+            return None
+        lpp = struct.pack(">BBH", 1, 116, int(self.room.batt_mv / 10))   # channel 1, voltage, 0.01 V
+        lat, lon = float(self.cfg.companion_lat or 0), float(self.cfg.companion_lon or 0)
+        if perm & 2 and (lat or lon):
+            lpp += bytes([1, 136]) + int(lat * 1e4).to_bytes(3, "big", signed=True) \
+                + int(lon * 1e4).to_bytes(3, "big", signed=True) + bytes(3)
+        return tag + lpp
+
+    def on_response(self, c, data):
+        tag = data[:4]
+        pl = self.pending
+        if pl["login"] is not None and c.pub[:4] == pl["login"]:
+            pl["login"] = None
+            if data[4:6] == b"OK":                          # legacy repeater login
+                f = bytes([PUSH_LOGIN_SUCCESS, 0]) + c.pub[:6]
+            elif len(data) > 4 and data[4] == RESP_SERVER_LOGIN_OK:
+                d = data.ljust(13, b"\0")
+                if d[5]:
+                    self.connections[c.pub] = dict(ka=d[5] * 16, next=time.monotonic() + d[5] * 16, ack=None, last=now_s())
+                f = bytes([PUSH_LOGIN_SUCCESS, d[6]]) + c.pub[:6] + tag + bytes([d[7], d[12]])
+            else:
+                f = bytes([PUSH_LOGIN_FAIL, 0]) + c.pub[:6]
+        elif len(data) > 4 and pl["status"] is not None and c.pub[:4] == pl["status"]:
+            pl["status"] = None
+            f = bytes([PUSH_STATUS_RESPONSE, 0]) + c.pub[:6] + data[4:]
+        elif len(data) > 4 and tag == pl["telemetry"]:
+            pl["telemetry"] = None
+            f = bytes([PUSH_TELEMETRY_RESPONSE, 0]) + c.pub[:6] + data[4:]
+        elif len(data) > 4 and tag == pl["req"]:
+            pl["req"] = None
+            f = bytes([PUSH_BINARY_RESPONSE, 0]) + tag + data[4:]
+        else:
+            return
+        self.write(f)
+
+    def process_ack(self, ack, pkt=None):
+        for e in self.expected:
+            if e[0] == ack:
+                self.write(bytes([PUSH_SEND_CONFIRMED]) + ack + struct.pack("<I", int((time.monotonic() - e[1]) * 1000)))
+                e[0] = None                                 # the same ACK can arrive more than once
+                self.acked.append((ack, time.monotonic()))
+                c = self.contacts.get(e[2])
+                if pkt is not None and pkt.is_flood and c is not None and c.out_len is not None:
+                    self.return_path_retry(c, pkt)
+                return True
+        for cn in self.connections.values():
+            if cn["ack"] is not None and cn["ack"] == ack:
+                cn["ack"], cn["last"], cn["next"] = None, now_s(), time.monotonic() + cn["ka"]
+                return True
+        return False
+
+    def mark_active(self, c):
+        cn = self.connections.get(c.pub)
+        if cn is not None:
+            cn["last"], cn["next"] = now_s(), time.monotonic() + cn["ka"]
+
+    def rx_group(self, pkt):
+        p = pkt.payload
+        if len(p) <= 3 or self.check_dup(pkt):
+            return
+        for idx in sorted(self.channels):
+            name, key = self.channels[idx]
+            if not any(key) or channel_hash(key) != p[0]:
+                continue
+            data = mac_then_decrypt(key + bytes(16), p[1:])
+            if data is None:
+                continue
+            plen = pkt.path_len if pkt.is_flood else 0xFF
+            if pkt.ptype == PT_GRP_TXT:
+                if len(data) < 5 or data[4] >> 2:
+                    return
+                text = data[5:].split(b"\0", 1)[0]
+                f = bytes([RESP_CHANNEL_MSG_RECV_V3]) + snr4(pkt.snr) + bytes([0, 0, idx, plen, TXT_TYPE_PLAIN]) + data[:4] + text
+            else:
+                if len(data) < 3 or data[2] > len(data) - 3 or data[2] > VC_MAX_FRAME - 9:
+                    return
+                f = bytes([RESP_CHANNEL_DATA_RECV]) + snr4(pkt.snr) + bytes([0, 0, idx, plen]) + data[:3] + data[3:3 + data[2]]
+            self.enqueue(f)
+            return
+
+    def rx_advert(self, pkt):
+        p = pkt.payload
+        if len(p) < PUB_KEY_SIZE + 4 + SIGNATURE_SIZE or p[:32] == self.pub or self.check_dup(pkt):
+            return
+        a = RoomServer.parse_advert(pkt)
+        if a is None or not a["name"]:
+            return
+        pub = a["pub"]
+        c = self.contacts.get(pub)
+        if c is not None and a["ts"] <= c.adv_ts:
+            return                                          # replayed
+        self.anon.pop(pub, None)
+        if path_valid(pkt.path_len):
+            k7 = pub[:7]
+            self.advert_paths.pop(k7, None)
+            self.advert_paths[k7] = (now_s(), pkt.path_len, pkt.path[:path_bytes(pkt.path_len)])
+            while len(self.advert_paths) > VC_ADVERT_PATHS:
+                self.advert_paths.popitem(last=False)
+        saved = Packet()                                    # kept for export / share: flood route, no transport codes
+        saved.header = (pkt.header & ~0x03) | ROUTE_FLOOD
+        saved.path_len, saved.path, saved.payload = pkt.path_len, pkt.path, pkt.payload
+        if c is None:
+            new = VCContact(pub)
+            self.fill_from_advert(new, a, saved)
+            if not self.auto_add(a["type"]) or (self.prefs["autoadd_max_hops"] and pkt.hop_count >= self.prefs["autoadd_max_hops"]):
+                self.write(new.frame(PUSH_NEW_ADVERT))      # the app may add it
+                return
+            if not self.add_contact(new):
+                self.write(new.frame(PUSH_NEW_ADVERT))
+                self.write(bytes([PUSH_CONTACTS_FULL]))
+                return
+            c = new
+        else:
+            self.fill_from_advert(c, a, saved)
+        self.touch(c)
+        self.write(bytes([PUSH_ADVERT]) + pub)
+
+    @staticmethod
+    def fill_from_advert(c, a, saved):
+        c.name = a["name"]
+        c.type = a["type"]
+        if a["lat"] is not None:
+            c.lat, c.lon = int(round(a["lat"] * 1e6)), int(round(a["lon"] * 1e6))
+        c.adv_ts = a["ts"]
+        c.lastmod = now_s()
+        c.advert = saved.encode()
+
+    def auto_add(self, atype):
+        if not self.prefs["manual_add"] & 1:
+            return True
+        bit = {ADV_TYPE_CHAT: 2, ADV_TYPE_REPEATER: 4, ADV_TYPE_ROOM: 8, ADV_TYPE_SENSOR: 16}.get(atype)
+        return bool(bit and self.prefs["autoadd_config"] & bit)
+
+    def add_contact(self, c):
+        if len(self.contacts) >= VC_MAX_CONTACTS:
+            if not self.prefs["autoadd_config"] & 1:
+                return False
+            olds = [x for x in self.contacts.values() if not x.flags & 1]
+            if not olds:
+                return False
+            old = min(olds, key=lambda x: x.lastmod)        # overwrite the oldest non-favourite
+            self.remove_contact(old.pub)
+            self.write(bytes([PUSH_CONTACT_DELETED]) + old.pub)
+        self.contacts[c.pub] = c
+        self.touch(c)
+        return True
+
+    def remove_contact(self, pub):
+        self.contacts.pop(pub, None)
+        self.dirty.discard(pub)
+        self.connections.pop(pub, None)
+        self.store.delete_contact(pub)
+
+    # ---------------------------------------------------------------- messages for the app
+
+    def queue_msg(self, c, txt_type, pkt, ts, extra, text):
+        self.stats["msgs_in"] += 1
+        plen = pkt.path_len if pkt.is_flood else 0xFF
+        self.enqueue(bytes([RESP_CONTACT_MSG_RECV_V3]) + snr4(pkt.snr) + bytes([0, 0]) + c.pub[:6]
+                     + bytes([plen, txt_type]) + struct.pack("<I", ts) + extra + text)
+
+    def enqueue(self, frame):
+        """Kept (in companion.db) until the app fetches it. Stored in the v3 layout; older apps get it converted."""
+        frame = frame[:VC_MAX_FRAME]
+        if len(self.queue) >= VC_QUEUE_MAX:
+            drop = next((e for e in self.queue if e[1][0] in (RESP_CHANNEL_MSG_RECV_V3, RESP_CHANNEL_DATA_RECV)), self.queue[0])
+            self.queue.remove(drop)                         # full: the oldest channel message goes first
+            self.store.queue_remove(drop[0])
+        self.queue.append((self.store.queue_add(frame), frame))
+        if self.connected:
+            self.write(bytes([PUSH_MSG_WAITING]))
+
+    # ---------------------------------------------------------------- periodic
+
+    def periodic(self):
+        now = time.monotonic()
+        c = self.cfg
+        iv = float(c.companion_advert_interval_min or 0)
+        if c.companion_auto_advert and iv > 0 and now >= self.next_advert:
+            self.send_advert(bool(c.companion_advert_flood))
+            self.next_advert = now + iv * 60
+        elif not c.companion_auto_advert:
+            self.next_advert = now + 10                     # turned on: first advert soon after
+        for pub, cn in list(self.connections.items()):      # keep-alives to servers that asked for them (checkConnections)
+            if now_s() >= cn["last"] + cn["ka"] * 5 // 2:
+                del self.connections[pub]
+                continue
+            ct = self.contacts.get(pub)
+            if now < cn["next"] or ct is None or ct.out_len is None:
+                continue
+            data = struct.pack("<I", self.unique_time()) + bytes([REQ_KEEP_ALIVE]) + struct.pack("<I", ct.sync_since)
+            cn["ack"] = sha256(data, self.pub)[:4]
+            self.send_direct(self.make_datagram(PT_REQ, ct, data), ct.out_path, ct.out_len)
+            cn["next"] = now + cn["ka"]
+        for tag in [t for t, exp in self.traces.items() if exp < now]:
+            del self.traces[tag]
+        if now >= self.next_flush:
+            self.flush()
+            self.next_flush = now + 15
+
+    def state(self):
+        link = self.link
+        return dict(listening=link is not None, error=self.link_error, client=link is not None and link.connected(),
+                    listen_port=link.port if link is not None else None,
+                    contacts=len(self.contacts), channels=sum(1 for n, k in self.channels.values() if any(k)),
+                    queued=len(self.queue), **self.stats)
+
+    # ---------------------------------------------------------------- app commands (MyMesh::handleCmdFrame)
+
+    def on_frame(self, f):
+        self.stats["frames"] += 1
+        if not f:
+            return
+        cmd = f[0]
+        if cmd in VC_IGNORED:
+            self.stats["ignored"] += 1
+            if cmd not in self.ignored_logged:
+                self.ignored_logged.add(cmd)
+                log.info("virtual companion: the app sent a %s change - acknowledged and ignored (pyMeshRoom manages "
+                         "the radio)", VC_IGNORED[cmd])
+            if cmd == CMD_RUN_CLI_COMMAND:
+                return self.write(bytes([RESP_CLI_REPLY]) + b"OK")
+            return self.ok()
+        h = self.HANDLERS.get(cmd)
+        if h is None:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        if cmd in VC_TX_CMDS and not self.tx_allowed(cmd):
+            self.stats["tx_limited"] = self.stats.get("tx_limited", 0) + 1
+            return self.err(ERR_TABLE_FULL)                 # (the app shows the send as failed)
+        try:
+            h(self, f)
+        except (IndexError, struct.error, ValueError):
+            self.err(ERR_ILLEGAL_ARG)
+
+    def tx_allowed(self, cmd):
+        """The app's transmissions: a token bucket (VC_TX_BURST, one more every VC_TX_EVERY_S), and adverts at most
+        every VC_ADVERT_EVERY_S, so an app (or anyone on the port) can't make the radio flood the mesh. What the
+        companion sends by itself (ACKs, path returns, auto adverts) isn't counted."""
+        now = time.monotonic()
+        tokens, last = getattr(self, "tx_bucket", (VC_TX_BURST, now))
+        tokens = min(VC_TX_BURST, tokens + (now - last) / VC_TX_EVERY_S)
+        if cmd == CMD_SEND_SELF_ADVERT:
+            if now - getattr(self, "last_app_advert", -1e9) < VC_ADVERT_EVERY_S:
+                self.tx_bucket = (tokens, now)
+                return False
+            self.last_app_advert = now
+        if tokens < 1:
+            self.tx_bucket = (tokens, now)
+            return False
+        self.tx_bucket = (tokens - 1, now)
+        return True
+
+    def c_device_query(self, f):
+        if len(f) < 2:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        if self.prefs["app_ver"] != f[1]:
+            self.prefs["app_ver"] = f[1]
+            self.save_prefs()
+        self.write(bytes([RESP_DEVICE_INFO, VC_FIRMWARE_VER_CODE, VC_MAX_CONTACTS // 2, VC_MAX_CHANNELS]) + struct.pack("<I", 0)
+                   + b"pyMeshRoom".ljust(12, b"\0") + b"pyMeshRoom virtual companion".ljust(40, b"\0")
+                   + FIRMWARE_VERSION.encode()[:19].ljust(20, b"\0") + bytes([0, int(self.cfg.path_hash_mode or 0)]))
+
+    def c_app_start(self, f):
+        if len(f) < 8:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        r = self.room
+        freq, bw, sf, cr = r.radio if r.radio else r.wanted_radio()
+        txp = r.cfg.radio_tx_power_dbm if r.cfg.radio_tx_power_dbm is not None else 22
+        pr = self.prefs
+        lat, lon = float(self.cfg.companion_lat or 0), float(self.cfg.companion_lon or 0)
+        self.write(bytes([RESP_SELF_INFO, ADV_TYPE_CHAT, int(txp) & 0xFF, 22]) + self.pub
+                   + struct.pack("<ii", int(lat * 1e6), int(lon * 1e6))
+                   + bytes([pr["multi_acks"], pr["advert_loc_policy"], (pr["telem_env"] << 4) | (pr["telem_loc"] << 2) | pr["telem_base"],
+                            pr["manual_add"]])
+                   + struct.pack("<IIBB", freq // 1000, bw, sf, cr) + utf8_cut(str(self.cfg.companion_name).encode(), 31))
+
+    def c_send_txt_msg(self, f):
+        if len(f) < 14:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        txt_type, attempt, ts = f[1], f[2], f[3:7]
+        c = self.find(f[7:13])
+        if c is None or txt_type not in (TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA):
+            return self.err(ERR_NOT_FOUND if c is None else ERR_UNSUPPORTED_CMD)
+        text = f[13:].split(b"\0", 1)[0]
+        if len(text) > VC_MAX_TEXT_LEN or (attempt > 3 and len(text) > VC_MAX_TEXT_LEN - 2):
+            return self.err(ERR_TABLE_FULL)
+        if txt_type == TXT_TYPE_CLI_DATA:                   # the node's clock, not the app's (replay protection)
+            data = struct.pack("<I", self.unique_time()) + bytes([(attempt & 3) | (TXT_TYPE_CLI_DATA << 2)]) + text
+            ack = bytes(4)
+        else:
+            data = ts + bytes([attempt & 3]) + text
+            ack = sha256(data, self.pub)[:4]
+            if attempt > 3:
+                data += b"\0" + bytes([attempt])            # the attempt number, hidden after the text
+        pkt = self.make_datagram(PT_TXT_MSG, c, data)
+        self.send_to(c, pkt)
+        if txt_type == TXT_TYPE_PLAIN:
+            self.expected.append([ack, time.monotonic(), c.pub])
+        self.stats["msgs_out"] += 1
+        self.write(self.sent_frame(pkt, ack))
+
+    def c_send_channel_txt_msg(self, f):
+        if len(f) < 7 or f[1] != TXT_TYPE_PLAIN:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        ch = self.channels.get(f[2])
+        if ch is None or not any(ch[1]):
+            return self.err(ERR_NOT_FOUND)
+        prefix = (str(self.cfg.companion_name) + ": ").encode()
+        text = f[7:].split(b"\0", 1)[0][:max(0, VC_MAX_TEXT_LEN - len(prefix))]
+        key = ch[1]
+        self.send_flood(Packet(PT_GRP_TXT, bytes([channel_hash(key)]) + encrypt_then_mac(key + bytes(16), f[3:7] + b"\0" + prefix + text)))
+        self.stats["msgs_out"] += 1
+        self.ok()
+
+    def c_send_channel_data(self, f):
+        if len(f) < 4:
+            return self.err(ERR_ILLEGAL_ARG)
+        idx, plen, i = f[1], f[2], 3
+        if plen != 0xFF and not path_valid(plen):
+            return self.err(ERR_ILLEGAL_ARG)
+        path = b""
+        if plen != 0xFF:
+            path = f[i:i + path_bytes(plen)]
+            i += path_bytes(plen)
+        dtype = f[i:i + 2]
+        payload = f[i + 2:]
+        ch = self.channels.get(idx)
+        if ch is None or not any(ch[1]):
+            return self.err(ERR_NOT_FOUND)
+        if len(dtype) < 2 or dtype == b"\0\0" or len(payload) > VC_MAX_FRAME - 9:
+            return self.err(ERR_ILLEGAL_ARG)
+        key = ch[1]
+        pkt = Packet(PT_GRP_DATA, bytes([channel_hash(key)]) + encrypt_then_mac(key + bytes(16), dtype + bytes([len(payload)]) + payload))
+        if plen == 0xFF:
+            self.send_flood(pkt)
+        else:
+            self.send_direct(pkt, path, plen)
+        self.ok()
+
+    def c_get_contacts(self, f):
+        since = struct.unpack_from("<I", f, 1)[0] if len(f) >= 5 else 0
+        self.write(bytes([RESP_CONTACTS_START]) + struct.pack("<I", len(self.contacts)))
+        latest = 0
+        for c in list(self.contacts.values()):
+            if c.lastmod > since:
+                self.write(c.frame(RESP_CONTACT))
+                latest = max(latest, c.lastmod)
+        self.write(bytes([RESP_END_OF_CONTACTS]) + struct.pack("<I", latest))
+
+    def c_set_advert_name(self, f):
+        if len(f) < 2:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        name = utf8_cut(f[1:].split(b"\0", 1)[0], 31).decode(errors="ignore").strip()
+        if not name:
+            return self.err(ERR_ILLEGAL_ARG)
+        if name != self.cfg.companion_name:
+            self.cfg.set("companion_name", name, save=False)
+            self.cfg_dirty = True                           # (saved by service(), at most every VC_SAVE_EVERY_S)
+        self.ok()
+
+    def c_set_advert_latlon(self, f):
+        if len(f) < 9:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        lat, lon = struct.unpack_from("<ii", f, 1)
+        if not (-90e6 <= lat <= 90e6 and -180e6 <= lon <= 180e6):
+            return self.err(ERR_ILLEGAL_ARG)
+        if (lat / 1e6, lon / 1e6) != (self.cfg.companion_lat, self.cfg.companion_lon):
+            self.cfg.set("companion_lat", lat / 1e6, save=False)
+            self.cfg.set("companion_lon", lon / 1e6, save=False)
+            self.cfg_dirty = True
+        self.ok()
+
+    def c_get_device_time(self, f):
+        self.write(bytes([RESP_CURR_TIME]) + struct.pack("<I", now_s()))
+
+    def c_send_self_advert(self, f):
+        self.send_advert(len(f) >= 2 and f[1] == 1)
+        self.ok()
+
+    def c_reset_path(self, f):
+        c = self.contacts.get(f[1:33]) if len(f) >= 33 else None
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        c.out_len, c.out_path = None, b""
+        self.touch(c)
+        self.ok()
+
+    def c_add_update_contact(self, f):
+        if len(f) < 36:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        pub = bytes(f[1:33])
+        d = f.ljust(148, b"\0")
+        c = self.contacts.get(pub)
+        new = c is None
+        if new:
+            c = self.anon.pop(pub, None) or VCContact(pub)
+            c.sync_since = 0
+        c.type, c.flags = d[33], d[34]
+        plen = d[35]
+        c.out_len = None if plen == 0xFF or not path_valid(plen) else plen
+        c.out_path = bytes(d[36:36 + path_bytes(plen)]) if c.out_len is not None else b""
+        c.name = d[100:132].split(b"\0", 1)[0].decode(errors="replace")
+        c.adv_ts = struct.unpack_from("<I", d, 132)[0]
+        if len(f) >= 144:
+            c.lat, c.lon = struct.unpack_from("<ii", d, 136)
+        c.lastmod = struct.unpack_from("<I", d, 144)[0] if len(f) >= 148 else now_s()
+        if new and not self.add_contact(c):
+            return self.err(ERR_TABLE_FULL)
+        self.touch(c)
+        self.ok()
+
+    def c_remove_contact(self, f):
+        pub = bytes(f[1:33])
+        if pub not in self.contacts:
+            return self.err(ERR_NOT_FOUND)
+        self.remove_contact(pub)
+        self.ok()
+
+    def c_share_contact(self, f):
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        pkt = Packet.parse(c.advert) if c.advert else None
+        if pkt is None:
+            return self.err(ERR_TABLE_FULL)
+        pkt.header = (pkt.header & ~0x03) | ROUTE_TRANSPORT_DIRECT
+        pkt.transport_codes = (0, 0)                        # { 0, 0 }: "send this nowhere" (repeaters don't relay it)
+        pkt.path_len, pkt.path = 0, b""
+        self._out(pkt, 0, 0.0)
+        self.ok()
+
+    def c_get_contact_by_key(self, f):
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        self.write(c.frame(RESP_CONTACT))
+
+    def c_export_contact(self, f):
+        if len(f) < 1 + PUB_KEY_SIZE:
+            pkt = self.make_self_advert()
+            pkt.header = (pkt.header & ~0x03) | ROUTE_FLOOD
+            return self.write(bytes([RESP_EXPORT_CONTACT]) + pkt.encode())
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None or not c.advert:
+            return self.err(ERR_NOT_FOUND)
+        self.write(bytes([RESP_EXPORT_CONTACT]) + c.advert)
+
+    def c_import_contact(self, f):
+        pkt = Packet.parse(bytes(f[1:])) if len(f) > 2 + 32 + 64 else None
+        if pkt is None or pkt.ptype != PT_ADVERT:
+            return self.err(ERR_ILLEGAL_ARG)
+        pkt.header = (pkt.header & ~0x03) | ROUTE_FLOOD    # as if received flood-mode
+        self.seen.pop(pkt.packet_hash(), None)
+        self.rx_advert(pkt)
+        self.ok()
+
+    def c_sync_next_message(self, f):
+        if not self.queue:
+            return self.write(bytes([RESP_NO_MORE_MESSAGES]))
+        qid, frame = self.queue.pop(0)
+        self.store.queue_remove(qid)
+        if self.prefs["app_ver"] < 3 and frame[0] in (RESP_CONTACT_MSG_RECV_V3, RESP_CHANNEL_MSG_RECV_V3):
+            frame = bytes([RESP_CONTACT_MSG_RECV if frame[0] == RESP_CONTACT_MSG_RECV_V3 else RESP_CHANNEL_MSG_RECV]) + frame[4:]
+        self.write(frame)
+
+    def c_get_tuning_params(self, f):
+        self.write(bytes([RESP_TUNING_PARAMS]) + struct.pack("<II", 0, 1000))
+
+    def c_set_other_params(self, f):
+        if len(f) < 2:
+            return self.err(ERR_ILLEGAL_ARG)
+        pr = self.prefs
+        pr["manual_add"] = f[1]
+        if len(f) >= 3:
+            pr["telem_base"], pr["telem_loc"], pr["telem_env"] = f[2] & 3, (f[2] >> 2) & 3, (f[2] >> 4) & 3
+        if len(f) >= 4:
+            pr["advert_loc_policy"] = f[3]
+        if len(f) >= 5:
+            pr["multi_acks"] = f[4]
+        self.save_prefs()
+        self.ok()
+
+    def c_get_batt_and_storage(self, f):
+        try:
+            used = os.path.getsize(self.store.path) // 1024
+            import shutil
+            total = (shutil.disk_usage(os.path.dirname(os.path.abspath(self.store.path))).free // 1024) + used
+        except OSError:
+            used = total = 0
+        self.write(bytes([RESP_BATT_AND_STORAGE]) + struct.pack("<HII", self.room.batt_mv & 0xFFFF, min(used, 0xFFFFFFFF),
+                                                                 min(total, 0xFFFFFFFF)))
+
+    def c_export_private_key(self, f):
+        self.write(bytes([RESP_DISABLED]))                  # as default firmware: the key never leaves the server
+
+    def _request(self, c, data, flood=False):
+        pkt = self.make_datagram(PT_REQ, c, data)
+        if flood:
+            self.send_flood(pkt)
+        else:
+            self.send_to(c, pkt)
+        return pkt
+
+    def c_send_login(self, f):
+        if len(f) < 1 + PUB_KEY_SIZE:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        pw = f[33:].split(b"\0", 1)[0][:15]
+        data = struct.pack("<I", self.unique_time()) + (struct.pack("<I", c.sync_since) if c.type == ADV_TYPE_ROOM else b"") + pw
+        pkt = Packet(PT_ANON_REQ, bytes([c.pub[0]]) + self.pub + encrypt_then_mac(self.secret(c), data))
+        self.send_to(c, pkt)
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["login"] = c.pub[:4]
+        self.write(self.sent_frame(pkt, c.pub[:4]))
+
+    def c_send_anon_req(self, f):
+        if len(f) <= 1 + PUB_KEY_SIZE:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        pub = bytes(f[1:33])
+        c = self.contact(pub)
+        if c is None:                                       # firmware v13: requests to non-contacts, zero-hop direct
+            c = self.anon[pub] = VCContact(pub)
+            c.out_len, c.lastmod = 0, now_s()
+            while len(self.anon) > 8:
+                self.anon.pop(next(iter(self.anon)))
+        tag = struct.pack("<I", self.unique_time())
+        pkt = Packet(PT_ANON_REQ, bytes([c.pub[0]]) + self.pub + encrypt_then_mac(self.secret(c), tag + f[33:]))
+        self.send_to(c, pkt)
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["req"] = tag
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_send_status_req(self, f):
+        c = self.contacts.get(bytes(f[1:33])) if len(f) >= 33 else None
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        tag = struct.pack("<I", self.unique_time())
+        pkt = self._request(c, tag + bytes([REQ_GET_STATUS]) + bytes(4) + os.urandom(4))
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["status"] = c.pub[:4]                  # (legacy matching, as firmware)
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_send_path_discovery_req(self, f):
+        if len(f) < 2 + PUB_KEY_SIZE or f[1] != 0:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        c = self.contacts.get(bytes(f[2:34]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        tag = struct.pack("<I", self.unique_time())         # a flooded request for base telemetry
+        pkt = self._request(c, tag + bytes([REQ_GET_TELEMETRY_DATA, 0xFE, 0, 0, 0]) + os.urandom(4), flood=True)
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["discovery"] = tag
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_send_telemetry_req(self, f):
+        if len(f) == 4:                                     # our own telemetry
+            lpp = struct.pack(">BBH", 1, 116, int(self.room.batt_mv / 10))
+            return self.write(bytes([PUSH_TELEMETRY_RESPONSE, 0]) + self.pub[:6] + lpp)
+        c = self.contacts.get(bytes(f[4:36])) if len(f) >= 4 + PUB_KEY_SIZE else None
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        tag = struct.pack("<I", self.unique_time())
+        pkt = self._request(c, tag + bytes([REQ_GET_TELEMETRY_DATA]) + bytes(4) + os.urandom(4))
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["telemetry"] = tag
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_send_binary_req(self, f):
+        if len(f) < 2 + PUB_KEY_SIZE:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        c = self.contacts.get(bytes(f[1:33]))
+        if c is None:
+            return self.err(ERR_NOT_FOUND)
+        if len(f) - 33 > MAX_PACKET_PAYLOAD - 16:
+            return self.err(ERR_TABLE_FULL)
+        tag = struct.pack("<I", self.unique_time())
+        pkt = self._request(c, tag + bytes(f[33:]))
+        self.pending = dict.fromkeys(self.pending)
+        self.pending["req"] = tag
+        self.write(self.sent_frame(pkt, tag))
+
+    def c_has_connection(self, f):
+        if bytes(f[1:33]) in self.connections:
+            return self.ok()
+        self.err(ERR_NOT_FOUND)
+
+    def c_logout(self, f):
+        self.connections.pop(bytes(f[1:33]), None)
+        self.ok()
+
+    def c_get_channel(self, f):
+        if len(f) < 2 or f[1] >= VC_MAX_CHANNELS:
+            return self.err(ERR_NOT_FOUND)
+        name, key = self.channels.get(f[1], ("", bytes(16)))
+        self.write(bytes([RESP_CHANNEL_INFO, f[1]]) + utf8_cut(name.encode(), 31).ljust(32, b"\0") + key)
+
+    def c_set_channel(self, f):
+        if len(f) >= 2 + 32 + 32:
+            return self.err(ERR_UNSUPPORTED_CMD)            # 256-bit channel keys: not supported (as firmware)
+        if len(f) < 2 + 32 + 16:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        idx = f[1]
+        if idx >= VC_MAX_CHANNELS:
+            return self.err(ERR_NOT_FOUND)
+        name = utf8_cut(f[2:34].split(b"\0", 1)[0], 31).decode(errors="replace")
+        key = bytes(f[34:50])
+        if name or any(key):
+            self.channels[idx] = (name, key)
+        else:
+            self.channels.pop(idx, None)
+        self.store.save_channel(idx, name, key)
+        self.ok()
+
+    def c_sign_start(self, f):
+        self.sign_buf = bytearray()
+        self.write(bytes([RESP_SIGN_START, 0]) + struct.pack("<I", VC_MAX_SIGN))
+
+    def c_sign_data(self, f):
+        if self.sign_buf is None:
+            return self.err(ERR_BAD_STATE)
+        if len(self.sign_buf) + len(f) - 1 > VC_MAX_SIGN:
+            return self.err(ERR_TABLE_FULL)
+        self.sign_buf += f[1:]
+        self.ok()
+
+    def c_sign_finish(self, f):
+        if self.sign_buf is None:
+            return self.err(ERR_BAD_STATE)
+        data = bytes(self.sign_buf)
+        self.sign_buf = None
+        if data[:PUB_KEY_SIZE] == self.pub or data.startswith(WEB_LOGIN_LABEL.encode()):
+            # an advert is signed over our key + time + app data, and a MeshCore Web login starts with its label: a
+            # signature over either would let whoever asked impersonate this node (until the key is changed)
+            log.warning("virtual companion: refused to sign an advert or a web login for %s", self.link.peer
+                        if getattr(self, "link", None) else "the app")
+            return self.err(ERR_ILLEGAL_ARG)
+        sig = self.id.sign(data)
+        self.write(bytes([RESP_SIGNATURE]) + sig)
+
+    def c_send_trace_path(self, f):
+        n = len(f) - 10
+        if n <= 0 or n >= MAX_PACKET_PAYLOAD - 5:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        flags = f[9]
+        sz = flags & 3
+        if sz == 3 or (n >> sz) > MAX_PATH_SIZE or n % (1 << sz):
+            return self.err(ERR_ILLEGAL_ARG)
+        tag = bytes(f[1:5])
+        pkt = Packet(PT_TRACE, bytes(f[1:10]) + bytes(f[10:]))   # the route rides in the payload; path_len counts SNRs
+        pkt.header = (pkt.header & ~0x03) | ROUTE_DIRECT
+        self.traces[tag] = time.monotonic() + 120
+        self._out(pkt, 5, 0.0)
+        t = self.room.airtime_ms(pkt.raw_length())
+        self.write(bytes([RESP_SENT, 0]) + tag + struct.pack("<I", int(500 + (t * 6 + 250) * ((n >> sz) + 1))))
+
+    def c_get_custom_vars(self, f):
+        self.write(bytes([RESP_CUSTOM_VARS]))
+
+    def c_set_custom_var(self, f):
+        self.err(ERR_ILLEGAL_ARG)
+
+    def c_get_advert_path(self, f):
+        if len(f) < PUB_KEY_SIZE + 2:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        e = self.advert_paths.get(bytes(f[2:9]))
+        if e is None:
+            return self.err(ERR_NOT_FOUND)
+        self.write(bytes([RESP_ADVERT_PATH]) + struct.pack("<I", e[0]) + bytes([e[1]]) + e[2])
+
+    def c_get_stats(self, f):
+        if len(f) < 2:
+            return self.err(ERR_ILLEGAL_ARG)
+        r, s = self.room, self.room.stats
+        if f[1] == 0:
+            out = struct.pack("<HIHB", r.batt_mv & 0xFFFF, int(time.monotonic() - r.boot), 0, min(len(r.txq), 255))
+        elif f[1] == 1:
+            out = struct.pack("<hbbII", int(r.noise_floor), max(-128, min(127, int(r.last_rssi))),
+                              max(-128, min(127, int(r.last_snr * 4))), s["airtime_ms"] // 1000, r.rx_airtime_ms // 1000)
+        elif f[1] == 2:
+            out = struct.pack("<7I", *(s[k] & 0xFFFFFFFF for k in ("recv", "sent", "sent_flood", "sent_direct",
+                                                                   "recv_flood", "recv_direct", "errors")))
+        else:
+            return self.err(ERR_ILLEGAL_ARG)
+        self.write(bytes([RESP_STATS, f[1]]) + out)
+
+    def c_set_flood_scope_key(self, f):
+        if len(f) < 2 or f[1] not in (0, 1):
+            return self.err(ERR_UNSUPPORTED_CMD)
+        if f[1] == 1:
+            self.send_unscoped = True
+        else:
+            self.send_scope = bytes(f[2:18]) if len(f) >= 18 else None
+            self.send_unscoped = False
+        self.ok()
+
+    def c_set_default_flood_scope(self, f):
+        if len(f) >= 1 + 31 + 16:
+            name = f[1:32].split(b"\0", 1)[0]
+            if not 0 < len(name) < 31:
+                return self.err(ERR_ILLEGAL_ARG)
+            self.prefs["scope_name"], self.prefs["scope_key"] = name.decode(errors="replace"), bytes(f[32:48]).hex()
+        else:
+            self.prefs["scope_name"], self.prefs["scope_key"] = "", ""
+        self.save_prefs()
+        self.ok()
+
+    def c_get_default_flood_scope(self, f):
+        if self.prefs["scope_name"]:
+            return self.write(bytes([RESP_DEFAULT_FLOOD_SCOPE]) + self.prefs["scope_name"].encode()[:30].ljust(31, b"\0")
+                              + bytes.fromhex(self.prefs["scope_key"]))
+        self.write(bytes([RESP_DEFAULT_FLOOD_SCOPE]))
+
+    def c_send_control_data(self, f):
+        if len(f) < 2 or not f[1] & 0x80:
+            return self.err(ERR_UNSUPPORTED_CMD)
+        self.send_zero_hop(Packet(PT_CONTROL, bytes(f[1:])))
+        self.ok()
+
+    def c_set_autoadd_config(self, f):
+        if len(f) < 2:
+            return self.err(ERR_ILLEGAL_ARG)
+        self.prefs["autoadd_config"] = f[1]
+        if len(f) >= 3:
+            self.prefs["autoadd_max_hops"] = min(f[2], 64)
+        self.save_prefs()
+        self.ok()
+
+    def c_get_autoadd_config(self, f):
+        self.write(bytes([RESP_AUTOADD_CONFIG, self.prefs["autoadd_config"], self.prefs["autoadd_max_hops"]]))
+
+    def c_get_allowed_repeat_freq(self, f):
+        self.write(bytes([RESP_ALLOWED_REPEAT_FREQ]))       # none: the companion never repeats
+
+    HANDLERS = {
+        CMD_DEVICE_QUERY: c_device_query, CMD_APP_START: c_app_start, CMD_SEND_TXT_MSG: c_send_txt_msg,
+        CMD_SEND_CHANNEL_TXT_MSG: c_send_channel_txt_msg, CMD_SEND_CHANNEL_DATA: c_send_channel_data,
+        CMD_GET_CONTACTS: c_get_contacts, CMD_SET_ADVERT_NAME: c_set_advert_name, CMD_SET_ADVERT_LATLON: c_set_advert_latlon,
+        CMD_GET_DEVICE_TIME: c_get_device_time, CMD_SEND_SELF_ADVERT: c_send_self_advert, CMD_RESET_PATH: c_reset_path,
+        CMD_ADD_UPDATE_CONTACT: c_add_update_contact, CMD_REMOVE_CONTACT: c_remove_contact, CMD_SHARE_CONTACT: c_share_contact,
+        CMD_GET_CONTACT_BY_KEY: c_get_contact_by_key, CMD_EXPORT_CONTACT: c_export_contact, CMD_IMPORT_CONTACT: c_import_contact,
+        CMD_SYNC_NEXT_MESSAGE: c_sync_next_message, CMD_GET_TUNING_PARAMS: c_get_tuning_params,
+        CMD_SET_OTHER_PARAMS: c_set_other_params, CMD_GET_BATT_AND_STORAGE: c_get_batt_and_storage,
+        CMD_EXPORT_PRIVATE_KEY: c_export_private_key, CMD_SEND_LOGIN: c_send_login, CMD_SEND_ANON_REQ: c_send_anon_req,
+        CMD_SEND_STATUS_REQ: c_send_status_req, CMD_SEND_PATH_DISCOVERY_REQ: c_send_path_discovery_req,
+        CMD_SEND_TELEMETRY_REQ: c_send_telemetry_req, CMD_SEND_BINARY_REQ: c_send_binary_req,
+        CMD_HAS_CONNECTION: c_has_connection, CMD_LOGOUT: c_logout, CMD_GET_CHANNEL: c_get_channel,
+        CMD_SET_CHANNEL: c_set_channel, CMD_SIGN_START: c_sign_start, CMD_SIGN_DATA: c_sign_data,
+        CMD_SIGN_FINISH: c_sign_finish, CMD_SEND_TRACE_PATH: c_send_trace_path, CMD_GET_CUSTOM_VARS: c_get_custom_vars,
+        CMD_SET_CUSTOM_VAR: c_set_custom_var, CMD_GET_ADVERT_PATH: c_get_advert_path, CMD_GET_STATS: c_get_stats,
+        CMD_SET_FLOOD_SCOPE_KEY: c_set_flood_scope_key, CMD_SET_DEFAULT_FLOOD_SCOPE: c_set_default_flood_scope,
+        CMD_GET_DEFAULT_FLOOD_SCOPE: c_get_default_flood_scope, CMD_SEND_CONTROL_DATA: c_send_control_data,
+        CMD_SET_AUTOADD_CONFIG: c_set_autoadd_config, CMD_GET_AUTOADD_CONFIG: c_get_autoadd_config,
+        CMD_GET_ALLOWED_REPEAT_FREQ: c_get_allowed_repeat_freq,
+    }
+
+# ============================================================================
+# Tenant rooms: more rooms on the same radio, each with its own key, members, posts, passwords and web page
+# ============================================================================
+
+TENANT_MAX = 100
+TENANT_DIR = "tenants"
+# settings a tenant room keeps for itself (in its own database); everything else comes from the main config, and a
+# tenant can't change it (no radio, timing or service settings: nothing that affects anyone outside the tenant)
+TENANT_KEYS = {"name", "path", "private_key", "lat", "lon", "admin_password", "room_password", "allow_read_only",
+               "web_password_hash", "welcome_new_members", "welcome_message", "welcome_advert_hint", "kick_message",
+               "ban_message", "advert_interval_min", "flood_advert_interval_h", "max_posts", "catchup_max"}
+TENANT_DEFAULTS = {"lat": 0.0, "lon": 0.0, "admin_password": "", "room_password": "", "allow_read_only": False,
+                   "web_password_hash": "", "advert_interval_min": 60, "flood_advert_interval_h": 24}
+TENANT_RESERVED_PATHS = {"api", "static", "icons", "index.html", "favicon.ico", "robots.txt", "tenants", "meshcore-web"}
+
+
+def hash_web_password(pw):
+    salt = os.urandom(16)
+    n = 100000
+    return "pbkdf2_sha256$%d$%s$%s" % (n, salt.hex(), hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, n).hex())
+
+
+WEB_PAGE_SESSION_S = 30 * 86400        # a MeshCore Web page session (page password) lasts this long
+
+
+def same_text(a, b):
+    """a == b, in constant time (passwords)."""
+    return hmac.compare_digest(str(a).encode(), str(b).encode())
+
+
+ROOM_LOGIN_FAILS = 5                  # wrong room / admin passwords from one key within ROOM_LOGIN_FAIL_WINDOW_S...
+ROOM_LOGIN_FAIL_WINDOW_S = 600        # ...and its logins go unanswered until the oldest is this old
+
+
+def web_page_session(stored, now=None):
+    """A MeshCore Web page session (the mr_web cookie): its expiry, signed with the stored page password hash (a secret:
+    salted, and only in the config). Nothing is kept, so it outlives a restart; a new password ends every one."""
+    exp = int((now or time.time()) + WEB_PAGE_SESSION_S)
+    return "%d.%s" % (exp, hmac.new(str(stored).encode(), b"mr_web %d" % exp, hashlib.sha256).hexdigest())
+
+
+def web_page_session_ok(token, stored):
+    exp, _, mac = str(token).partition(".")
+    if not stored or not exp.isdigit() or int(exp) < time.time():
+        return False
+    return hmac.compare_digest(mac, hmac.new(str(stored).encode(), b"mr_web %d" % int(exp), hashlib.sha256).hexdigest())
+
+
+def check_web_password(pw, stored):
+    try:
+        algo, n, salt, h = str(stored).split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        got = hashlib.pbkdf2_hmac("sha256", str(pw).encode(), bytes.fromhex(salt), int(n)).hex()
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(got, h)
+
+
+def welcome_changes(body, room_name, cur):
+    """Welcome DM settings from a dashboard -> {setting: value}, validated against the room's name and current
+    settings (cur: an object with the welcome_* settings). Raises ValueError."""
+    if not isinstance(body, dict):
+        raise ValueError("invalid JSON")
+    updates = {}
+    if "welcome_new_members" in body:
+        if not isinstance(body["welcome_new_members"], bool):
+            raise ValueError("welcome_new_members must be true or false")
+        updates["welcome_new_members"] = body["welcome_new_members"]
+    for key in ("welcome_message", "welcome_advert_hint"):
+        if key in body:
+            if not isinstance(body[key], str):
+                raise ValueError("%s must be text" % key)
+            updates[key] = body[key]
+    if not updates:
+        raise ValueError("no welcome settings supplied")
+    enabled = updates.get("welcome_new_members", bool(cur.welcome_new_members))
+    message = updates.get("welcome_message", str(cur.welcome_message))
+    hint = updates.get("welcome_advert_hint", str(cur.welcome_advert_hint))
+    if enabled and message:
+        rendered = message.replace("{room}", str(room_name))
+        if hint:
+            rendered += " " + hint.replace("{room}", str(room_name))
+        if len(rendered.encode()) > MAX_POST_TEXT_LEN:
+            raise ValueError("welcome DM is too long after {room} is replaced (maximum %d UTF-8 bytes)" % MAX_POST_TEXT_LEN)
+    return updates
+
+
+def tenant_location(body):
+    """A tenant room's advertised position from the dashboard: (lat, lon), both blank = none (0, 0). Raises ValueError."""
+    def num(k, lim):
+        v = body.get(k)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("%s: a number" % k)
+        if not -lim <= f <= lim or f != f:
+            raise ValueError("%s: -%d to %d" % (k, lim, lim))
+        return round(f, 6)
+    lat, lon = num("lat", 90), num("lon", 180)
+    if (lat is None) != (lon is None):
+        raise ValueError("location: give both latitude and longitude, or neither")
+    return (lat or 0.0, lon or 0.0)
+
+
+def tenant_spec(body, taken_paths=(), taken_keys=()):
+    """Dashboard 'create tenant room' form -> validated spec. The web password is hashed here (it never reaches the
+    main loop or the database in the clear). Raises ValueError with a readable message."""
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    name = str(body.get("name", "")).strip()
+    if not name or len(name.encode()) > 31:
+        raise ValueError("room name: 1 to 31 bytes")
+    path = str(body.get("path", "")).strip().strip("/").lower()
+    if not 1 <= len(path) <= 32 or not all(c in "abcdefghijklmnopqrstuvwxyz0123456789-_" for c in path):
+        raise ValueError("room path: 1 to 32 lowercase letters, digits, - or _")
+    if path in TENANT_RESERVED_PATHS or path in taken_paths:
+        raise ValueError("room path %r is already in use" % path)
+    key = str(body.get("private_key", "") or "").strip().lower()
+    if key:
+        if len(key) not in (64, 128) or any(c not in "0123456789abcdef" for c in key):
+            raise ValueError("private key must be 64 or 128 hexadecimal characters (or empty for a random one)")
+        pub = RepeaterIdentity(bytes.fromhex(key)).pub_key
+        if pub[0] in (0x00, 0xFF):
+            raise ValueError("that key's public key starts with %02X, which MeshCore reserves" % pub[0])
+        if pub in taken_keys:
+            raise ValueError("that key is already used by this server")
+    out = dict(name=name, path=path, private_key=key)
+    for j in ("room_password", "admin_password"):
+        v = str(body.get(j, "") or "")
+        if len(v.encode()) > 15:
+            raise ValueError("%s: at most 15 bytes (MeshCore's limit)" % j.replace("_", " "))
+        out[j] = v
+    if out["admin_password"] and out["admin_password"] == out["room_password"]:
+        raise ValueError("the admin password must differ from the join password")
+    wp = str(body.get("web_password", "") or "")
+    if len(wp) < 6:
+        raise ValueError("web UI password: at least 6 characters")
+    out["web_password_hash"] = hash_web_password(wp)
+    out["lat"], out["lon"] = tenant_location(body)
+    return out
+
+
+class TenantConfig:
+    """A tenant room's settings: its own (TENANT_KEYS, kept in its database) over the main config's. set() refuses
+    anything outside TENANT_KEYS, so nothing a tenant does (RF CLI included) can change the main room or the radio."""
+
+    def __init__(self, base, store):
+        self.__dict__["base"], self.__dict__["store"] = base, store
+        data = {}
+        for k, v in store.read("SELECT k, v FROM settings"):
+            try:
+                data[k] = json.loads(v)
+            except ValueError:
+                pass
+        self.__dict__["data"] = data
+
+    def __getattr__(self, k):
+        d = self.__dict__["data"]
+        if k in d:
+            return d[k]
+        if k in TENANT_DEFAULTS:
+            return TENANT_DEFAULTS[k]
+        return getattr(self.__dict__["base"], k)
+
+    def __setattr__(self, k, v):
+        self.set(k, v)
+
+    def set(self, k, v):
+        if k not in TENANT_KEYS:
+            raise ValueError("%s is a server setting: a tenant room can't change it" % k.replace("_", "."))
+        self.__dict__["data"][k] = v
+        self.__dict__["store"].execmany([("INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)", [(k, json.dumps(v))])])
+
+
+def _shared(name, writable=False):
+    """A TenantRoom attribute that is the main room's (the map, the radio's readings, the virtual repeater...).
+    Writes are ignored unless writable (RoomServer.__init__ assigns defaults that must not reach the main room)."""
+    def get(self):
+        return getattr(self.host, name)
+
+    def put(self, v):
+        if writable:
+            setattr(self.host, name, v)
+    return property(get, put)
+
+
+class TenantRoom(RoomServer):
+    """A room on the main room's radio: same room logic, its own key, members, posts, bans, passwords and settings
+    (tenants/{public key}.db). It shares the main room's map and routes to repeaters, and its transmissions go through
+    the main room (internal hand-over to the other nodes on this radio, then the one transmit queue). It never does
+    mesh-level work: no topology learning, discovery, traces, map building or radio housekeeping."""
+
+    TENANT = True
+    SHARED = ("radio", "noise_floor", "nf_min", "nf_max", "last_rssi", "last_snr", "batt_mv", "mcu_temp_c", "temp_supported",
+              "rroutes", "mrpts", "edges", "repeaters", "heard", "obs_edges", "probes", "neighbours", "names", "disk_names",
+              "vr", "vc", "observer", "feed", "txq", "tx_busy_until", "last_rx_mono", "rx_airtime_ms", "web_map",
+              "map_version", "minutes", "sys_samples", "mem_total_mb")
+    RADIO_STATS = ("recv", "sent", "airtime_ms", "recv_flood", "recv_direct", "sent_flood", "sent_direct", "errors",
+                   "flood_dups", "direct_dups", "traces")
+
+    def __init__(self, host, store, cfg=None):
+        self.host = host
+        cfg = cfg or TenantConfig(host.cfg, store)
+        ident = RepeaterIdentity(bytes.fromhex(str(cfg.private_key)))
+        super().__init__(cfg, host.modem, ident, store)
+        self.events_put = host.events_put
+        self.web_last_request = 0.0
+        self.web_state = {}
+        now = time.monotonic()
+        self.next_zero_advert = now + random.uniform(10, 300)    # (spread out: many rooms restarting together)
+        self.next_flood_advert = now + random.uniform(60, 1800)
+
+    path = property(lambda s: s.cfg.path)
+    key = property(lambda s: hexs(s.id.pub_key))
+
+    # ---------------------------------------------------------------- mesh-level work belongs to the main room
+    def repeater_apply(self):
+        pass
+
+    def observe_flood_path(self, pkt):
+        pass
+
+    def observe_trace(self, pkt):
+        pass
+
+    def on_control(self, pkt):
+        pass
+
+    def maybe_trace(self):
+        pass
+
+    def send_discovery(self):
+        pass
+
+    def learn_name(self, pub, ts, name):
+        pass                                                # (the main room keeps the shared name cache)
+
+    def radio_stats(self):
+        """This room's counters, with the radio's own (packets heard and sent, airtime) from the main room."""
+        s = dict(self.stats)
+        for k in self.RADIO_STATS:
+            s[k] = self.host.stats.get(k, 0)
+        return s
+
+    def hour_stats(self):
+        return self.host.hour_stats()
+
+    def sys_stats(self):
+        return self.host.sys_stats()
+
+    # ---------------------------------------------------------------- radio: through the main room
+    def queue_tx(self, pkt, prio, delay=0.0, deferrable=False, relay=False, src=None):
+        self.seen_mark(pkt)
+        self.host.bus_send(self, pkt, prio, delay, deferrable)
+
+    def wants(self, pkt):
+        """Could this packet concern this room? (Cheap filter: the main room offers every packet to every tenant.)"""
+        t, p = pkt.ptype, pkt.payload
+        if t in (PT_PATH, PT_REQ, PT_RESPONSE, PT_TXT_MSG, PT_ANON_REQ):
+            return bool(p) and p[0] == self.self_hash
+        if t in (PT_ACK, PT_MULTIPART):
+            return bool(self.notices) or any(m.pending_ack is not None or m.ack_map
+                                             for m in self.members.values())
+        if t == PT_ADVERT:
+            return p[:32] in self.members
+        if t == PT_TRACE:
+            return pkt.is_direct and len(p) >= 9 and self.id.pub_key[:1 << (p[8] & 3)] in p[9:]
+        return False
+
+    def on_advert(self, pkt):
+        """A member's advert: they're on the air (the main room does names, positions and the map)."""
+        m = self.members.get(pkt.payload[:32])
+        if m is None or self.check_dup(pkt) or self.parse_advert(pkt) is None:
+            return
+        if pkt.is_flood:
+            self.member_flood(m, pkt)
+        self.heard_from(m)
+        if (m.given_up or m.push_failures > 0 or m.stuck_since) and m.pending_ack is None:
+            self.member_active(m, pkt)
+            if m.last_activity == 0:
+                m.last_activity = now_s()
+            self.mark_dirty()
+
+    def dashboard_advert(self, flood):
+        self.send_advert(flood)
+        log.info("tenant room %r: %s advert sent from its page", self.cfg.name, "flood" if flood else "zero-hop")
+
+    def handle_cli(self, cmd):
+        """The room CLI, without anything that reaches outside this room (the radio, timing, discovery, restarts)."""
+        c = cmd.strip()
+        if c in ("reboot", "restart", "discover") or c.startswith(("set path.hash", "set push.")):
+            return "Err - not available in a tenant room"
+        return super().handle_cli(c)
+
+    def run_once(self):
+        if self.notices:
+            self.service_notices()
+        self.periodic()
+
+    def periodic(self):
+        now = time.monotonic()
+        c = self.cfg
+        if c.advert_interval_min and now >= self.next_zero_advert:
+            self.send_advert(False)
+            self.next_zero_advert = now + float(c.advert_interval_min) * 60
+        if c.flood_advert_interval_h and now >= self.next_flood_advert:
+            self.send_advert(True)
+            self.next_flood_advert = now + float(c.flood_advert_interval_h) * 3600
+        if now >= self.next_aging:
+            for m in self.members.values():
+                self.prune_routes(m)
+            self.drop_private(None, older_than=now_s() - 7 * 86400)
+            self.next_aging = now + 3600
+        self.pace_ease()
+        if self.dirty and now >= self.next_flush:
+            self.flush()
+            self.next_flush = now + 30
+        if now - self.web_last_request < 20 and now >= self.next_web:
+            self.publish_web_state()
+            self.next_web = now + 1
+
+    def publish_web_state(self):
+        super().publish_web_state()
+        st = dict(self.web_state)
+        st["stats"] = dict(st["stats"], **{k: self.host.stats.get(k, 0) for k in self.RADIO_STATS})
+        st["room"] = dict(st["room"], tenant=True, path=self.cfg.path)
+        st["mqtt"], st["repeater"], st["companion"] = {}, {}, {}
+        self.web_state = st
+
+    def admin_row(self):
+        return dict(name=self.cfg.name, path=self.cfg.path, key=self.key, id=hexs(self.id.pub_key[:2]),
+                    lat=float(self.cfg.lat or 0.0), lon=float(self.cfg.lon or 0.0),
+                    members=sum(1 for m in self.members.values() if not m.given_up),
+                    suspended=sum(1 for m in self.members.values() if m.given_up),
+                    posts=sum(1 for p in self.posts if p[3] is None))
+
+    def close(self):
+        self.flush()
+        self.store.close()
+
+
+for _n in TenantRoom.SHARED:
+    setattr(TenantRoom, _n, _shared(_n))
+TenantRoom._rpt_idx = _shared("_rpt_idx", writable=True)          # (the repeater name index follows the shared map)
+TenantRoom._label_memo = _shared("_label_memo", writable=True)
+del _n
 
 # ============================================================================
 # Observer feed (MQTT augmentation): read-only, its own thread, filters before anything reaches the main loop
@@ -4389,6 +7233,18 @@ class MiniMQTT:
 
 
 
+TOPIC_REGION_RE = re.compile(r"^meshcore/([A-Za-z0-9]+)/(\+/packets|#)$")
+
+
+def topic_regions(topics):
+    """The region codes a set of topic filters stands for (upper case), or None when they aren't plain
+    per-region filters (e.g. meshcore/# or a custom filter), in which case nothing is filtered by region."""
+    found = [TOPIC_REGION_RE.match(str(t).strip()) for t in (topics or [])]
+    if not found or not all(found):
+        return None
+    return frozenset(m.group(1).upper() for m in found)
+
+
 class ObserverFeed:
     """Listens to the observer network over MQTT (LetsMesh format: meshcore/<region>/<observer>/packets, JSON with
     the raw packet in hex). Keeps only ACKs and packets addressed to the room (destination byte), drops duplicates
@@ -4406,7 +7262,7 @@ class ObserverFeed:
         self.recent = collections.deque()                    # (time, relevant) for the rate shown in the header
         self.diag = collections.Counter({                    # received and intentionally ignored MQTT observations
             "received": 0, "accepted": 0, "retained": 0, "non_packet_topic": 0,
-            "malformed": 0, "self_origin": 0, "duplicate": 0})
+            "malformed": 0, "self_origin": 0, "duplicate": 0, "other_region": 0})
         self.subscriptions = {}                               # topic -> pending/granted/denied, set by broker SUBACK
         self.subscription_error = ""
         self.ingress = queue.Queue(maxsize=max(10, int(room.cfg.mqtt_queue_max)))
@@ -4509,6 +7365,12 @@ class ObserverFeed:
         if retain or not topic.endswith("/packets"):
             self.diag["retained" if retain else "non_packet_topic"] += 1
             return                                          # retained = an old packet replayed; status messages: not needed
+        regions = topic_regions(getattr(self.room.cfg, "mqtt_topics", None))
+        if regions is not None:
+            parts = topic.split("/")
+            if len(parts) < 2 or parts[1].upper() not in regions:
+                self.diag["other_region"] += 1
+                return                                      # only the regions asked for, even if a broker sends more
         try:
             obj = json.loads(payload)
             raw = bytes.fromhex(obj["raw"])
@@ -4549,6 +7411,8 @@ class ObserverFeed:
                 out.append((pkey, ("grp", raw)))
             if cfg.mqtt_topo_ingest and ((pkt.is_flood and pkt.hash_size >= 2 and pkt.hop_count) or (t == PT_TRACE and pkt.is_direct)):
                 out.append(((pkey, origin[:4]), ("topo", raw, origin, snr)))   # every observer's copy adds its own last link
+            if cfg.web_backlog_mqtt and int(cfg.web_backlog_days or 0) > 0 and t in BACKLOG_TYPES and len(pl) >= 2:
+                out.append((("bk", pkey), ("backlog", raw, snr)))         # for MeshCore Web's catch-up (kept once)
         with self.lock:
             self.recent.append((now, bool(out)))
             keep = []
@@ -4569,8 +7433,1440 @@ class ObserverFeed:
 
 
 # ============================================================================
+# KaaS: KISS radio as an API service. Websocket clients (bots, integrations) get every packet this radio hears and
+# sends, and may send raw packets of their own; they do all MeshCore crypto themselves. See docs/api.md.
+# ============================================================================
+
+KAAS_PATH = "/api/v1/kaas"
+WEB_PATH = "/api/v1/web"
+KAAS_TOKEN_PREFIX = "kaas_"
+KAAS_TICKET_PREFIX = "kt_"
+KAAS_TICKET_S = 30                    # a websocket ticket (for browsers, which can't send Authorization) lasts this long
+KAAS_TICKET_LOG_S = 300               # what became of a ticket, kept this long for /api/v1/web/ticket to tell its browser
+KAAS_MAX_TICKETS = 1024               # tickets waiting to be used, across all keys
+KAAS_TICKETS_PER_KEY = 4              # ...and per key, so no one key can take them all
+KAAS_MAX_KEYS = 50
+KAAS_MAX_CLIENTS = 16
+KAAS_QUEUE_MAX = 512                  # messages waiting for a slow client; past that the oldest are dropped (and counted)
+KAAS_MAX_MESSAGE = 4096               # largest message a client may send
+KAAS_QUERY_LIMITS = {"nodes": 4, "route": 30}   # queries a minute per key (nodes; near/routes/route)
+NODES_DAYS_WEB = 31                    # a web session's "nodes" reaches back at most this many days
+LINK_GRAPH_TTL_S = 30                  # route questions reuse the repeater link graph this long
+KAAS_MAX_INFLIGHT = 4                 # a client's sends waiting for the main loop
+ROUTE_HOP_COST = 0.95                 # each hop of a suggested route scores this much less
+KAAS_MAX_ROUTES = 5                   # route suggestions per request
+KAAS_PING_S = 30                      # websocket ping this often; nothing heard for 3 of these closes the connection
+KAAS_STATS = ("rx", "tx", "err")      # per key: packets streamed to it, packets it sent (accepted), errors it got
+KAAS_STATS_SAVE_S = 300
+KAAS_PRIO = 9                         # (and they go out after everything of the room's, the repeater's and pushes)
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WEB_CHALLENGE_PREFIX = "wc_"
+WEB_CHALLENGE_S = 60                  # a web login's challenge must be signed and sent back within this long
+WEB_MAX_USED_CHALLENGES = 20000       # logins in the last minute (each a signed challenge) remembered, so none is reused
+WEB_LOGIN_LABEL = "meshcore-web login v1"   # signed first, so a login signature is never a valid packet signature
+WEB_USERS_MAX = 1000                  # web users remembered for the dashboard (the least recently active go first)
+WEB_ID_PREFIX = "w:"                  # a web session's id in the per-key stats: "w:" + its public key
+BACKLOG_TYPES = (PT_GRP_TXT, PT_TXT_MSG)  # what web users catch up on: channel messages and DMs (and room posts)
+BACKLOG_RECENT = 20000                # packet hash -> seq kept in memory, so later copies of a packet get its number
+BACKLOG_BATCH = 200                   # packets per replay message
+BACKLOG_FLUSH_S = 1.0                 # new backlog rows are written at most this often (one transaction)
+BACKLOG_PRUNE_S = 3600
+# what a web session may send, and the identity each must carry (adverts, logins: the full key; DMs etc.: its hash)
+WEB_SEND_TYPES = (PT_ADVERT, PT_GRP_TXT, PT_TXT_MSG, PT_ACK, PT_PATH, PT_ANON_REQ, PT_REQ, PT_RESPONSE, PT_MULTIPART)
+
+
+def web_login_message(host, challenge, pub_hex):
+    """What a web login signs: the label, the server's host as the browser named it, the challenge, the key."""
+    return ("%s\n%s\n%s\n%s" % (WEB_LOGIN_LABEL, host, challenge, pub_hex)).encode()
+
+
+def web_packet_check(pkt, pub):
+    """None if a web session holding pub may send pkt, else why not."""
+    t, p = pkt.ptype, pkt.payload
+    if t not in WEB_SEND_TYPES:
+        return "web sessions can't send %s packets" % (PT_NAMES[t] if t < len(PT_NAMES) else t)
+    if t == PT_ADVERT and p[:PUB_KEY_SIZE] != pub:
+        return "an advert must be for your own key"
+    if t == PT_ANON_REQ and p[1:1 + PUB_KEY_SIZE] != pub:
+        return "a login must be from your own key"
+    if t in (PT_TXT_MSG, PT_REQ, PT_RESPONSE, PT_PATH) and (len(p) < 2 or p[1] != pub[0]):
+        return "a message must be from your own key"
+    if pkt.is_flood and pkt.path_len & 63:
+        return "a flood starts with no hops: the repeaters add them"
+    return None
+
+
+def kaas_token_hash(token):
+    """Only this is stored: a key is 256 random bits, so a plain SHA-256 can't be reversed or guessed."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def kaas_key_spec(body, now=None):
+    """A new API key's settings from the dashboard -> dict(receive, send, description, expires), or ValueError."""
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    receive, send = body.get("receive"), body.get("send")
+    if not isinstance(receive, bool) or not isinstance(send, bool):
+        raise ValueError("receive and send must be true or false")
+    if not (receive or send):
+        raise ValueError("choose Receive, Send or both")
+    desc = body.get("description", "")
+    if not isinstance(desc, str) or len(desc.strip()) > 80:
+        raise ValueError("description: text, at most 80 characters")
+    exp = body.get("expires")
+    if exp is not None:
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+            raise ValueError("expires: a time in seconds since 1970, or null for never")
+        if exp <= (now or time.time()):
+            raise ValueError("that expiry date has already passed")
+        exp = int(exp)
+    return dict(receive=receive, send=send, description=desc.strip(), expires=exp)
+
+
+def ws_accept(key):
+    return base64.b64encode(hashlib.sha1(key.encode() + WS_GUID).digest()).decode()
+
+
+def ws_frame(opcode, data=b"", mask=False):
+    """One whole websocket frame. Servers send unmasked frames, clients masked ones."""
+    n = len(data)
+    head = bytearray([0x80 | opcode])
+    mbit = 0x80 if mask else 0
+    if n < 126:
+        head.append(mbit | n)
+    elif n < 65536:
+        head.append(mbit | 126)
+        head += struct.pack(">H", n)
+    else:
+        head.append(mbit | 127)
+        head += struct.pack(">Q", n)
+    if mask:
+        k = os.urandom(4)
+        head += k
+        data = bytes(b ^ k[i & 3] for i, b in enumerate(data))
+    return bytes(head) + data
+
+
+def _ws_exact(rf, n):
+    b = rf.read(n) if n else b""
+    if len(b) < n:
+        raise EOFError
+    return b
+
+
+def ws_read(rf, max_len, masked=True, on_control=None):
+    """The next message: (opcode, payload), fragments joined. Control frames (close, ping, pong) come back on their
+    own, or go to on_control when they arrive between a message's fragments. EOFError when the connection ends,
+    ValueError for a protocol error."""
+    parts, first = [], None
+    while True:
+        h = _ws_exact(rf, 2)
+        fin, op, n = h[0] & 0x80, h[0] & 0x0F, h[1] & 0x7F
+        if bool(h[1] & 0x80) != masked:
+            raise ValueError("client frames must be masked" if masked else "server frames must not be masked")
+        if n == 126:
+            n = struct.unpack(">H", _ws_exact(rf, 2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", _ws_exact(rf, 8))[0]
+        if sum(len(p) for p in parts) + n > max_len:
+            raise ValueError("message too big")
+        k = _ws_exact(rf, 4) if masked else None
+        data = _ws_exact(rf, n)
+        if k:
+            data = bytes(b ^ k[i & 3] for i, b in enumerate(data))
+        if op >= 8:
+            if not fin or n > 125:
+                raise ValueError("bad control frame")
+            if parts and on_control is not None and op != 8:
+                on_control(op, data)
+                continue
+            return op, data
+        if op == 0:
+            if first is None:
+                raise ValueError("unexpected continuation frame")
+        elif first is not None:
+            raise ValueError("expected a continuation frame")
+        else:
+            first = op
+        parts.append(data)
+        if fin:
+            return first, b"".join(parts)
+
+
+def kaas_endpoint(x):
+    """One end of a route request: ("key", bytes), ("repeater", 2-3 bytes) or ("name", str); None if it's none."""
+    if not isinstance(x, str):
+        return None
+    x = x.strip()
+    try:
+        b = bytes.fromhex(x)
+    except ValueError:
+        b = None
+    if b is not None and 8 <= len(b) <= 32:
+        return "key", b
+    if b is not None and 2 <= len(b) <= 3 and not x.startswith("@"):
+        return "repeater", b
+    n = kaas_mention_name(x)
+    return None if n is None else ("name", n)
+
+
+def kaas_mention_name(x):
+    """A node name from a near request: "platinum" or the mention form "@[platinum]". None if it can't be a name."""
+    if not isinstance(x, str):
+        return None
+    x = x.strip()
+    m = re.fullmatch(r"@\[(.*)\]", x, re.S)
+    if m:
+        x = m.group(1).strip()
+    return x if 1 <= len(x.encode()) <= 32 else None
+
+
+class KaasConn:
+    """One websocket client. Its HTTP thread reads; its own writer thread drains a bounded outbox, so a slow client
+    never holds up the radio (past KAAS_QUEUE_MAX waiting, the oldest are dropped and the client is told how many)."""
+
+    def __init__(self, hub, sock, rfile, key, peer):
+        self.hub, self.sock, self.rfile, self.peer = hub, sock, rfile, peer
+        self.ip = peer                                      # the client's address (behind a proxy: the one it forwarded for)
+        self.key_id, self.can_receive, self.can_send = key["id"], bool(key.get("receive")), bool(key.get("send"))
+        self.web = key.get("web")                           # a web login: its public key (hex); None for an API key
+        self.rooms = set()                                  # rooms on this server it follows (web logins: "room")
+        self.out = collections.deque()
+        self.cv = threading.Condition()
+        self.wlock = threading.Lock()
+        self.closed, self.close_frame, self.dropped, self.inflight = False, None, 0, 0
+        self.last_rx = time.monotonic()
+        self.since = now_s()
+
+    def put(self, text):
+        with self.cv:
+            if self.closed:
+                return
+            if len(self.out) >= KAAS_QUEUE_MAX:
+                self.out.popleft()
+                self.dropped += 1
+            self.out.append(text)
+            self.cv.notify()
+
+    def send_json(self, obj):
+        t = obj.get("type")
+        if t == "error" or (t == "send_result" and obj.get("status") == "dropped"):
+            self.hub.count(self.key_id, "err")
+        elif t == "send_result" and obj.get("status") in ("queued", "local"):
+            self.hub.count(self.key_id, "tx")
+        self.put(json.dumps(obj, separators=(",", ":")))
+
+    def close(self, code=1000, reason=""):
+        with self.cv:
+            if self.closed:
+                return
+            self.closed, self.close_frame = True, (code, reason)
+            self.cv.notify()
+
+    def _raw(self, frame):
+        with self.wlock:
+            self.sock.sendall(frame)
+
+    def _control(self, op, data):
+        if op == 9:
+            self._raw(ws_frame(10, data))                   # ping -> pong
+        elif op == 8:
+            code = struct.unpack(">H", data[:2])[0] if len(data) >= 2 else 1000
+            self.close(code if code in (1000, 1001) else 1000)
+
+    def run(self):
+        """In the HTTP thread that upgraded: start the writer, then read until the connection ends."""
+        tokens, t_tok = float(KAAS_MSG_BURST), time.monotonic()
+        writer = threading.Thread(target=self._writer, name="kaas-w", daemon=True)
+        try:
+            writer.start()
+            while not self.closed:
+                op, data = ws_read(self.rfile, KAAS_MAX_MESSAGE, on_control=self._control)
+                self.last_rx = time.monotonic()
+                if op >= 8:
+                    self._control(op, data)
+                    continue
+                if op != 1:
+                    self.send_json({"type": "error", "error": "send JSON text messages"})
+                    continue
+                try:
+                    msg = json.loads(data)
+                except ValueError:
+                    msg = None
+                if not isinstance(msg, dict):
+                    self.send_json({"type": "error", "error": "not a JSON object"})
+                    continue
+                now = time.monotonic()                      # (a token bucket: KAAS_MSG_RATE a second, KAAS_MSG_BURST deep)
+                tokens, t_tok = min(KAAS_MSG_BURST, tokens + (now - t_tok) * KAAS_MSG_RATE) - 1, now
+                if tokens < -KAAS_MSG_BURST:
+                    self.close(1008, "too many messages")
+                    break
+                if tokens < 0:
+                    self.send_json({"type": "error", "id": msg.get("id") if isinstance(msg.get("id"), (str, int)) else None,
+                                    "error": "too many messages: at most %d a second" % KAAS_MSG_RATE})
+                    continue
+                self.hub.on_message(self, msg)
+        except ValueError as e:
+            self.close(1002, str(e)[:100])
+        except (EOFError, OSError):
+            pass
+        finally:
+            self.close()
+            self.hub.drop(self)                             # (the writer drops it too: whichever ends first frees the slot)
+            if writer.is_alive() and writer is not threading.current_thread():
+                writer.join(2.0)                            # (its close frame goes out before the socket is closed)
+
+    def _writer(self):
+        last_ping = time.monotonic()
+        try:
+            while True:
+                with self.cv:
+                    if not self.out and not self.closed and not self.dropped:
+                        self.cv.wait(max(0.0, last_ping + KAAS_PING_S - time.monotonic()))
+                    batch, dropped, closed = list(self.out), self.dropped, self.closed
+                    self.out.clear()
+                    self.dropped = 0
+                if dropped:
+                    self._raw(ws_frame(1, json.dumps({"type": "dropped", "count": dropped}).encode()))
+                for text in batch:
+                    self._raw(ws_frame(1, text.encode()))
+                if closed:
+                    code, reason = self.close_frame
+                    self._raw(ws_frame(8, struct.pack(">H", code) + reason.encode()[:120]))
+                    break
+                now = time.monotonic()
+                if now - self.last_rx > 3 * KAAS_PING_S:
+                    break                                   # gone quiet: not even pongs
+                if now - last_ping >= KAAS_PING_S:
+                    self._raw(ws_frame(9, b"kaas"))
+                    last_ping = now
+        except OSError:
+            pass
+        finally:
+            with self.cv:
+                self.closed = True
+            self.hub.drop(self)
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)        # also ends the reader's blocking read
+            except OSError:
+                pass
+
+
+class KaasHub:
+    """The radio as an API: keys (from the config, hashed), connected clients, the packet stream and clients' sends.
+    publish/send/sent/periodic/event run in the main loop; find/add/drop/on_message/key_rows in web threads."""
+
+    def __init__(self, room):
+        self.room = room
+        self.lock = threading.Lock()
+        self.conns = []                     # (replaced, never mutated: the main loop reads it without the lock)
+        self.last_used = {}                 # key id -> time (this run; the config keeps the last connect)
+        self.last_send = {}                 # key id -> deque of monotonic times of its rate-limited sends in the window
+        self.stats = dict(rx=0, tx=0, sent=0, local=0, dropped=0)
+        self.next_check = 0.0
+        self.tickets = {}                   # ticket -> (web login's pub hex, monotonic expiry): one websocket, once
+        self.ticket_log = {}                # ticket -> (what became of it, monotonic expiry): see ticket_outcome
+        self.qtimes = {}                    # (key id, "nodes" | "route") -> deque of monotonic times: query budget
+        self.refused_hosts = {}             # host -> (logins refused, last): names web logins were signed for, not ours
+        self.challenge_key = os.urandom(32)  # signs web login challenges (stateless: no pool to exhaust)
+        self.used_challenges = {}           # challenge -> expiry (time.time): signed ones, so each works once
+        self.wusers = {}                    # web user (pub hex) -> {"name", "first", "last"}: shown on the dashboard
+        self.wusers_path = os.path.join(room.cfg.data_dir, "web_users.json")
+        self.wusers_dirty = False
+        # the backlog: channel messages and DMs, numbered (seq), so web users catch up on what they missed
+        self.bk_lock = threading.Lock()
+        self.bk_seq = 0
+        self.bk_recent = collections.OrderedDict()  # packet hash -> seq
+        self.bk_pending = []                # rows not written yet (a replay reads them too)
+        self.bk_next_flush, self.bk_next_prune = 0.0, 0.0
+        self.bk_store = getattr(room, "store", None)
+        if self.bk_store is not None:
+            try:
+                self.bk_seq = int(self.bk_store.read("SELECT MAX(seq) FROM backlog")[0][0] or 0)
+                self.bk_store.execmany([("CREATE INDEX IF NOT EXISTS backlog_ts ON backlog (ts)", None)])
+            except Exception as e:
+                log.warning("MeshCore Web backlog not available: %s", e)
+                self.bk_store = None
+        self.slock = threading.Lock()
+        self.kstats = {}                    # key id -> {"total": [rx, tx, err], "hours": {hour: [rx, tx, err]}}
+        self.kstats_path = os.path.join(room.cfg.data_dir, "kaas_stats.json")
+        self.kstats_dirty, self.next_save = False, time.monotonic() + KAAS_STATS_SAVE_S
+        try:
+            with open(self.kstats_path) as f:
+                for kid, st in json.load(f).items():
+                    self.kstats[kid] = {"total": [int(x) for x in st["total"]][:3],
+                                        "hours": {int(h): [int(x) for x in v][:3] for h, v in st["hours"].items()}}
+        except FileNotFoundError:
+            pass
+        except (ValueError, KeyError, TypeError, AttributeError, OSError) as e:
+            log.warning("KaaS stats in %s not read: %s", self.kstats_path, e)
+        try:
+            with open(self.wusers_path) as f:
+                self.wusers = {k: dict(name=str(v.get("name", ""))[:32], first=int(v["first"]), last=int(v["last"]),
+                                       seq=int(v.get("seq") or 0), floor=int(v.get("floor") or 0))
+                               for k, v in json.load(f).items()}
+        except FileNotFoundError:
+            pass
+        except (ValueError, KeyError, TypeError, AttributeError, OSError) as e:
+            log.warning("web users in %s not read: %s", self.wusers_path, e)
+
+    # ---------------------------------------------------------------- per-key stats
+
+    def count(self, kid, field, n=1):
+        """Any thread. Hourly buckets for the last 24 h, plus a running total."""
+        i, hour = KAAS_STATS.index(field), int(time.time() // 3600)
+        with self.slock:
+            st = self.kstats.setdefault(kid, {"total": [0, 0, 0], "hours": {}})
+            st["total"][i] += n
+            st["hours"].setdefault(hour, [0, 0, 0])[i] += n
+            self.kstats_dirty = True
+
+    def key_stats(self, kid):
+        """{"rx": [last 24 h, total], "tx": [...], "err": [...]}"""
+        since = int(time.time() // 3600) - 23
+        with self.slock:
+            st = self.kstats.get(kid) or {"total": [0, 0, 0], "hours": {}}
+            day = [sum(v[i] for h, v in st["hours"].items() if h >= since) for i in range(3)]
+            return {f: [day[i], st["total"][i]] for i, f in enumerate(KAAS_STATS)}
+
+    def save_stats(self):
+        self.save_web_users()
+        since = int(time.time() // 3600) - 23
+        with self.slock:
+            if not self.kstats_dirty:
+                return
+            for st in self.kstats.values():
+                for h in [h for h in st["hours"] if h < since]:
+                    del st["hours"][h]
+            for kid in [k for k in self.kstats if k.startswith(WEB_ID_PREFIX) and k[len(WEB_ID_PREFIX):] not in self.wusers]:
+                del self.kstats[kid]                        # (a web key the users list let go: self-made keys are free)
+            data = json.dumps(self.kstats)
+            self.kstats_dirty = False
+        tmp = self.kstats_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(data)
+            os.replace(tmp, self.kstats_path)
+        except OSError as e:
+            log.warning("KaaS stats not saved: %s", e)
+
+    # ---------------------------------------------------------------- keys
+
+    def keys(self):
+        return [k for k in (self.room.cfg.kaas_keys or []) if isinstance(k, dict) and k.get("id")]
+
+    def key_by_id(self, kid):
+        return next((k for k in self.keys() if k["id"] == kid), None)
+
+    def find(self, token):
+        if not token.startswith(KAAS_TOKEN_PREFIX) or len(token) > 128:
+            return None
+        h = kaas_token_hash(token)
+        found = None
+        for k in self.keys():
+            if hmac.compare_digest(str(k.get("hash", "")), h):
+                found = k
+        return found
+
+    def new_ticket(self, key):
+        """A one-time ticket for a web login, or None when too many are waiting. Browsers can't put Authorization on a
+        websocket, so they log in by signing (/api/v1/web/login) and open the websocket with ?ticket=. Any thread."""
+        import secrets
+        ticket = KAAS_TICKET_PREFIX + secrets.token_urlsafe(24)
+        now = time.monotonic()
+        with self.lock:
+            self._prune_tickets(now)
+            if len(self.tickets) >= KAAS_MAX_TICKETS or \
+                    sum(1 for e in self.tickets.values() if e[0] == key["web"]) >= KAAS_TICKETS_PER_KEY:
+                return None
+            self.tickets[ticket] = (key["web"], now + KAAS_TICKET_S)
+        return ticket
+
+    def _prune_tickets(self, now):
+        for t in [t for t, e in self.tickets.items() if e[1] <= now]:
+            del self.tickets[t]
+            self.ticket_log[t] = ("unused", now + KAAS_TICKET_LOG_S)       # (it never reached us)
+        for t in [t for t, e in self.ticket_log.items() if e[1] <= now]:
+            del self.ticket_log[t]
+        while len(self.ticket_log) > 4 * KAAS_MAX_TICKETS:
+            del self.ticket_log[next(iter(self.ticket_log))]
+
+    def redeem(self, ticket):
+        """(the key a ticket was made for, None) or (None, why not: "expired", "unknown", "refused"). A ticket works
+        once."""
+        with self.lock:
+            e = self.tickets.pop(ticket, None)
+        if e is None:
+            return None, "unknown"
+        if e[1] <= time.monotonic():
+            return None, "expired"
+        key = self.web_key(e[0])
+        return (key, None) if key else (None, "refused")
+
+    def ticket_outcome(self, ticket, outcome):
+        """What became of a ticket's websocket: "connected", or why it was refused ("no_upgrade", "bad_version",
+        "busy", "full", "expired", "refused"). The browser only sees that its websocket didn't open; this tells it
+        why (/api/v1/web/ticket)."""
+        if not str(ticket).startswith(KAAS_TICKET_PREFIX):
+            return
+        with self.lock:
+            self.tickets.pop(ticket, None)
+            self.ticket_log[ticket] = (outcome, time.monotonic() + KAAS_TICKET_LOG_S)
+
+    def ticket_status(self, ticket):
+        """POST /api/v1/web/ticket: "waiting" (made, but its websocket hasn't reached us: a proxy or the browser
+        stopped it), "unused" (the same, and it has expired), an outcome from ticket_outcome, or "unknown"."""
+        with self.lock:
+            self._prune_tickets(time.monotonic())
+            if ticket in self.tickets:
+                return "waiting"
+            e = self.ticket_log.get(ticket)
+        return e[0] if e else "unknown"
+
+    # ---------------------------------------------------------------- web logins (any thread unless noted)
+
+    def web_banned(self, pub_hex):
+        return any(isinstance(b, dict) and b.get("pub") == pub_hex for b in (self.room.cfg.web_banned or []))
+
+    def web_ip_banned(self, ip):
+        return any(isinstance(b, dict) and b.get("ip") == ip for b in (self.room.cfg.web_banned_ips or []))
+
+    def web_can_send(self, pub_hex):
+        """Heard advertising on this radio (or by an observer, when trusted), or let in by the admin."""
+        if pub_hex in (self.room.cfg.web_approved or []):
+            return True
+        return self.room.heard_on_rf(bytes.fromhex(pub_hex)) is not None      # (on this radio: an MQTT report won't do)
+
+    def web_key(self, pub_hex):
+        """A web login as a key: receive always, send once heard or allowed. None while logins are off, or banned."""
+        if not self.room.cfg.web_login or self.web_banned(pub_hex):
+            return None
+        return dict(id=WEB_ID_PREFIX + pub_hex, receive=True, send=self.web_can_send(pub_hex), expires=None, web=pub_hex)
+
+    def new_challenge(self):
+        """A web login challenge: its expiry and a nonce, signed with this run's key. Nothing is stored until a login
+        uses it, so asking for challenges can't use them up."""
+        body = struct.pack(">Q", int(time.time()) + WEB_CHALLENGE_S) + os.urandom(12)
+        mac = hmac.new(self.challenge_key, body, hashlib.sha256).digest()[:16]
+        return WEB_CHALLENGE_PREFIX + base64.urlsafe_b64encode(body + mac).rstrip(b"=").decode()
+
+    def challenge_expiry(self, ch):
+        """A challenge's expiry (time.time) if this server made it and it's still good, else None."""
+        try:
+            raw = base64.urlsafe_b64decode(str(ch)[len(WEB_CHALLENGE_PREFIX):] + "==")
+        except (ValueError, TypeError):
+            return None
+        if not str(ch).startswith(WEB_CHALLENGE_PREFIX) or len(raw) != 36:
+            return None
+        if not hmac.compare_digest(raw[20:], hmac.new(self.challenge_key, raw[:20], hashlib.sha256).digest()[:16]):
+            return None
+        exp = struct.unpack(">Q", raw[:8])[0]
+        return exp if exp > time.time() else None
+
+    def web_login(self, body, hosts, ip="?"):
+        """POST /api/v1/web/login: {"pub", "signature", "challenge", "host", "name"}, the signature over
+        web_login_message(host, challenge, pub). -> (HTTP status, answer): a ticket, and whether this key may send."""
+        if not self.room.cfg.web_login:
+            return 403, {"error": "web logins are off on this server"}
+        body = body if isinstance(body, dict) else {}
+        pub, sig, ch, host = (str(body.get(k, "")).strip() for k in ("pub", "signature", "challenge", "host"))
+        pub = pub.lower()
+        try:
+            pb, sb = bytes.fromhex(pub), bytes.fromhex(sig)
+        except ValueError:
+            pb = sb = b""
+        if len(pb) != PUB_KEY_SIZE or len(sb) != SIGNATURE_SIZE:
+            return 400, {"error": "pub: a 32-byte public key in hex; signature: 64 bytes in hex"}
+        exp = self.challenge_expiry(ch)
+        if exp is None:
+            return 401, {"error": "unknown or expired challenge: ask for a new one"}
+        if host.lower() not in hosts:
+            self.web_refused_host(host.lower())
+            return 401, {"error": "the login was signed for %s, which isn't one of this server's names (its admin can "
+                                  "allow it on the Web users card)" % host[:100]}
+        if not ed25519_verify(pb, sb, web_login_message(host, ch, pub)):
+            return 401, {"error": "the signature doesn't match the key"}
+        now = time.time()
+        with self.lock:                                     # (a challenge works once)
+            if ch in self.used_challenges:
+                return 401, {"error": "that challenge was used already: ask for a new one"}
+            for c in [c for c, e in self.used_challenges.items() if e <= now]:
+                del self.used_challenges[c]
+            if len(self.used_challenges) >= WEB_MAX_USED_CHALLENGES:
+                return 503, {"error": "too many logins at once: try again shortly"}
+            self.used_challenges[ch] = exp
+        if pb in self.room.own_node_keys():
+            return 403, {"error": "that key belongs to a node on this server"}
+        if self.web_banned(pub):
+            return 403, {"error": "this key is banned from this server"}
+        name = "".join(c for c in str(body.get("name", "")) if ord(c) >= 0x20)[:32].strip()
+        cap = int(self.room.cfg.web_max_clients or 0)
+        if sum(1 for c in self.conns if c.web and not c.closed) >= cap:
+            log.warning("web login (%s) from %s refused: all %d web sessions are in use", pub[:8], ip, cap)
+            return 503, {"error": "all of this server's web sessions are in use (%d): try again later" % cap, "full": True}
+        self.web_seen(pub, name, ip)
+        key = self.web_key(pub)
+        ticket = self.new_ticket(key) if key else None
+        if ticket is None:
+            return 503, {"error": "too many logins at once: try again shortly"}
+        return 200, {"ticket": ticket, "expires_in": KAAS_TICKET_S, "send": key["send"],
+                     "state": "allowed" if key["send"] else "pending"}
+
+    def web_refused_host(self, host):
+        """A web login signed for a name not in web_hosts: kept (the last few) for the Web users card to offer."""
+        if not re.fullmatch(r"[a-z0-9.\-:\[\]]{1,100}", host):
+            return
+        with self.slock:
+            n = self.refused_hosts.pop(host, (0, 0))[0]
+            self.refused_hosts[host] = (n + 1, now_s())
+            while len(self.refused_hosts) > 10:
+                del self.refused_hosts[next(iter(self.refused_hosts))]
+
+    def web_seen(self, pub_hex, name=None, ip=None):
+        """A web user logged in, or is still connected: the dashboard's list (the least recently active go first)."""
+        now = now_s()
+        with self.slock:
+            u = self.wusers.get(pub_hex)
+            if u is None:
+                if len(self.wusers) >= WEB_USERS_MAX:
+                    keep = set(self.room.cfg.web_approved or [])
+                    cands = [k for k in self.wusers if k not in keep] or list(self.wusers)
+                    del self.wusers[min(cands, key=lambda k: self.wusers[k]["last"])]
+                u = self.wusers[pub_hex] = dict(name="", first=now, last=now, seq=self.bk_seq, floor=0)
+            if name:
+                u["name"] = name
+            if ip and ip != "?":
+                u["ip"] = ip                                # (the last address they logged in from)
+            u["last"] = now
+            self.wusers_dirty = True
+
+    def save_web_users(self):
+        with self.slock:
+            if not self.wusers_dirty:
+                return
+            data = json.dumps(self.wusers)
+            self.wusers_dirty = False
+        tmp = self.wusers_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(data)
+            os.replace(tmp, self.wusers_path)
+        except OSError as e:
+            log.warning("web users not saved: %s", e)
+
+    def web_rows(self):
+        """The dashboard's Web users card: most recently active first, the connected ones on top."""
+        conns = list(self.conns)
+        approved = set(self.room.cfg.web_approved or [])
+        with self.slock:
+            users = {k: dict(v) for k, v in self.wusers.items()}
+        rows = []
+        per_ip = collections.Counter(u.get("ip") for u in users.values() if u.get("ip"))
+        for pub, u in users.items():
+            n = self.room.nodes.get(bytes.fromhex(pub)) or {}
+            connected = sum(1 for c in conns if c.web == pub)
+            rows.append(dict(pub=pub, name=u["name"], advert_name=n.get("name") or None, first=u["first"], last=u["last"],
+                             heard_rf=n.get("rf"), heard_obs=n.get("obs"), approved=pub in approved,
+                             send=self.web_can_send(pub), banned=self.web_banned(pub), connected=connected,
+                             ip=u.get("ip"), ip_shared=max(0, per_ip[u.get("ip")] - 1) if u.get("ip") else 0,
+                             ip_banned=bool(u.get("ip")) and self.web_ip_banned(u.get("ip")),
+                             stats=self.key_stats(WEB_ID_PREFIX + pub)))
+        rows.sort(key=lambda r: (-min(r["connected"], 1), -r["last"]))
+        for r in rows:                                      # backlog packets since they were last connected
+            r["missed"] = 0 if r["connected"] else max(0, self.bk_seq - users[r["pub"]].get("seq", self.bk_seq))
+        return rows
+
+    @staticmethod
+    def valid(k, now=None):
+        return k is not None and (not k.get("expires") or k["expires"] > (now or time.time()))
+
+    def new_key(self, spec):
+        """(token, entry): the token goes back to the dashboard once; the config keeps only its hash."""
+        import secrets
+        token = KAAS_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        entry = dict(id=secrets.token_hex(4), hash=kaas_token_hash(token), created=now_s(), last_used=None, **spec)
+        return token, entry
+
+    def key_rows(self):
+        conns = list(self.conns)
+        return [dict(id=k["id"], description=k.get("description", ""),
+                     receive=bool(k.get("receive")), send=bool(k.get("send")), expires=k.get("expires"),
+                     created=k.get("created"), expired=not self.valid(k),
+                     last_used=max(self.last_used.get(k["id"]) or 0, k.get("last_used") or 0) or None,
+                     connected=sum(1 for c in conns if c.key_id == k["id"]), stats=self.key_stats(k["id"]))
+                for k in self.keys()]
+
+    def event(self, ev):
+        """kaas_key_add / kaas_key_del / kaas_used / kaas_tx, in the main loop."""
+        kind, cfg = ev[0], self.room.cfg
+        if kind == "kaas_tx":
+            self.send(*ev[1:])
+            return
+        if kind == "kaas_query":
+            self.query(*ev[1:])
+            return
+        if kind == "kaas_web_admin":
+            self.web_admin(*ev[1:])
+            return
+        if kind == "kaas_room":
+            self.room_request(*ev[1:])
+            return
+        if kind == "kaas_key_add":
+            cfg.set("kaas_keys", self.keys() + [ev[1]])
+        elif kind == "kaas_key_del":
+            cfg.set("kaas_keys", [k for k in self.keys() if k["id"] != ev[1]])
+            for c in self.conns:
+                if c.key_id == ev[1]:
+                    c.close(4001, "key revoked")
+            with self.slock:
+                if self.kstats.pop(ev[1], None) is not None:
+                    self.kstats_dirty = True
+        elif kind == "kaas_used":
+            cfg.set("kaas_keys", [dict(k, last_used=ev[2]) if k["id"] == ev[1] else k for k in self.keys()])
+        self.room.web_dirty = True
+
+    def web_admin(self, action, pub_hex, name=""):
+        """The dashboard's Web users card, in the main loop: allow / unallow sending, kick, ban, unban, forget;
+        or ("settings", {"web_login": bool, ...})."""
+        cfg = self.room.cfg
+        if action == "settings":
+            for k, v in pub_hex.items():
+                cfg.set(k, v)
+        elif action == "allow":
+            cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex] + [pub_hex])
+        elif action == "unallow":
+            cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex])
+        elif action == "ban":
+            with self.slock:
+                name = name or (self.wusers.get(pub_hex) or {}).get("name", "")
+            cfg.set("web_banned", [b for b in (cfg.web_banned or []) if isinstance(b, dict) and b.get("pub") != pub_hex] +
+                    [dict(pub=pub_hex, name=name, ts=now_s())])
+            cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex])
+        elif action == "unban":
+            cfg.set("web_banned", [b for b in (cfg.web_banned or []) if isinstance(b, dict) and b.get("pub") != pub_hex])
+        elif action == "ban_ip":                            # (pub_hex is the address here)
+            cfg.set("web_banned_ips", [b for b in (cfg.web_banned_ips or []) if isinstance(b, dict) and b.get("ip") != pub_hex] +
+                    [dict(ip=pub_hex, name=name, ts=now_s())])
+            for c in list(self.conns):
+                if c.web and getattr(c, "ip", None) == pub_hex:
+                    c.close(4003, "this address is banned from this server")
+        elif action == "unban_ip":
+            cfg.set("web_banned_ips", [b for b in (cfg.web_banned_ips or []) if isinstance(b, dict) and b.get("ip") != pub_hex])
+        elif action == "purge":                             # their backlog: as if they'd caught up just now
+            with self.slock:
+                u = self.wusers.get(pub_hex)
+                if u is not None:
+                    u["floor"] = u["seq"] = self.bk_seq
+                    self.wusers_dirty = True
+        elif action == "delete":                            # forget them: their record, counts, and "allow send"
+            with self.slock:
+                if self.wusers.pop(pub_hex, None) is not None:
+                    self.wusers_dirty = True
+                if self.kstats.pop(WEB_ID_PREFIX + pub_hex, None) is not None:
+                    self.kstats_dirty = True
+            cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex])
+        for c in self.conns:
+            if c.web and (c.web == pub_hex or action == "settings"):
+                if action in ("kick", "delete"):
+                    c.close(4005, "disconnected by the admin")
+                elif action == "ban":
+                    c.close(4003, "this key is banned from this server")
+        self.next_check = 0.0                               # settings, allow/unallow: applied by the next periodic check
+        self.room.web_dirty = True
+
+    # ---------------------------------------------------------------- clients
+
+    def add(self, conn):
+        with self.lock:
+            web = sum(1 for c in self.conns if c.web)
+            if (web >= int(self.room.cfg.web_max_clients or 0)) if conn.web else (len(self.conns) - web >= KAAS_MAX_CLIENTS):
+                return False
+            self.conns = self.conns + [conn]
+        self.last_used[conn.key_id] = now_s()
+        return True
+
+    def drop(self, conn):
+        with self.lock:
+            self.conns = [c for c in self.conns if c is not conn]
+
+    def web_sessions_from(self, ip):
+        return sum(1 for c in self.conns if c.web and c.ip == ip and not c.closed)
+
+    def close_all(self):
+        for c in self.conns:
+            c.close(1001, "server shutting down")
+        self.save_stats()
+
+    def hello(self, key):
+        room = self.room
+        radio = dict(zip(("freq_hz", "bw_hz", "sf", "cr"), room.radio)) if room.radio else None
+        return {"type": "hello", "api": 1, "server": FIRMWARE_VERSION,
+                "key": dict({"id": key["id"], "receive": bool(key.get("receive")), "send": bool(key.get("send")),
+                             "expires": key.get("expires")},
+                            **({"web": True, "pub": key["web"], "state": "allowed" if key.get("send") else "pending",
+                                "pending_message": str(room.cfg.web_unknown_key_message or "")}
+                               if key.get("web") else {})),
+                "send_burst": int(room.cfg.kaas_send_burst), "send_window_s": float(room.cfg.kaas_send_window_s),
+                "airtime_pct": room.air.rates()[1]["web" if key.get("web") else "kaas"] * 100.0,   # (its class's
+                                                                                   # guaranteed share; more when quiet)
+                "radio": radio,
+                "giphy_key": (room.cfg.web_giphy_key or None) if key.get("web") else None,   # (Giphy keys are for browsers)
+                "motd": (str(room.cfg.web_motd).strip() or None) if key.get("web") and room.cfg.web_motd_enabled else None,
+                "nodes": {"room": None,                     # (the host isn't a room: every room is in tenants)
+                          "tenants": [hexs(t.id.pub_key) for t in list(room.tenants.values())],
+                          "repeater": hexs(room.vr.pub) if room.vr is not None else None,
+                          "companion": hexs(room.vc.pub) if room.vc is not None else None},
+                "names": {hexs(t.id.pub_key): t.cfg.name for t in list(room.tenants.values())}}
+
+    def on_message(self, conn, msg):
+        """A client's message (its reader thread). Sends go to the main loop; at most KAAS_MAX_INFLIGHT wait there."""
+        t, rid = msg.get("type"), msg.get("id")
+        if rid is not None and not (isinstance(rid, (str, int)) and not isinstance(rid, bool) and len(str(rid)) <= 64):
+            rid = None
+        if t == "ping":
+            return conn.send_json({"type": "pong", "id": rid})
+        if t in ("near", "routes", "route", "nodes", "paths"):
+            return self.ask(conn, t, msg, rid)
+        if t == "replay":
+            return self.replay(conn, msg, rid)
+        if t in ("room", "room_post"):
+            return self.room_ask(conn, t, msg, rid)
+        if t != "send":
+            return conn.send_json({"type": "error", "id": rid,
+                                   "error": "unknown message type: use send, near, routes, route, paths, nodes or ping"})
+
+        def drop(reason):
+            self.stats["dropped"] += 1
+            conn.send_json({"type": "send_result", "id": rid, "status": "dropped", "reason": reason})
+        if not conn.can_send:
+            return drop("your key hasn't been heard on this radio yet: the admin can let it send" if conn.web
+                        else "this key can't send")
+        try:
+            raw = bytes.fromhex(str(msg.get("raw", "")))
+        except ValueError:
+            return drop("raw must be the packet in hex")
+        with conn.cv:
+            if conn.inflight >= KAAS_MAX_INFLIGHT:
+                busy = True
+            else:
+                busy = False
+                conn.inflight += 1
+        if busy:
+            return drop("too many sends waiting: wait for their results")
+        self.room.events_put(("kaas_tx", conn, raw, rid))
+
+    # ---------------------------------------------------------------- the backlog (MeshCore Web's catch-up)
+
+    def backlog_add(self, raw, src, snr=None):
+        """A packet heard ("rf": by this radio, or sent by it) or reported by an observer ("mqtt"), in the main loop.
+        Channel messages and DMs are kept, once each whatever the source, numbered in order. -> its seq and whether
+        it's new, or (None, False) when it isn't kept."""
+        cfg = self.room.cfg
+        if self.bk_store is None or int(cfg.web_backlog_days or 0) <= 0:
+            return None, False
+        pkt = Packet.parse(raw)
+        if pkt is None or pkt.ptype not in BACKLOG_TYPES or len(pkt.payload) < 2:
+            return None, False
+        h = pkt.packet_hash()
+        with self.bk_lock:
+            seq = self.bk_recent.get(h)
+            if seq is not None:
+                return seq, False                           # another copy: through another repeater, or MQTT and RF
+            self.bk_seq += 1
+            seq = self.bk_recent[h] = self.bk_seq
+            while len(self.bk_recent) > BACKLOG_RECENT:
+                self.bk_recent.popitem(last=False)
+            p = pkt.payload
+            self.bk_pending.append((seq, h, now_s(), bytes(raw), src, snr, pkt.ptype,
+                                    p[0] if pkt.ptype == PT_GRP_TXT else None, p[0] if pkt.ptype == PT_TXT_MSG else None))
+        return seq, True
+
+    def backlog_info(self):
+        """For the dashboard (a web thread): the settings, and how much is kept."""
+        cfg = self.room.cfg
+        info = {"days": int(cfg.web_backlog_days or 0), "mqtt": bool(cfg.web_backlog_mqtt), "count": 0, "oldest": None,
+                "seq": self.bk_seq}
+        if self.bk_store is not None:
+            try:
+                n, oldest = self.bk_store.read("SELECT COUNT(*), MIN(ts) FROM backlog")[0]
+                info.update(count=int(n or 0) + len(self.bk_pending), oldest=oldest)
+            except Exception:
+                pass
+        return info
+
+    def backlog_mqtt(self, raw, snr):
+        """A channel message or DM an MQTT observer reported: kept, and to web users at once (they'd see it on their
+        next catch-up otherwise). Read only, like a catch-up: the radio didn't hear it."""
+        if not self.room.cfg.web_backlog_mqtt:
+            return
+        seq, new = self.backlog_add(raw, "mqtt", snr)
+        if not new:
+            return
+        conns = [c for c in self.conns if c.web and c.can_receive]
+        if conns:
+            text = json.dumps({"type": "packet", "dir": "mqtt", "ts": round(time.time(), 3), "raw": bytes(raw).hex(),
+                               "seq": seq}, separators=(",", ":"))
+            for c in conns:
+                c.put(text)
+                self.count(c.key_id, "rx")
+
+    def backlog_periodic(self):
+        """Main loop: write new rows (one transaction a second at most), and prune past web_backlog_days."""
+        if self.bk_store is None:
+            return
+        now = time.monotonic()
+        if self.bk_pending and now >= self.bk_next_flush:
+            self.bk_next_flush = now + BACKLOG_FLUSH_S
+            with self.bk_lock:
+                rows, self.bk_pending = self.bk_pending, []
+            self.bk_store.execmany([("INSERT OR IGNORE INTO backlog (seq, hash, ts, raw, src, snr, ptype, ch, dst) "
+                                     "VALUES (?,?,?,?,?,?,?,?,?)", rows)])
+        if now >= self.bk_next_prune:
+            self.bk_next_prune = now + BACKLOG_PRUNE_S
+            days = int(self.room.cfg.web_backlog_days or 0)
+            self.bk_store.execmany([("DELETE FROM backlog WHERE ts < ?", [(now_s() - days * 86400,)])])
+
+    def replay(self, conn, msg, rid):
+        """A web user's catch-up: {"type": "replay", "since": seq or null, "channels": [channel hash bytes], "me": its key's
+        hash byte}. The channel messages and DMs kept after `since` (and after the admin's purge) that could be for it,
+        in batches; then replay_done with the seq it's up to. No `since` (a first visit): nothing, just that seq."""
+        def err(e):
+            conn.send_json({"type": "error", "id": rid, "error": e})
+        if not conn.web:
+            return err("catching up is for web logins only")
+        since, chans, me = msg.get("since"), msg.get("channels") or [], msg.get("me")
+        ok_byte = lambda x: isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 255
+        if since is not None and (isinstance(since, bool) or not isinstance(since, int) or since < 0):
+            return err("since: a seq from a packet, or null")
+        if not isinstance(chans, list) or len(chans) > 256 or not all(ok_byte(x) for x in chans) or not ok_byte(me):
+            return err("channels: channel hash bytes; me: your key's first byte")
+        if getattr(conn, "replaying", False):
+            return err("a catch-up is already running")
+        conn.replaying = True
+        threading.Thread(target=self._replay, args=(conn, rid, since, sorted(set(chans)), me), name="kaas-replay",
+                         daemon=True).start()
+
+    def _replay(self, conn, rid, since, chans, me):
+        try:
+            with self.slock:
+                u = dict(self.wusers.get(conn.web) or {})
+            top = self.bk_seq
+            if since is None or self.bk_store is None:
+                conn.send_json({"type": "replay_done", "id": rid, "last": top, "count": 0})
+                return
+            since = max(since, int(u.get("floor") or 0))
+            want = lambda ptype, ch, dst: (ptype == PT_GRP_TXT and ch in chans) or (ptype == PT_TXT_MSG and dst == me)
+            marks = ",".join("?" * len(chans)) or "NULL"
+            sql = ("SELECT seq, raw, ts, src, snr FROM backlog WHERE seq > ? AND seq <= ? AND ((ptype = %d AND ch IN (%s)) OR "
+                   "(ptype = %d AND dst = ?)) ORDER BY seq LIMIT %d" % (PT_GRP_TXT, marks, PT_TXT_MSG, BACKLOG_BATCH))
+            sent, last = 0, since
+            while not conn.closed:
+                rows = self.bk_store.read(sql, (last, top, *chans, me))
+                if not rows:
+                    with self.bk_lock:                      # (and what's not written yet)
+                        rows = [(r[0], r[3], r[2], r[4], r[5]) for r in self.bk_pending
+                                if last < r[0] <= top and want(r[6], r[7], r[8])][:BACKLOG_BATCH]
+                    if not rows:
+                        break
+                pkts = [{"seq": q, "raw": bytes(raw).hex(), "ts": ts, "dir": "mqtt" if src == "mqtt" else "rx",
+                         "snr": snr} for q, raw, ts, src, snr in rows]
+                while len(conn.out) > 32 and not conn.closed:
+                    time.sleep(0.05)                        # let the client keep up: its outbox is bounded
+                conn.send_json({"type": "replay_batch", "id": rid, "packets": pkts})
+                sent += len(pkts)
+                last = rows[-1][0]
+                self.count(conn.key_id, "rx", len(pkts))
+            conn.send_json({"type": "replay_done", "id": rid, "last": top, "count": sent})
+            with self.slock:
+                if conn.web in self.wusers:
+                    self.wusers[conn.web]["seq"] = max(self.wusers[conn.web].get("seq", 0), top)
+                    self.wusers_dirty = True
+        except Exception as e:
+            log.warning("catch-up for %s failed: %s", conn.web[:8], e)
+            conn.send_json({"type": "error", "id": rid, "error": "the catch-up failed"})
+        finally:
+            conn.replaying = False
+
+    def query_allowed(self, conn, t):
+        """A key's query budget, across its connections: KAAS_QUERY_LIMITS per minute (the main loop answers them)."""
+        kind = "nodes" if t == "nodes" else "route"
+        limit = KAAS_QUERY_LIMITS[kind]
+        now = time.monotonic()
+        with self.lock:
+            q = self.qtimes.setdefault((conn.key_id, kind), collections.deque())
+            while q and now - q[0] >= 60:
+                q.popleft()
+            if len(q) >= limit:
+                return False
+            q.append(now)
+            if len(self.qtimes) > 4096:                     # (keys gone quiet)
+                for k in [k for k, v in self.qtimes.items() if not v or now - v[-1] >= 60]:
+                    del self.qtimes[k]
+        return True
+
+    def ask(self, conn, t, msg, rid):
+        """A route question: checked here, answered by the main loop (it owns the map). Shares the in-flight cap."""
+        def err(e):
+            conn.send_json({"type": "error", "id": rid, "error": e})
+        def over_budget():
+            if self.query_allowed(conn, t):
+                return False
+            kind = "nodes" if t == "nodes" else "route"
+            err("too many %s requests: at most %d a minute" % (kind, KAAS_QUERY_LIMITS[kind]))
+            return True
+        if t == "nodes":
+            days = msg.get("days", 7)
+            top = NODES_DAYS_WEB if conn.web else 365
+            if isinstance(days, bool) or not isinstance(days, (int, float)) or not 0 < days <= top:
+                return err("days: more than 0, at most %d" % top)
+            if over_budget():
+                return
+            with conn.cv:
+                if conn.inflight >= KAAS_MAX_INFLIGHT:
+                    return err("too many requests waiting: wait for their answers")
+                conn.inflight += 1
+            return self.room.events_put(("kaas_query", conn, t, float(days), NODES_ANSWER_MAX, rid))
+        if t == "paths":
+            try:
+                node = bytes.fromhex(str(msg.get("node", "")))
+            except ValueError:
+                node = b""
+            limit = msg.get("limit", 4)
+            if len(node) != PUB_KEY_SIZE:
+                return err("node: its public key in hex (64 characters)")
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 8:
+                return err("limit: 1 to 8")
+            if over_budget():
+                return
+            with conn.cv:
+                if conn.inflight >= KAAS_MAX_INFLIGHT:
+                    return err("too many requests waiting: wait for their answers")
+                conn.inflight += 1
+            return self.room.events_put(("kaas_query", conn, t, node, limit, rid))
+        try:
+            key = bytes.fromhex(str(msg.get("node" if t == "near" else "repeater", "")))
+        except ValueError:
+            key = b""
+        if t == "near" and "name" in msg and "node" not in msg:
+            key = kaas_mention_name(msg["name"])
+            if key is None:
+                return err("name: the node's advertised name, or a mention like @[name]")
+        elif t == "near" and not 8 <= len(key) <= 32:
+            return err("node: its public key in hex (at least the first 8 bytes), or name: its advertised name")
+        if t == "routes" and not 2 <= len(key) <= 32:
+            return err("repeater: its public key in hex (at least the first 2 bytes)")
+        if t == "route":
+            key = (kaas_endpoint(msg.get("from")), kaas_endpoint(msg.get("to")))
+            for end, spec in zip(("from", "to"), key):
+                if spec is None:
+                    return err(end + ": a node's public key in hex (at least 8 bytes), its name or @[name], "
+                               "or a repeater's 2-byte id in hex")
+        limit = msg.get("limit", 4 if t == "near" else 3)
+        top = KAAS_MAX_ROUTES if t == "route" else 10
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= top:
+            return err("limit: 1 to %d" % top)
+        if over_budget():
+            return
+        with conn.cv:
+            if conn.inflight >= KAAS_MAX_INFLIGHT:
+                return err("too many requests waiting: wait for their answers")
+            conn.inflight += 1
+        self.room.events_put(("kaas_query", conn, t, key, limit, rid))
+
+    # ---------------------------------------------------------------- this server's rooms, for web logins
+
+    def room_ask(self, conn, t, msg, rid):
+        """A web login's "room" (read a room on this server: its posts, then each new one as it's stored) or
+        "room_post" (post to it). Straight to the room, not over the air: the member's sync point and routes, which
+        their radio companion relies on, are left alone. Checked here, done in the main loop."""
+        def err(e):
+            conn.send_json({"type": "error", "id": rid, "error": e})
+        if not conn.web:
+            return err("rooms on this server: for web logins only (an API key logs in over the air)")
+        try:
+            pub = bytes.fromhex(str(msg.get("room", "")))
+        except ValueError:
+            pub = b""
+        if len(pub) != PUB_KEY_SIZE:
+            return err("room: the room's public key in hex")
+        if not conn.can_send:                               # (rooms too: nothing for a key not yet allowed)
+            return err("your key hasn't been heard on this radio yet: the admin can let it send")
+        if t == "room":
+            since, pw = msg.get("since", 0), msg.get("password", "")
+            if isinstance(since, bool) or not isinstance(since, int) or since < 0 or not isinstance(pw, str):
+                return err("since: a timestamp (0 for the latest posts); password: text")
+            arg = (since, pw[:15])
+        else:
+            text = msg.get("text")
+            if not isinstance(text, str) or not text.strip() or len(text.strip().encode()) > MAX_POST_TEXT_LEN:
+                return err("text: 1 to %d bytes" % MAX_POST_TEXT_LEN)
+            arg = text.strip()
+        with conn.cv:
+            if conn.inflight >= KAAS_MAX_INFLIGHT:
+                return err("too many requests waiting: wait for their answers")
+            conn.inflight += 1
+        self.room.events_put(("kaas_room", conn, t, pub, arg, rid))
+
+    def local_room(self, pub):
+        return self.room.tenants.get(pub)
+
+    def room_request(self, conn, t, pub, arg, rid):
+        """In the main loop. room: (since, password) -> the posts this member may see after since (all of the newest
+        catchup_max when 0), and from now on each new one as "room_post". room_post: text -> stored as their post."""
+        with conn.cv:
+            conn.inflight = max(0, conn.inflight - 1)
+        r, me = self.local_room(pub), bytes.fromhex(conn.web)
+
+        def err(e, **kw):
+            conn.send_json(dict({"type": "error", "id": rid, "error": e}, **kw))
+        if r is None:
+            return err("not a room on this server", local=False)
+        if me in r.bans:
+            return err("you're banned from this room")
+        m = r.members.get(me)
+        if t == "room":
+            since, pw = arg
+            if m is None or (pw and m.role == PERM_GUEST):  # (a member is known by their key: no password needed)
+                if r.login_blocked(me):
+                    return err("too many wrong passwords: try again later", refused=True)
+                if r.cfg.admin_password and same_text(pw, r.cfg.admin_password):
+                    perm = PERM_ADMIN
+                elif same_text(pw, r.cfg.room_password):
+                    perm = PERM_READ_WRITE
+                elif r.cfg.allow_read_only:
+                    perm = PERM_GUEST
+                else:
+                    r.login_failed(me)
+                    return err("the room refused the login (a wrong password?)", refused=True)
+                if m is None:
+                    m = r.put_member(me)
+                    m.secret = r.id.shared_secret(me)
+                    public = [p for p in r.posts if p[3] is None]          # what a new member's radio would get
+                    m.sync_since = public[-r.cfg.catchup_max - 1][0] if 0 < r.cfg.catchup_max < len(public) else 0
+                m.perms = (m.perms & ~3) | perm
+                r.mark_dirty()
+            # (last_activity is left alone: it's what makes the room push over the air. A member who joined here has
+            # none until their radio logs in, so the room never pushes to a radio that isn't there.)
+            seen = [p for p in r.posts if p[0] > since and (p[3] is None or p[3] == me)]
+            if since == 0:
+                seen = seen[-max(1, int(r.cfg.catchup_max or 50)):]
+            conn.rooms.add(pub)
+            conn.send_json({"type": "room_result", "id": rid, "room": pub.hex(), "name": r.cfg.name,
+                            "admin": m.is_admin, "perms": m.perms, "can_post": m.role != PERM_GUEST,
+                            "posts": [self.room_post_json(r, p) for p in seen[-ROOM_ANSWER_MAX:]]})
+            return
+        if m is None or m.role == PERM_GUEST:
+            return err("log in to the room with its password to post", refused=m is None)
+        if r.is_manual_resend(m, arg):
+            return conn.send_json({"type": "room_post_result", "id": rid, "status": "duplicate"})
+        r.store_post(me, arg)
+        conn.send_json({"type": "room_post_result", "id": rid, "status": "posted", "ts": r.posts[-1][0]})
+
+    def room_post_json(self, r, p):
+        ts, author, text, to = p
+        return {"ts": ts, "author": author.hex(), "name": r.chat_label(author), "text": text, "private": to is not None}
+
+    def room_post_added(self, r, p):
+        """A post was just stored in room r (main loop): to the web sessions following it that may see it."""
+        pub = r.id.pub_key
+        for c in self.conns:
+            if c.web and pub in c.rooms and not c.closed and (p[3] is None or p[3].hex() == c.web) \
+                    and bytes.fromhex(c.web) not in r.bans:
+                c.send_json(dict(self.room_post_json(r, p), type="room_post", room=pub.hex()))
+
+    # ---------------------------------------------------------------- the main loop's side
+
+    def query(self, conn, t, key, limit, rid):
+        """near: the repeaters that hear a node (its first hop into the mesh), with each one's share.
+        routes: the room's best known routes to a repeater (from this radio), ready to use as a direct path."""
+        with conn.cv:
+            conn.inflight -= 1
+        r = self.room
+        if getattr(r, "_rpt_idx", None) is None:
+            r.build_rpt_index()
+
+        def name(h):
+            hit = r.rpt_lookup(h)
+            return hit[1]["name"] if hit and hit[1].get("name") else None
+        if t == "nodes":
+            return self.nodes_answer(conn, key, limit, rid)
+        if t == "near" and isinstance(key, str):
+            k8 = r.node_by_name(key)
+            if k8 is None:
+                conn.send_json({"type": "error", "id": rid, "error": "no node named %s has been heard" % key})
+                return
+            key = k8
+        if t == "route":
+            return self.route(conn, key, limit, rid, name)
+        if t == "paths":
+            return self.paths_answer(conn, key, limit, rid, name)
+        if t == "near":
+            rows = r.locations(key[:8])[:limit]
+            nm = r.names.get(key[:8])
+            # heard with no hops: by this radio itself, so name its virtual repeater (what relays for it), else the room
+            here = ({"id": r.vr.pub[:2].hex(), "name": r.cfg.repeater_name} if r.vr is not None else
+                    {"id": r.id.pub_key[:2].hex(), "name": r.cfg.name})
+            conn.send_json({"type": "near_result", "id": rid, "node": key.hex(), "name": nm[1] if nm else None,
+                            "repeaters": [dict(here, direct=True, share=round(share, 3)) if h == b"" else
+                                          {"id": h.hex(), "name": name(h), "share": round(share, 3)}
+                                          for h, share in rows]})
+            return
+        target = key[:2]
+        rows = []
+        for rr, conf in r.top_rpt_routes(target, limit):
+            sz = (rr.plen >> 6) + 1
+            hops = [rr.path[i * sz:(i + 1) * sz] for i in range(rr.plen & 63)]
+            rows.append({"path_len": rr.plen, "path": rr.path.hex(), "hops": [h.hex() for h in hops],
+                         "names": [name(h) for h in hops], "confidence": round(conf, 3)})
+        conn.send_json({"type": "routes_result", "id": rid, "repeater": target.hex(), "name": name(target), "routes": rows})
+
+    def nodes_answer(self, conn, days, limit, rid):
+        """nodes: everyone this server knows of, heard in the last `days`, newest first, for contact lists and maps. The
+        node directory (adverts heard here or by an MQTT observer), plus what the room already kept: the repeater map
+        and neighbours, room members (main and tenant rooms), the virtual companion's contacts, and the name cache.
+        The name cache holds only the first 8 bytes of a key: those come as "partial", with that much of the key."""
+        r = self.room
+        since = now_s() - days * 86400
+        types = {ADV_TYPE_CHAT: "chat", ADV_TYPE_REPEATER: "repeater", ADV_TYPE_ROOM: "room", ADV_TYPE_SENSOR: "sensor"}
+        found = {}                                          # pub -> row; a later source only fills in what's missing
+
+        def add(pub, kind, name, last, lat=None, lon=None, rf=None, obs=None):
+            pub = bytes(pub)
+            if len(pub) != PUB_KEY_SIZE or pub in self.own_keys():
+                return
+            row = found.get(pub)
+            if row is None:
+                row = found[pub] = {"pub": pub.hex(), "type": kind, "name": "", "lat": None, "lon": None,
+                                    "last_heard": 0, "rf": rf, "obs": obs}
+            row["name"] = row["name"] or name or ""
+            if row["lat"] is None and lat is not None and (lat or lon):
+                row["lat"], row["lon"] = lat, lon
+            row["last_heard"] = max(row["last_heard"], int(last or 0))
+
+        for pub, n in list(r.nodes.items()):
+            add(pub, types.get(n["type"], n["type"]), n["name"], max(n["rf"] or 0, n["obs"] or 0), n["lat"], n["lon"],
+                n["rf"], n["obs"])
+        for pub, x in list(r.repeaters.items()):
+            add(pub, "repeater", x.get("name"), x.get("last_advert"), x.get("lat"), x.get("lon"))
+        for pub, x in list(r.neighbours.items()):
+            add(pub, "repeater", x.get("name"), x.get("heard"))
+        for room in [r] + list(r.tenants.values()):
+            for pub, m in list(room.members.items()):
+                nm = r.names.get(pub[:8])
+                add(pub, "chat", nm[1] if nm else "", max(m.last_heard or 0, m.last_activity or 0))
+        if r.vc is not None:
+            for pub, c in list(r.vc.contacts.items()):
+                add(pub, types.get(c.type, "chat"), c.name, c.lastmod or c.adv_ts,
+                    c.lat / 1e6 if c.lat else None, c.lon / 1e6 if c.lon else None)
+        prefixes = {pub[:8] for pub in found}
+        partial = [{"pub": k8.hex(), "partial": True, "type": "chat", "name": name, "lat": None, "lon": None,
+                    "last_heard": int(ts or 0), "rf": None, "obs": None}
+                   for k8, (ts, name) in list(r.names.items()) if k8 not in prefixes and name]
+        rows = [x for x in list(found.values()) + partial if x["last_heard"] >= since]
+        rows.sort(key=lambda x: -x["last_heard"])
+        conn.send_json({"type": "nodes_result", "id": rid, "nodes": rows[:limit]})
+
+    def route(self, conn, ends, limit, rid, name):
+        """route: suggested repeater chains from one node (or repeater) to another, through the links the room
+        has seen, best first and scored."""
+        r = self.room
+        sides = []
+        for spec in ends:
+            kind, v = spec
+            if kind == "repeater":
+                sides.append(({"repeater": v.hex(), "name": name(v)}, {v[:2]: 1.0}))
+                continue
+            k8 = r.node_by_name(v) if kind == "name" else v[:8]
+            if k8 is None:
+                return conn.send_json({"type": "error", "id": rid, "error": "no node named %s has been heard" % v})
+            nm = r.names.get(k8)
+            locs = dict(r.locations(k8))
+            if not locs:
+                return conn.send_json({"type": "error", "id": rid, "error": "no recent location for %s: it hasn't "
+                                       "flood-adverted lately" % (nm[1] if nm else k8.hex())})
+            sides.append(({"node": k8.hex(), "name": nm[1] if nm else None}, locs))
+        rows = []
+        for hops, score in r.suggest_routes(sides[0][1], sides[1][1], limit):
+            rows.append({"path_len": 0x40 | len(hops), "path": b"".join(hops).hex(), "hops": [h.hex() for h in hops],
+                         "names": [name(h) for h in hops], "score": round(score, 3)})
+        conn.send_json({"type": "route_result", "id": rid, "from": sides[0][0], "to": sides[1][0], "routes": rows})
+
+    def paths_answer(self, conn, pub, limit, rid, name):
+        """paths: direct paths from this radio to a node, best first, as the room plans its own pushes: routes measured
+        by delivering to it (when it's a member here), routes built from the repeaters that hear it and this radio's
+        best route to each, and shortcuts. Each is ready to put on a packet (path_len, path)."""
+        r = self.room
+        found = {}
+        rooms = [x for x in [r] + list(r.tenants.values()) if pub in x.members]
+        for room, m in [(x, x.members[pub]) for x in rooms] or [(r, types.SimpleNamespace(pub=pub, routes=[]))]:
+            for c in room.candidates(m):
+                if c["plen"] is None:
+                    continue
+                k = (c["plen"], bytes(c["path"]))
+                old = found.get(k)
+                if old is None or c["score"] > old["score"] or (c["proven"] is not None and old["proven"] is None):
+                    found[k] = c
+        rows = []
+        for c in sorted(found.values(), key=lambda c: (-round(c["score"], 2), c["plen"] & 63))[:limit]:
+            sz, n = (c["plen"] >> 6) + 1, c["plen"] & 63
+            hops = [bytes(c["path"])[i * sz:(i + 1) * sz] for i in range(n)]
+            rows.append({"path_len": c["plen"], "path": bytes(c["path"]).hex(), "hops": [h.hex() for h in hops],
+                         "names": [name(h) for h in hops], "score": round(c["score"], 3),
+                         "source": "measured" if c["proven"] is not None else "shortcut" if c["built"] == "shortcut"
+                         else "direct" if n == 0 else "map"})
+        nm = r.names.get(pub[:8])
+        conn.send_json({"type": "paths_result", "id": rid, "node": pub.hex(), "name": nm[1] if nm else None,
+                        "paths": rows})
+
+    def own_keys(self):
+        r = self.room
+        keys = {r.id.pub_key} | {t.id.pub_key for t in r.tenants.values()}
+        if r.vr is not None:
+            keys.add(r.vr.pub)
+        if r.vc is not None:
+            keys.add(r.vc.pub)
+        return keys
+
+    def publish(self, direction, raw, snr=None, rssi=None):
+        """A packet this radio heard ("rx") or sent ("tx"): to every client that may receive. Channel messages and DMs
+        are kept for MeshCore Web's catch-up, and carry their number (seq)."""
+        raw = bytes(raw)
+        seq, _ = self.backlog_add(raw, "rf", snr)
+        conns = [c for c in self.conns if c.can_receive]
+        if not conns:
+            return
+        msg = {"type": "packet", "dir": direction, "ts": round(time.time(), 3), "raw": raw.hex()}
+        if seq is not None:
+            msg["seq"] = seq
+        pkt = Packet.parse(raw)
+        if pkt is not None:
+            msg.update(ptype=PT_NAMES[pkt.ptype] if pkt.ptype < len(PT_NAMES) else pkt.ptype,
+                       route="flood" if pkt.is_flood else "direct", hops=pkt.hop_count, hash=pkt.packet_hash().hex())
+        if direction == "rx":
+            msg.update(snr=snr, rssi=rssi)
+        self.stats[direction] += 1
+        text = json.dumps(msg, separators=(",", ":"))
+        for c in conns:
+            c.put(text)
+            self.count(c.key_id, "rx")
+
+    def send(self, conn, raw, rid):
+        """A client's packet: checked, rate-limited, offered to the nodes on this radio, then queued for the air at the
+        lowest priority. ACKs and path returns (which usually carry an ACK) skip the per-key rate limit, since a bot must
+        answer what it's sent. Airtime comes out of the web users' or API clients' share (see Airtime)."""
+        with conn.cv:
+            conn.inflight -= 1
+
+        def result(status, **kw):
+            if status == "dropped":
+                self.stats["dropped"] += 1
+            conn.send_json(dict(type="send_result", id=rid, status=status, **kw))
+        if conn.closed:
+            return
+        if conn.web:
+            k = self.web_key(conn.web)
+            if k is None or not k["send"]:
+                return result("dropped", reason="this key may not send (anymore)")
+        else:
+            k = self.key_by_id(conn.key_id)
+            if not self.valid(k) or not k.get("send"):
+                return result("dropped", reason="key revoked or expired")
+        pkt = Packet.parse(raw)
+        if pkt is None or pkt.encode() != raw:
+            return result("dropped", reason="not a valid MeshCore packet")
+        if conn.web:
+            why = web_packet_check(pkt, bytes.fromhex(conn.web))
+            if why:
+                return result("dropped", reason=why)
+        own = self.own_keys()
+        if (pkt.ptype == PT_ADVERT and pkt.payload[:PUB_KEY_SIZE] in own) or \
+                (pkt.ptype == PT_ANON_REQ and pkt.payload[1:1 + PUB_KEY_SIZE] in own):
+            return result("dropped", reason="that packet speaks for a node on this radio")
+        now = time.monotonic()
+        exempt = pkt.ptype in (PT_ACK, PT_PATH)
+        burst, window = int(self.room.cfg.kaas_send_burst or 1), float(self.room.cfg.kaas_send_window_s or 0)
+        recent = self.last_send.setdefault(conn.key_id, collections.deque())
+        while recent and recent[0] <= now - window:
+            recent.popleft()
+        if not exempt and len(recent) >= burst:
+            return result("dropped", reason="rate limit: %d packets per %g s per key (ACKs and paths excepted)" % (burst, window),
+                          retry_after=round(max(recent[0] + window - now, 0.1), 1))
+        if not exempt:
+            recent.append(now)
+        self.last_used[conn.key_id] = now_s()
+        if self.room.vr is not None and pkt.is_direct and pkt.hop_count and pkt.ptype != PT_TRACE:
+            pkt.path, pkt.path_len = self.room.vr.strip_first_hops(pkt.path, pkt.path_len)   # (as the room does: our own
+                                                                                             # repeater is this radio)
+        if self.room.offer(pkt, self) and (pkt.is_flood or pkt.hop_count == 0 or pkt.ptype == PT_TRACE):
+            self.stats["local"] += 1
+            return result("local")                          # only for a node on this radio: it never goes on the air
+        self.room.queue_tx(pkt, KAAS_PRIO, 0.0, deferrable=not exempt, src=self, tag=(conn, rid))
+        result("queued")
+
+    def sent(self, tag):
+        conn, rid = tag
+        self.stats["sent"] += 1
+        conn.send_json({"type": "send_result", "id": rid, "status": "sent"})
+
+    def dropped(self, tag, reason):
+        """A queued packet that never went out."""
+        conn, rid = tag
+        self.stats["dropped"] += 1
+        conn.send_json({"type": "send_result", "id": rid, "status": "dropped", "reason": reason})
+
+    def periodic(self):
+        """Close connections whose key was revoked or has expired; save the per-key stats now and then; the backlog."""
+        now = time.monotonic()
+        self.backlog_periodic()
+        if now >= self.next_save:
+            self.next_save = now + KAAS_STATS_SAVE_S
+            self.save_stats()
+        if now < self.next_check or not self.conns:
+            return
+        self.next_check = now + 1.0
+        t = time.time()
+        cfg = self.room.cfg
+        for c in self.conns:
+            if c.closed:
+                continue                                    # (closing: kicked, banned or deleted a moment ago)
+            if c.web:
+                if not cfg.web_login:
+                    c.close(4004, "web logins were turned off")
+                elif self.web_banned(c.web):
+                    c.close(4003, "this key is banned from this server")
+                else:
+                    self.web_seen(c.web)
+                    with self.slock:                        # connected: they get everything as it comes
+                        if c.web in self.wusers and not getattr(c, "replaying", False):
+                            self.wusers[c.web]["seq"] = self.bk_seq
+                    send = self.web_can_send(c.web)
+                    if send != c.can_send:                  # heard on the air at last, or allowed / unallowed by the admin
+                        c.can_send = send
+                        c.send_json({"type": "access", "send": send, "state": "allowed" if send else "pending"})
+                continue
+            k = self.key_by_id(c.key_id)
+            if k is None:
+                c.close(4001, "key revoked")
+            elif not self.valid(k, t):
+                c.close(4002, "key expired")
+
+
+# ============================================================================
 # Dashboard (own thread; reads only the snapshot the main loop publishes)
 # ============================================================================
+
+WEB_UNLOCK_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>MeshCore Web</title>
+<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111418;color:#d8dee6;
+font:14px/1.45 system-ui,sans-serif;padding:16px}form{background:#1a1f26;border:1px solid #2a313b;border-radius:8px;padding:22px;
+width:100%;max-width:360px}h1{font-size:20px;margin:0 0 6px}p{color:#8a94a3;margin:0 0 14px}input{width:100%;box-sizing:border-box;
+padding:9px 11px;border:1px solid #2a313b;border-radius:4px;background:#111418;color:inherit;font:inherit}button{width:100%;
+margin-top:14px;padding:10px;border:1px solid #5cb3ff;border-radius:4px;background:#5cb3ff;color:#0b1420;font:inherit;font-weight:600;
+cursor:pointer}.err{color:#e05a5a;margin:12px 0 0}</style></head><body>
+<form method="post" action="unlock"><h1>MeshCore Web</h1><p>This server's MeshCore Web needs a password.</p>
+<input type="password" name="password" autocomplete="current-password" placeholder="Password" autofocus required aria-label="Password">
+{error}<button type="submit">Open</button></form></body></html>"""
+
 
 DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>meshroom</title>
@@ -4578,7 +8874,7 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name
 <link rel="stylesheet" href="static/leaflet.css">
 <script src="static/leaflet.js"></script>
 <style>
-:root{--bg:#111418;--card:#1a1f26;--line:#2a313b;--fg:#d8dee6;--dim:#8a94a3;--acc:#5cb3ff;--ok:#4caf7a;--warn:#e0a83e;--bad:#e05a5a}
+:root{--link:#2f7fc4;--bg:#111418;--card:#1a1f26;--line:#2a313b;--fg:#d8dee6;--dim:#8a94a3;--acc:#5cb3ff;--ok:#4caf7a;--warn:#e0a83e;--bad:#e05a5a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
 header{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:18px;align-items:baseline}
 header h1{font-size:18px;margin:0}.dim{color:var(--dim)}main{padding:14px 18px;display:grid;gap:14px}
@@ -4586,7 +8882,7 @@ header h1{font-size:18px;margin:0}.dim{color:var(--dim)}main{padding:14px 18px;d
 .card h2{font-size:14px;margin:0 0 8px;color:var(--acc);text-transform:uppercase;letter-spacing:.04em}
 table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:top}
 th{color:var(--dim);font-weight:500}.tag{padding:1px 6px;border-radius:4px;font-size:12px}
-.idle{background:#24382c;color:var(--ok)}.waiting,.retrying{background:#3a3220;color:var(--warn)}.backoff,.gave_up,.suspended{background:#3d2424;color:var(--bad)}
+.synced{background:#24382c;color:var(--ok)}.queued,.sent{background:#1f3042;color:var(--acc)}.retry{background:#3a3220;color:var(--warn)}.backoff,.gave_up,.suspended{background:#3d2424;color:var(--bad)}
 button{background:#2a313b;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:2px 10px;cursor:pointer}
 .mapwrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
 @media (max-width:900px){.mapwrap{grid-template-columns:1fr}}
@@ -4620,7 +8916,14 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .rprow input,.rprow select{width:auto;flex:none;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.sw{cursor:pointer}
 .mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password],.mqrow input[type=number],.mqrow select{width:auto;min-width:110px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
-.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}
+.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}.wbkey{font-family:ui-monospace,monospace}.wbacts{display:flex;flex-wrap:wrap;gap:4px;min-width:150px}.wbacts button{white-space:nowrap}.wbacts .wbwarn{color:var(--bad)}
+#wb_motd{font:inherit;max-width:100%;padding:6px 8px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg);resize:vertical}
+#wb_motd:focus{outline:none;border-color:var(--acc)}
+.airtab td{padding:3px 8px}.airtab input{width:4.5em;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.airbar{display:inline-block;width:160px;height:8px;background:var(--line);border-radius:4px;position:relative;vertical-align:middle;overflow:hidden}
+.airbar i{position:absolute;left:0;top:0;bottom:0;background:var(--acc)}.airbar b{position:absolute;top:0;bottom:0;width:2px;background:var(--fg);opacity:.6}
+.dlg{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:14px 18px;min-width:min(420px,90vw)}
+.dlg::backdrop{background:rgb(0 0 0/.5)}.dlg h3{margin:0 0 10px;font-size:15px}.dlgrow{display:flex;gap:8px;align-items:center;margin:6px 0}
+.dlgbtns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}.dlg .wbwarn{color:var(--bad)}
 #members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
 .hexr{font-family:ui-monospace,monospace;white-space:nowrap}.caret{color:var(--dim);font-size:11px;margin-right:4px}
 .mbox.wide{width:520px}.ac{position:relative}.aclist{background:#0d1014;border:1px solid var(--line);border-top:none;
@@ -4628,11 +8931,12 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .aclist div.on,.aclist div:hover{background:#243447}.hint{color:var(--dim);font-size:12px;margin:6px 0}#sgprev{font-size:12px;margin-top:6px;min-height:16px}#members td{vertical-align:middle}
 #tip{position:fixed;z-index:2000;display:none;max-width:460px;background:#0d1014;border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;pointer-events:none;box-shadow:0 4px 18px #0008}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
-#rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
+#rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.reldot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle;background:currentColor}.bestwrap{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start}#bestmapbox{flex:0 1 420px;min-width:260px}#bestmap{height:320px;border-radius:6px;background:#0d1014}.besttab{flex:1 1 360px;min-width:0;overflow-x:auto}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
-#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
+.host #memberscard,.host #suspendedcard,.host #banscard,.host #chatcard{display:none!important}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#kpicard{order:0}#bestcard{order:1}#aircard{order:2}#roomcard{order:3}#chatcard{order:4}#memberscard{order:5}#suspendedcard{order:6}#banscard{order:7}#tncard{order:8}#rpcard{order:9}#vccard{order:10}#kaascard{order:11}#webcard{order:12}#welcomecard{order:13}#mqcard{order:14}#observercard{order:15}#trafficcard{order:16}#mapcard{order:17}#repeaterscard{order:18}
+.card input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]),.card select,.card textarea{padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg);font:inherit}.card input:focus,.card select:focus,.card textarea:focus{outline:none;border-color:var(--acc)}.advbtns{display:inline-flex;gap:6px;align-items:center;margin-left:10px}.advbtns .act:disabled{opacity:.35;cursor:not-allowed}
 </style></head><body>
-<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
+<header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rvc" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
 <div id="hstats" class="hstats"></div></header>
 <div id="suggestbox" class="modal"><div class="mbox wide"><h3 id="sgtitle">Suggest a route</h3>
@@ -4641,26 +8945,39 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="ac"><input id="sgpath" placeholder="e.g. Seaside (E3C5), Williams Hill (4322)" autocomplete="off"><div id="aclist" class="aclist"></div></div>
 <div id="sgprev" class="dim"></div><div id="sgerr" class="poor small"></div>
 <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end"><button onclick="closeSuggest()">Cancel</button><button onclick="doSuggest()">Add route</button></div></div></div>
+<div id="kkbox" class="modal"><div class="mbox wide"><h3>API key</h3>
+<div class="hint">Copy it now: it is shown only this once. The server keeps only a hash of it.</div>
+<input id="kk_token" readonly class="mono" onclick="this.select()"><div id="kkcopied" class="good small"></div>
+<div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end"><button onclick="kkCopy()">Copy</button><button onclick="kkDone()">Done</button></div></div></div>
 <div id="loginbox" class="modal"><div class="mbox"><h3>Admin log in</h3><input id="pw" type="password" placeholder="Password" onkeydown="if(event.key==='Enter')doLogin()">
 <div id="loginerr" class="poor small"></div><div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end"><button onclick="closeLogin()">Cancel</button><button onclick="doLogin()">Log in</button></div></div></div>
 <main>
-<div class="card"><div class="kpis" id="kpis"></div></div>
+<div class="card" id="kpicard"><div class="kpis" id="kpis"></div></div>
+<div class="card" id="aircard" style="display:none"><h2>Airtime <span class="hdesc">Max transmit duty cycle</span></h2>
+<div class="rprow"><label>Max duty cycle <input id="air_duty" type="number" min="1" max="100" step="1" style="width:4.5em" oninput="airSum()">% of the time</label>
+<span class="dim small">everything this radio sends together, over about a minute (ACKs and replies may go briefly over)</span></div>
+<table id="airtab" class="airtab"></table>
+<div class="rprow"><button onclick="airSave()">Save</button><span id="airmsg" class="small"></span></div>
+<div class="hint" style="margin-left:26px">Weights are any numbers: each class is guaranteed its weight's part of the max duty cycle
+(weight &divide; total), and may borrow what others leave unused, up to the max. The virtual repeater and companion don't count while they're off.
+Packets over their share wait their turn; relays waiting over 20 s, and web, companion or API packets over 2 minutes, are dropped.</div></div>
 <div class="card" id="mqcard" style="display:none"><h2>MQTT augmentation <span class="hdesc">listen to the observer network as well as the radio</span></h2>
 <div class="mqrow"><label class="sw"><input type="checkbox" id="mq_en" onchange="mqSet({enabled:this.checked})"> <b>MQTT augmentation</b></label>
 <span id="mqstat" class="dim small"></span></div>
-<div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_ack" onchange="mqSet({ack_ingest:this.checked})"> ACK ingestion <span class="dim">&mdash; determine delivery via observers</span></label></div>
+<div class="mqrow sub"><label class="sw" title="Trusts the feed: anyone who can publish to it could mark a post delivered that never arrived, so the member misses it. Off by default"><input type="checkbox" id="mq_ack" onchange="mqSet({ack_ingest:this.checked})"> ACK ingestion <span class="dim">&mdash; determine delivery via observers (trusts the feed)</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_msg" onchange="mqSet({msg_ingest:this.checked})"> Message ingestion <span class="dim">&mdash; capture room posts via observers</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_topo" onchange="mqSet({topo_ingest:this.checked})"> Topology ingestion <span class="dim">&mdash; collect route, SNR, and path reliability data for known infrastructure</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_adv" onchange="mqSet({advert_ingest:this.checked})"> Advert ingestion <span class="dim">&mdash; discover users and their locations</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_act" onchange="mqSet({activity:this.checked})"> Activity monitor <span class="dim">&mdash; packets from an inactive member resume sync (at most every 15 min)</span><span id="mqch" class="dim small"></span></label></div>
 <div class="mqrow sub"><label>Subscriber username <input id="mq_user" type="text" autocomplete="username" placeholder="GoMesh username"></label><label>Subscriber password <input id="mq_pass" type="password" autocomplete="current-password" placeholder="GoMesh password"></label><button onclick="mqCredentials()">Save subscriber credentials</button><span id="mqcred" class="dim small"></span></div>
 <div class="mqrow sub"><label>Broker host <input id="mq_host" type="text" autocomplete="off" placeholder="mqtt.example.org"></label><label>Port <input id="mq_port" type="number" min="1" max="65535"></label><label>Transport <select id="mq_transport"><option value="websockets">WebSockets</option><option value="tcp">TCP</option></select></label><label>WebSocket path <input id="mq_path" type="text" autocomplete="off" placeholder="/mqtt"></label></div>
+<div class="mqrow sub"><label title="Observers publish under their region's code (an airport code, as your own observer's IATA). Only these regions' reports are taken in; empty takes the whole world">Regions <input id="mq_regions" type="text" size="26" autocomplete="off" placeholder="all, or e.g. SJC, SFO, MRY"></label><button onclick="mqRegions(this)">Save regions</button><span id="mqreg" class="dim small"></span></div>
 <div class="mqrow sub"><label class="sw"><input id="mq_tls" type="checkbox"> TLS</label><label class="sw"><input id="mq_verify" type="checkbox"> Verify TLS certificate</label><label>Topic filter(s) <input id="mq_topics" type="text" autocomplete="off" placeholder="meshcore/REGION/+/packets"></label><button onclick="mqConnection()">Save broker and topics</button><span id="mqconn" class="dim small"></span></div>
 <div class="mqnote">RF will always be used for fallback and route calculations: what the observers report never changes routes,
 delivery scores or the push pace, and if the broker is unreachable the room carries on exactly as before.</div></div>
 <div class="card" id="rpcard" style="display:none"><h2>Virtual repeater <span class="hdesc">a second identity on the room's radio that relays for the mesh</span></h2>
 <div class="mqrow sub"><label>Import private key <input id="rp_key" type="password" autocomplete="new-password" placeholder="64 or 128 hex characters"></label><button onclick="rpImportKey()">Import key</button><span id="rpkeymsg" class="dim small"></span></div>
-<div class="mqrow"><label class="sw"><input type="checkbox" id="rp_en" onchange="rpSet({enabled:this.checked})"> <b>Virtual repeater</b></label>
+<div class="mqrow"><label class="sw"><input type="checkbox" id="rp_en" onchange="rpSet({enabled:this.checked})"> <b>Virtual repeater</b></label><span class="advbtns"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this,'repeater')"><img src="icons/advert.png" alt="advert"></button><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this,'repeater')"><img src="icons/flood_advert.png" alt="flood advert"></button><span class="dim small advmsg"></span></span>
 <span id="rpstat" class="dim small"></span></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="rp_relay" onchange="rpSet({relay:this.checked})"> Relay packets <span class="dim">&mdash; turning this off stops relaying at once (queued relays are dropped); it keeps advertising</span></label></div>
 <div class="rprow"><label>Name <input id="rp_name" maxlength="31" size="16"></label>
@@ -4669,23 +8986,100 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <span class="dim small">unscoped floods are always relayed</span></div>
 <div class="rprow"><label>Position <input id="rp_lat" size="10" placeholder="room's"> , <input id="rp_lon" size="11" placeholder="room's"></label>
 <span class="dim small">lat, lon in degrees; blank = the room's (set it a little apart so map icons don't overlap)</span></div>
-<div class="rprow"><label>Airtime cap <input id="rp_air" type="number" min="1" max="100" step="1" style="width:4.5em">%</label>
+<div class="rprow"><label title="its weight on the Airtime card: its guaranteed part of the max duty cycle; it may borrow more when the channel is quiet">Airtime weight <input id="rp_air" type="number" min="0" max="10000" step="1" style="width:4.5em"></label>
 <label>Loop detection <select id="rp_loop"><option>off</option><option>minimal</option><option>moderate</option><option>strict</option></select></label>
 <label>Adverts every <input id="rp_adv" type="number" min="0" max="1440" style="width:5em"> min</label>
 <label>flood every <input id="rp_fadv" type="number" min="0" max="168" style="width:4.5em"> h</label>
 <button onclick="rpSave()">Save</button><span id="rpmsg" class="small"></span></div>
 <div id="rpcounts" class="dim small" style="margin-left:26px"></div>
 </div>
-<div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the room's, and the virtual repeater's when it's on</span></h2><div class="advrow">
-<div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
-<div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
-<span id="advmsg" class="dim small"></span></div></div>
+<div class="card" id="vccard" style="display:none"><h2>Virtual companion <span class="hdesc">a chat node on the room's radio that MeshCore apps connect to over the network</span></h2>
+<div class="mqrow"><label class="sw"><input type="checkbox" id="vc_en" onchange="vcToggle(this)"> <b>Virtual companion</b></label><span class="advbtns"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this,'companion')"><img src="icons/advert.png" alt="advert"></button><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this,'companion')"><img src="icons/flood_advert.png" alt="flood advert"></button><span class="dim small advmsg"></span></span>
+<span id="vcstat" class="dim small"></span><span id="vcmsg" class="small"></span></div>
+<div id="vcopts"><div class="hint" id="vclockhint" style="margin-left:26px"></div>
+<div class="mqrow sub"><label>Import private key <input id="vc_key" type="password" autocomplete="new-password" placeholder="64 or 128 hex characters"></label><button onclick="vcImportKey()">Import key</button><span id="vckeymsg" class="dim small"></span></div>
+<div class="hint" style="margin:-2px 0 6px 26px">Optional. If no private key is imported, one is generated randomly the first time the companion is turned on and kept in the config, so its identity stays the same across restarts.</div>
+<div class="rprow"><label>Name <input id="vc_name" maxlength="31" size="16"></label>
+<label>TCP port <input id="vc_port" type="number" min="1" max="65535" style="width:6em"></label>
+<label>Allowed addresses <input id="vc_allow" size="26" placeholder="anyone who can reach the port"></label></div>
+<div class="rprow"><label class="sw"><input type="checkbox" id="vc_auto"> Auto advert</label>
+<label>every <input id="vc_int" type="number" min="1" max="10080" style="width:5em"> min</label>
+<label>as <select id="vc_flood"><option value="0">zero-hop</option><option value="1">flood</option></select></label></div></div>
+<div id="vccounts" class="dim small" style="margin-left:26px"></div>
+<div class="mqnote">Connect a MeshCore app to this server's address and port as a WiFi/TCP companion. The port is open only while
+the companion is enabled. The companion protocol has no password: anyone who can reach the port can read its messages and send
+as it, so keep it on your own network (never forward it from the internet) and list allowed addresses (e.g. 192.168.1.0/24) to
+narrow it further. Radio settings, the Bluetooth PIN, reboot and factory reset from the app are acknowledged and ignored.
+Messages between the companion and this room or its repeater never go on the air.</div></div>
+<div class="card" id="tncard" style="display:none"><h2>Rooms <span class="hdesc">the rooms on this radio, each with its own page, members and passwords</span></h2>
+<div class="rprow"><label>Room name <input id="tn_name" maxlength="31" size="16"></label>
+<label>Path <span class="dim" id="tn_base"></span><input id="tn_path" maxlength="32" size="12" placeholder="e.g. hiking" autocomplete="off"></label>
+<label>Private key <input id="tn_key" type="password" autocomplete="new-password" size="22" placeholder="blank = random"></label></div>
+<div class="rprow"><label>Join password <input id="tn_join" type="password" autocomplete="new-password" maxlength="15" size="12" placeholder="blank = open room"></label>
+<label>Admin password <input id="tn_admin" type="password" autocomplete="new-password" maxlength="15" size="12" placeholder="blank = no RF admin"></label>
+<label>Web UI password <input id="tn_web" type="password" autocomplete="new-password" size="12" placeholder="6+ characters"></label></div>
+<div class="rprow"><label>Latitude <input id="tn_lat" size="10" placeholder="blank = none" autocomplete="off"></label>
+<label>Longitude <input id="tn_lon" size="10" placeholder="blank = none" autocomplete="off"></label>
+<button onclick="tnCreate(this)">Create</button><span id="tnmsg" class="small"></span></div>
+<div class="hint" style="margin-left:26px">If no private key is entered, one is generated randomly. Each room gets its own page at its path, where its
+admins (web UI password) see its members and the map, chat, advert, resync, suggest routes, kick and ban. The join and admin passwords are what
+people use from their MeshCore apps. The location is what the room's adverts put on maps; the room's admins can change it on its page, as can you from its Actions.
+Rooms share this radio, its map and its airtime; nothing a room's admin does reaches outside their room.</div>
+<table id="tnlist" style="margin-top:8px"></table></div>
+<div class="card" id="kaascard" style="display:none"><h2>KaaS <span class="hdesc">KISS radio as an API service - useful for bots or other integrations</span></h2>
+<div class="rprow"><label><input id="kk_receive" type="checkbox" checked> Receive</label><label><input id="kk_send" type="checkbox"> Send</label>
+<label>Description <input id="kk_desc" maxlength="80" size="22" placeholder="e.g. weather bot"></label>
+<label>Expires <input id="kk_exp" type="date"></label><span class="dim small">(optional)</span>
+<button onclick="kkCreate(this)">Save</button><span id="kkmsg" class="small"></span></div>
+<div class="hint" style="margin-left:26px">Clients connect a websocket to <code id="kk_url"></code> with the header <code>Authorization: Bearer &lt;key&gt;</code>.
+Receive streams every packet this radio hears and sends. Send may send raw packets: <span id="kk_burst">3</span> per <span id="kk_win">20</span> s per key (ACKs and path returns excepted), within the API clients' share
+of airtime (<span id="kk_air">10</span>% guaranteed, more when the channel is quiet: see Airtime), after everything of the room's. Clients do their own MeshCore crypto: see docs/api.md and the Python client in client/.
+A key is shown once, when it is made: only a hash of it is kept, so a lost key can't be recovered, only revoked and replaced.</div>
+<table id="kklist" style="margin-top:8px"></table></div>
+<div class="card" id="webcard" style="display:none"><h2>Web users <span class="hdesc">MeshCore Web: people log in by signing with their node's private key, which never leaves their browser &middot; <a href="meshcore-web/" target="_blank" rel="noopener">open MeshCore Web</a></span></h2>
+<div class="rprow"><label><input id="wb_on" type="checkbox" onchange="wbSettings({web_login:this.checked})"> Allow web logins</label>
+<span class="dim small"><span id="wb_conn">0</span> of <span id="wb_max">32</span> sessions in use</span><span id="wbmsg" class="small"></span></div>
+<div class="rprow"><label>Page password <input id="wb_pw" type="password" size="18" maxlength="64" autocomplete="new-password" placeholder="none"></label>
+<button onclick="wbPagePw(this,false)">Set</button><button id="wb_pw_rm" onclick="wbPagePw(this,true)">Remove</button>
+<span class="dim small" id="wb_pw_state"></span></div>
+<div class="rprow"><label title="The names people reach MeshCore Web by, through a proxy or a domain (this server's own ip:port always works). A login signed for any other name is refused: another server can't relay its visitors' logins here">Host names
+<input id="wb_hosts" type="text" size="40" maxlength="600" autocomplete="off" placeholder="mesh.example.com, ..."></label><button onclick="wbHosts(this)">Save</button>
+<span class="small" id="wb_refused"></span></div>
+<div class="rprow"><label title="Shown to a web user whose key may not send yet: not heard advertising on this radio (an MQTT report doesn't count), and not allowed by you">Unknown key message
+<input id="wb_unk" type="text" size="60" maxlength="200" autocomplete="off"></label><button onclick="wbUnknown(this)">Save</button></div>
+<div class="rprow" style="align-items:flex-start"><label class="sw" title="Shown to web users as a popup when they log in or open the page (each can tick &quot;don't show this again&quot;, until you change the text)"><input id="wb_motd_on" type="checkbox" onchange="wbSettings({motd_enabled:this.checked})"> Message of the day</label>
+<textarea id="wb_motd" rows="3" cols="60" maxlength="1000" placeholder="Shown when web users log in"></textarea><button onclick="wbMotd(this)">Save</button></div>
+<div class="rprow"><label title="For MeshCore Web's GIF picker: a free key from developers.giphy.com (an API key, not an SDK key). Web users' browsers use it to search Giphy">Giphy API key
+<input id="wb_giphy" type="password" size="18" maxlength="64" autocomplete="off" placeholder="none"></label>
+<button onclick="wbGiphy(this,false)">Set</button><button id="wb_giphy_rm" onclick="wbGiphy(this,true)">Remove</button>
+<span class="dim small" id="wb_giphy_state"></span></div>
+<div class="rprow"><label title="Channel messages and DMs, so web users catch up on what they missed while away (0 = keep none)">Backlog: keep
+<input id="wb_days" type="number" min="0" step="1" style="width:5em"> days</label><button onclick="wbBacklog(this)">Save</button>
+<label title="Also keep what MQTT observers report (each packet is kept once, whether heard here or reported), and show it to web users as it comes"><input id="wb_bk_mqtt" type="checkbox" onchange="wbSettings({web_backlog_mqtt:this.checked})"> Include MQTT packets</label>
+<span class="dim small" id="wb_bk_state"></span></div>
+<div class="hint" style="margin-left:26px">Anyone can log in and read. A key may send once this radio has heard it advertise (or after you press Allow send):
+<span id="wb_burst">3</span> packets per <span id="wb_win">20</span> s each, within the web users' share of airtime, and only as itself. A ban is by public key: a new key starts out unable to send.</div>
+<table id="wblist" style="margin-top:8px"></table>
+<div class="rprow" style="margin-top:10px"><label>Ban a public key <input id="wb_banpub" class="mono" size="40" maxlength="64" placeholder="64 hex characters"></label>
+<button onclick="wbBanKey(this)">Ban</button><span id="wbbanmsg" class="small"></span></div>
+<table id="wbbanned" style="margin-top:8px"></table></div>
+<dialog id="wbbandlg" class="dlg"><form method="dialog"><h3 id="wbban_title">Ban</h3>
+<label class="dlgrow"><input type="checkbox" id="wbban_key"> Public key <span class="wbkey" id="wbban_pub"></span></label>
+<label class="dlgrow"><input type="checkbox" id="wbban_ip"> IP address <span class="wbkey" id="wbban_addr"></span></label>
+<div class="small" id="wbban_note"></div>
+<div class="dlgbtns"><button value="cancel">Cancel</button><button id="wbban_go" value="ban" class="wbwarn">Ban</button></div></form></dialog>
+<div class="card" id="roomcard" style="display:none"><h2>Room <span class="hdesc">this room's adverts and location</span></h2>
+<div class="advrow"><b>Advert</b><span class="advbtns"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><span class="dim small advmsg"></span></span></div>
+<div class="rprow"><label>Latitude <input id="rm_lat" size="10" placeholder="none" autocomplete="off"></label>
+<label>Longitude <input id="rm_lon" size="11" placeholder="none" autocomplete="off"></label><button onclick="roomLoc(this)">Save location</button><span id="rmlocmsg" class="small"></span></div>
+<div class="hint">What the room's adverts put on maps. Blank both for no position. An advert with the new position goes out within seconds.</div></div>
 <div class="card" id="chatcard" style="display:none"><h2>Room chat</h2>
 <div id="chatlog" class="chatlog"><div class="dim">loading...</div></div>
 <div class="chatin"><input id="chatmsg" maxlength="400" placeholder="Message everyone in the room (sent as the room)" autocomplete="off">
 <span id="chatleft" class="dim small"></span><button id="chatsend" onclick="sendChat()">Send</button></div>
 <div id="chaterr" class="poor small"></div></div>
-<div class="card" id="bestcard"><h2>Best neighbour repeaters <span class="dim small">(by trace packet loss)</span></h2><table id="toplinks"></table></div>
+<div class="card" id="bestcard"><h2>Best neighbour repeaters <span class="dim small">(by trace reliability)</span></h2>
+<div class="bestwrap"><div id="bestmapbox"><div id="bestmap"></div><div id="bestmapnote" class="dim small"></div></div><div class="besttab"><table id="toplinks"></table></div></div></div>
 <div class="card" id="memberscard"><h2>Members <span class="hdesc">Room members &middot; tap a row for details</span></h2><table id="members"></table></div>
 <div class="card" id="suspendedcard"><h2>Suspended <span class="hdesc">Inactive members, will be returned to member list when they are heard on the mesh</span></h2><table id="suspended"></table></div>
 <div class="card" id="banscard"><h2>Banned <span class="hdesc">Room members who FAFO'd</span></h2><table id="bans"></table></div>
@@ -4693,7 +9087,8 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <div class="mapwrap"><div><div id="map"></div><div id="mapnote" class="dim small"></div></div>
 <div id="rdetail" class="rdetail"><div class="dim pick">Select a repeater from the map</div></div></div></div>
 <div class="card" id="observercard" style="display:none"><h2>MQTT observer <span class="hdesc">admin only</span></h2>
-<div class="advrow"><label><input id="obs_enabled" type="checkbox" onchange="saveObserverToggle()"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="4"></label>
+<div class="advrow"><label title="The node the observer reports as: its public key and name are what MQTT maps show">Report as <select id="obs_who" onchange="saveObserverWho()"></select></label>
+<label><input id="obs_enabled" type="checkbox" onchange="saveObserverToggle()"> Enabled</label><span id="obswho_note" class="small dim"></span><label>IATA <input id="obs_iata" maxlength="3" size="6" placeholder="e.g. SJC" title="Your region: the nearest airport code. Required: everything the observer publishes is filed under it"></label>
 <label><input id="obs_status" type="checkbox"> Status</label><label><input id="obs_packets" type="checkbox"> Packets</label><label><input id="obs_rx" type="checkbox"> RX</label>
 <label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
 <div class="rprow"><label>Name <input id="os_name" placeholder="Regional MQTT"></label><label>Host <input id="os_host" placeholder="mqtt.example.org"></label><label>Port <input id="os_port" type="number" value="443"></label><label>Audience <input id="os_aud" placeholder="mqtt.example.org"></label><label>Path <input id="os_path" value="/"></label><label>Prefix <input id="os_prefix" value="meshcore"></label><label><input id="os_enabled" type="checkbox" checked> Enabled</label><label><input id="os_tls" type="checkbox" checked> TLS</label><label><input id="os_verify" type="checkbox" checked> Verify TLS</label><button onclick="addObserverServer()">Add server</button></div>
@@ -4702,13 +9097,14 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <div class="card" id="trafficcard" style="display:none"><div id="observertraffic"></div></div>
 <div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members</span></h2>
 <div class="advrow"><label><input id="welcome_enabled" type="checkbox"> Send welcome DM</label><button onclick="saveWelcome()">Save welcome settings</button><span id="welcomemsg" class="small dim"></span></div>
-<div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
-<div style="margin-top:8px"><label>Name-unknown hint <span class="dim small">(optional; appended when the member has not sent an advert)</span><br><textarea id="welcome_hint" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
+<div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%);box-sizing:border-box"></textarea></label></div>
+<div style="margin-top:8px"><label>Name-unknown hint <span class="dim small">(optional; appended when the member has not sent an advert)</span><br><textarea id="welcome_hint" rows="2" maxlength="151" style="width:min(680px,100%);box-sizing:border-box"></textarea></label></div>
 <div class="hint">Use <code>{room}</code> for the room name. The rendered welcome message and optional hint together may be at most 151 UTF-8 bytes.</div></div>
 <div class="card" id="repeaterscard"><h2>Repeaters heard</h2><table id="rpts"></table></div>
 </main>
 <script>
-const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const TENANT=!!window.TENANT;document.body.classList.add(TENANT?"tenant":"host");
+const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));
 function ago(t){if(!t)return"never";let d=Math.max(0,Date.now()/1000-t);return d<60?Math.round(d)+"s":d<3600?Math.round(d/60)+"m":d<86400?(d/3600).toFixed(1)+"h":(d/86400).toFixed(1)+"d"}
 async function act(url,label){if(!confirm(label))return;const r=await fetch(url,{method:"POST"});if(r.status===401){await session();alert("Your admin session has expired: log in again.")}setTimeout(load,300)}
 async function resync(m,btn){btn.disabled=true;await fetch("api/members/"+m.pub+"/resync",{method:"POST"});
@@ -4717,7 +9113,7 @@ function score(m){if(m.delivery==null)return'<span class="dim">new</span>';const
  return `<span class="${c}">${m.delivery}%</span> <span class="dim small">${m.avg_attempts} tries &middot; ${m.deliveries}</span>`}
 function route(r){return r==null?'<span class="dim">unknown (flood)</span>':r.length?r.map(esc).join(" &rsaquo; "):'direct'}
 let EXP=new Set(),map=null,layer=null,RPTS=[],MEMBERS=[],LAST=null,ADMIN=false,LOGIN_ON=false;
-let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false,WELCOME_LOADED=false;
+let CHAT_TS=0,CHAT_MAX=151,CHAT_BUSY=false,WELCOME_LOADED=false;let VCA={},MAINADM=false,TN_ROWS=[];
 function bytesOf(t){return new TextEncoder().encode(t).length}
 function chatLeft(){const n=CHAT_MAX-bytesOf($("chatmsg").value);$("chatleft").textContent=n+" left";$("chatleft").className=n<0?"poor small":"dim small";$("chatsend").disabled=n<0}
 async function loadChat(reset){if(!ADMIN||CHAT_BUSY)return;CHAT_BUSY=true;
@@ -4735,45 +9131,227 @@ async function rpSet(o){const r=await fetch("api/repeater",{method:"POST",header
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
  $("rpmsg").className=r.ok?"good small":"poor small";$("rpmsg").textContent=r.ok?"saved":m;delete SIG.rpform;setTimeout(load,400);return r.ok}
 async function rpImportKey(){const k=$("rp_key").value.trim();if(!k)return;const ok=await rpSet({private_key:k});$("rp_key").value="";$("rpkeymsg").textContent=ok?"key imported; repeater remains disabled":"key was not imported"}
+const AIR_CLASSES=[["control","Control","ACKs, replies, and path returns"],["relay","Relays","virtual repeater transmit (when enabled)"],
+ ["room","Room","message delivery to members (all rooms)"],["web","Web users","users connected to web client"],
+ ["companion","Virtual companion","packets sent by virtual companion (when enabled)"],["kaas","KaaS","API clients"],["background","Background","adverts and traces"]];
+function renderAir(A){if(!A||!A.weight)return;const off=AIR_OFF=new Set(A.off||[]);const f=document.activeElement,typing=f&&f.closest&&f.closest("#aircard")&&f.type==="number";
+ const scale=Math.max(A.ceiling_pct,A.total_pct,1),bar=(u,g)=>`<span class="airbar"><i style="width:${Math.min(100,100*u/scale)}%"></i><b style="left:${Math.min(100,100*g/scale)}%"></b></span>`;
+ if(!typing&&changed("airform",[A.ceiling_pct,JSON.stringify(A.weight),A.off])){$("air_duty").value=A.ceiling_pct;
+  $("airtab").innerHTML="<tr><th>Class</th><th>Weight</th><th>Guaranteed</th><th>Used (last "+Math.round(A.window_s/60)+" min)</th><th></th></tr>"+AIR_CLASSES.map(([k,n,t])=>
+   `<tr${off.has(k)?' class="dim"':""}><td title="${t}">${n} <span class="dim small">${t}</span></td><td><input type="number" min="0" max="10000" step="1" id="air_${k}" oninput="airSum()"></td>`+
+   `<td id="airg_${k}" class="small"></td><td id="airu_${k}"></td><td id="aird_${k}" class="small"></td></tr>`).join("")+
+   `<tr><td><b>Total</b></td><td id="air_sum"></td><td class="small">${A.ceiling_pct}%</td><td id="airu_total"></td><td></td></tr>`;
+  for(const [k] of AIR_CLASSES)$("air_"+k).value=A.weight[k];airSum()}
+ for(const [k] of AIR_CLASSES){$("airu_"+k).innerHTML=off.has(k)?"":bar(A.used_pct[k],A.share_pct[k])+` ${A.used_pct[k]}%`;const d=A.dropped[k];$("aird_"+k).innerHTML=d?`<span class="poor">${d} dropped</span>`:""}
+ $("airu_total").innerHTML=bar(A.total_pct,A.ceiling_pct)+` ${A.total_pct}% <span class="dim small">of ${A.ceiling_pct}%</span>`}
+let AIR_OFF=new Set();
+function airSum(){const w=k=>Math.max(0,+$("air_"+k).value||0),tot=AIR_CLASSES.reduce((a,[k])=>a+(AIR_OFF.has(k)?0:w(k)),0),max=+$("air_duty").value||0;
+ $("air_sum").textContent=Math.round(tot*100)/100;
+ for(const [k] of AIR_CLASSES)$("airg_"+k).innerHTML=AIR_OFF.has(k)?'<span class="dim">off: not counted</span>':tot?Math.round(max*w(k)/tot*10)/10+"%":"0%"}
+async function airSave(){const wt={};for(const [k] of AIR_CLASSES)wt[k]=+$("air_"+k).value;
+ const r=await fetch("api/airtime",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({duty_pct:+$("air_duty").value,weight:wt})});
+ let m="Saved";if(!r.ok){m="Could not save";try{m=(await r.json()).error||m}catch(e){}}$("airmsg").className=r.ok?"dim small":"poor small";$("airmsg").textContent=" "+m;setTimeout(load,500)}
 function rpSave(){rpSet({name:$("rp_name").value,lat:$("rp_lat").value.trim(),lon:$("rp_lon").value.trim(),scope_mode:$("rp_mode").value,regions:$("rp_regions").value,
  airtime_cap:+$("rp_air").value,loop_detect:$("rp_loop").value,advert_min:+$("rp_adv").value,flood_advert_h:+$("rp_fadv").value})}
+async function vcSet(o){const r=await fetch("api/companion",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
+ let m="";if(!r.ok){m="Could not save";try{m=(await r.json()).error||m}catch(e){}}
+ if(r.status===401){m="Your admin session has expired: log in again.";session()}
+ $("vcmsg").className=r.ok?"good small":"poor small";$("vcmsg").textContent=r.ok?"":" "+m;delete SIG.vcform;setTimeout(load,400);return r.ok}
+async function vcImportKey(){const k=$("vc_key").value.trim();if(!k)return;const ok=await vcSet({private_key:k});$("vc_key").value="";$("vckeymsg").textContent=ok?"key imported; companion remains disabled":"key was not imported"}
+const VC_WARNING="The virtual companion is meant for use on a trusted local network only. Its port has no login: anyone "+
+ "who can reach it can read and delete its messages, read its channel secrets, see its contacts, send as it and "+
+ "have it sign data with its key.\n\nNever expose the port to the internet. Limit it to the devices you use with "+
+ "\"Allowed addresses\" (or bind it to 127.0.0.1).\n\nTurn the virtual companion on?";
+async function vcToggle(cb){   // turning it on saves the options with it; they stay locked until it's turned off again
+ if(cb.checked&&!confirm(VC_WARNING)){cb.checked=false;return}
+ const o=cb.checked?{enabled:true,name:$("vc_name").value,port:+$("vc_port").value,allow:$("vc_allow").value,auto_advert:$("vc_auto").checked,
+  advert_min:+$("vc_int").value,advert_flood:$("vc_flood").value==="1"}:{enabled:false};
+ cb.disabled=true;const ok=await vcSet(o);cb.disabled=false;if(!ok)cb.checked=!cb.checked}
+async function loadTenants(){if(!MAINADM)return;try{const r=await fetch("api/tenants");if(!r.ok)return;const d=await r.json();TN_ROWS=d.rooms||[]}catch(e){return}
+ $("tn_base").textContent=location.host+"/";
+ const t=$("tnlist");if(!TN_ROWS.length){t.innerHTML='<tr><td class="dim">No rooms yet: create one above.</td></tr>';return}
+ if(t.querySelector("select:focus"))return;
+ t.innerHTML="<tr><th>Room</th><th>Page</th><th>ID</th><th>Location</th><th>Members</th><th>Suspended</th><th>Posts</th><th></th></tr>"+TN_ROWS.map(x=>
+  `<tr><td>${esc(x.name)}</td><td><a href="${encodeURI(x.path)}/" target="_blank">/${esc(x.path)}/</a></td><td class="mono4" title="${esc(x.key)}">${esc(x.id)}</td>`+
+  `<td>${x.lat||x.lon?x.lat.toFixed(5)+", "+x.lon.toFixed(5):'<span class="dim">none</span>'}</td>`+
+  `<td>${x.members}</td><td>${x.suspended}</td><td>${x.posts}</td><td><select data-key="${esc(x.key)}" data-name="${esc(x.name)}" data-loc="${x.lat||x.lon?x.lat+", "+x.lon:""}" onchange="tnAction(this)">`+
+  `<option value="">Actions&hellip;</option><option value="loc">Set location</option><option value="pw">Reset web UI password</option><option value="del">Delete room</option></select></td></tr>`).join("")}
+let KK_ROWS=[];
+async function loadKaas(){if(!MAINADM)return;let d;try{const r=await fetch("api/v1/kaas/keys");if(!r.ok)return;d=await r.json()}catch(e){return}
+ KK_ROWS=d.keys||[];$("kk_url").textContent=(location.protocol==="https:"?"wss://":"ws://")+location.host+d.path;$("kk_burst").textContent=d.send_burst;$("kk_win").textContent=d.send_window_s;$("kk_air").textContent=d.airtime_pct;
+ const t=$("kklist");if(!KK_ROWS.length){t.innerHTML='<tr><td class="dim">No API keys yet.</td></tr>';return}
+ const day=x=>x?new Date(x*1000).toLocaleDateString():"never";
+ t.innerHTML="<tr><th>Description</th><th>Access</th><th>Expires</th><th>Last used</th><th>Connected</th>"+
+  '<th title="packets streamed to this key: last 24 h / total">Received <span class=\"dim small\">24h / total</span></th><th title="packets this key sent: last 24 h / total">Sent <span class=\"dim small\">24h / total</span></th>'+
+  '<th title="refused sends and other errors: last 24 h / total">Errors <span class=\"dim small\">24h / total</span></th><th></th></tr>'+KK_ROWS.map(k=>
+  `<tr><td>${esc(k.description)||'<span class="dim">(no description)</span>'}</td><td>${[k.receive?"Receive":"",k.send?"Send":""].filter(Boolean).join(" + ")}</td>`+
+  `<td class="${k.expired?"poor":""}">${k.expired?"expired "+day(k.expires):day(k.expires)}</td><td>${k.last_used?ago(k.last_used)+" ago":"never"}</td>`+
+  `<td>${k.connected?'<span class="mqdot on"></span> '+k.connected:'<span class="dim">no</span>'}</td>`+
+  ["rx","tx","err"].map(f=>{const v=(k.stats||{})[f]||[0,0];return `<td class="${f==="err"&&v[0]?"poor":""}">${v[0].toLocaleString()} <span class="dim">/ ${v[1].toLocaleString()}</span></td>`}).join("")+
+  `<td><button data-id="${esc(k.id)}" data-name="${esc(k.description||"(no description)")}" onclick="kkRevoke(this)">Revoke</button></td></tr>`).join("")}
+async function kkCreate(btn){const v=$("kk_exp").value;const o={receive:$("kk_receive").checked,send:$("kk_send").checked,description:$("kk_desc").value.trim(),
+ expires:v?Math.floor(new Date(v+"T23:59:59").getTime()/1000):null};
+ btn.disabled=true;const r=await fetch("api/v1/kaas/keys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});btn.disabled=false;
+ let d={};try{d=await r.json()}catch(e){}
+ if(!r.ok){let m=d.error||"Could not save";if(r.status===401){m="Your admin session has expired: log in again.";session()}$("kkmsg").className="poor small";$("kkmsg").textContent=" "+m;return}
+ $("kkmsg").textContent="";$("kk_desc").value="";$("kk_exp").value="";$("kk_token").value=d.token;$("kkcopied").textContent="";$("kkbox").style.display="flex";setTimeout(loadKaas,700)}
+async function kkCopy(){const i=$("kk_token");i.select();try{await navigator.clipboard.writeText(i.value)}catch(e){document.execCommand("copy")}$("kkcopied").textContent="Copied."}
+function kkDone(){$("kk_token").value="";$("kkbox").style.display="none"}
+async function kkRevoke(b){if(!confirm("Revoke the API key "+b.dataset.name+"? Clients using it are disconnected now and can't connect again."))return;
+ const m=await tnPost("api/v1/kaas/keys/"+b.dataset.id+"/revoke",{});if(m)alert(m);setTimeout(loadKaas,500)}
+let WB={users:[],banned:[]};
+async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v1/web/users");if(!r.ok)return;d=await r.json()}catch(e){return}
+ WB=d;$("wb_on").checked=d.enabled;$("wb_pw_state").textContent=d.page_password?"set: the page and its logins ask for it":"none: anyone who can reach this server can open the page";$("wb_pw_rm").disabled=!d.page_password;
+ $("wb_giphy_state").textContent=d.giphy_key?"set: web users get a GIF picker":"none: no GIF picker (Giphy links still show)";$("wb_giphy_rm").disabled=!d.giphy_key;
+ {const b=d.backlog||{};if(document.activeElement!==$("wb_days"))$("wb_days").value=b.days;$("wb_bk_mqtt").checked=!!b.mqtt;
+  $("wb_bk_state").textContent=b.days?(b.count||0).toLocaleString()+" packets kept"+(b.oldest?", the oldest from "+ago(b.oldest)+" ago":""):"off: web users don't catch up";}if(document.activeElement!==$("wb_unk"))$("wb_unk").value=d.unknown_key_message||"";
+ $("wb_motd_on").checked=!!d.motd_enabled;if(document.activeElement!==$("wb_motd"))$("wb_motd").value=d.motd||"";
+ WBH=d.hosts||[];if(document.activeElement!==$("wb_hosts"))$("wb_hosts").value=WBH.join(", ");
+ $("wb_refused").innerHTML=(d.refused_hosts||[]).length?'<span class="mid">Refused:</span> '+d.refused_hosts.map(r=>
+  `<span class="mono">${esc(r.host)}</span> <span class="dim">(${r.count}, ${ago(r.last)} ago)</span> <button data-h="${esc(r.host)}" onclick="wbHosts(this,this.dataset.h)">Allow</button>`).join(" "):"";$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
+ $("wb_burst").textContent=$("kk_burst").textContent;$("wb_win").textContent=$("kk_win").textContent;
+ const t=$("wblist");if(!d.users.length){t.innerHTML='<tr><td class="dim">'+(d.enabled?"Nobody has logged in yet.":"Web logins are off.")+'</td></tr>'}else{
+ const key=p=>`<span class="wbkey" title="${esc(p)}">${esc(p.slice(0,8))}&hellip;</span>`;
+ const addr=u=>u.ip?`<br><span class="dim small${u.ip_banned?" poor":""}" title="last logged in from${u.ip_shared?" (and "+u.ip_shared+" other user"+(u.ip_shared>1?"s":"")+")":""}">${esc(u.ip)}${u.ip_banned?" banned":u.ip_shared?" +"+u.ip_shared:""}</span>`:"";
+ const access=u=>u.banned?'<span class="poor">banned</span>':u.send?('<span class="good">can send</span> <span class="dim small">'+(u.heard_rf?"heard "+ago(u.heard_rf)+" ago":u.approved?"allowed":"heard by an observer")+'</span>'):'<span class="mid">pending</span> <span class="dim small">not heard on the air</span>';
+ t.innerHTML="<tr><th>Name</th><th>Public key</th><th>Access</th><th>Last active</th><th>Connected</th>"+
+  '<th title="packets streamed to this user: last 24 h / total">Received <span class="dim small">24h / total</span></th><th title="packets this user sent: last 24 h / total">Sent <span class="dim small">24h / total</span></th>'+
+  '<th title="refused sends and other errors: last 24 h / total">Errors <span class="dim small">24h / total</span></th>'+
+  '<th title="backlog packets kept since they were last connected: they catch up on these when they come back">Missed</th><th></th></tr>'+d.users.map(u=>
+  `<tr><td>${esc(u.name)||'<span class="dim">(no name)</span>'}${u.advert_name&&u.advert_name!==u.name?' <span class="dim small">adverts as '+esc(u.advert_name)+'</span>':''}</td><td>${key(u.pub)}${addr(u)}</td>`+
+  `<td>${access(u)}</td><td>${ago(u.last)} ago</td><td>${u.connected?'<span class="mqdot on"></span> '+u.connected:'<span class="dim">no</span>'}</td>`+
+  ["rx","tx","err"].map(f=>{const v=(u.stats||{})[f]||[0,0];return `<td class="${f==="err"&&v[0]?"poor":""}">${v[0].toLocaleString()} <span class="dim">/ ${v[1].toLocaleString()}</span></td>`}).join("")+
+  `<td>${u.connected?'<span class="dim">-</span>':(u.missed||0).toLocaleString()}</td>`+
+  `<td><div class="wbacts">${[[!u.send&&!u.banned,"allow","Allow send","let this key send before the radio hears it"],
+   [u.approved&&!u.banned,"unallow","Unallow","take back Allow send: it sends again once the radio hears it"],
+   [u.connected,"kick","Kick","disconnect now; they can log in again"],
+   [u.missed,"purge","Purge","count them as caught up to now: they won't get what they missed"],
+   [!u.banned||(u.ip&&!u.ip_banned),"ban","Ban","disconnect, and refuse this key and/or its address from now on"],
+   [true,"delete","Delete","disconnect and forget them (not a ban: they can log in again as a new user)"]].filter(x=>x[0]).map(([,a,l,tip])=>
+   `<button data-pub="${esc(u.pub)}" data-name="${esc(u.name)}" data-act="${a}" data-ip="${esc(u.ip||"")}" data-shared="${u.ip_shared||0}" data-banned="${u.banned?1:""}" data-ipbanned="${u.ip_banned?1:""}" title="${tip}"${a==="ban"||a==="delete"?' class="wbwarn"':""} onclick="wbAct(this)">${l}</button>`).join("")}</div></td></tr>`).join("")}
+ const bi=d.banned_ips||[],b=$("wbbanned");b.innerHTML=d.banned.length||bi.length?"<tr><th>Banned</th><th>Public key or address</th><th>Since</th><th></th></tr>"+d.banned.map(x=>
+  `<tr><td>${esc(x.name)||'<span class="dim">(no name)</span>'}</td><td class="mono">${esc(x.pub)}</td><td>${ago(x.ts)} ago</td>`+
+  `<td><button data-pub="${esc(x.pub)}" data-act="unban" onclick="wbAct(this)">Unban</button></td></tr>`).join("")+bi.map(x=>
+  `<tr><td>${esc(x.name)||'<span class="dim">(no name)</span>'}</td><td class="mono">${esc(x.ip)} <span class="dim small">address</span></td><td>${ago(x.ts)} ago</td>`+
+  `<td><button data-ip="${esc(x.ip)}" onclick="wbIp(this)">Unban</button></td></tr>`).join(""):""}
+async function wbBacklog(btn){const n=Number($("wb_days").value);
+ if(!Number.isInteger(n)||n<0){$("wbmsg").className="poor small";$("wbmsg").textContent=" Days: a whole number, 0 for none.";return}
+ if(n===0&&!confirm("Keep no backlog? What's kept now is deleted, and web users won't catch up on what they missed."))return;
+ btn.disabled=true;await wbSettings({web_backlog_days:n});btn.disabled=false}
+async function wbPagePw(btn,remove){const pw=remove?"":$("wb_pw").value;
+ if(!remove&&(pw.length<4||pw.length>64)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A page password is 4 to 64 characters.";return}
+ if(remove&&!confirm("Remove the MeshCore Web page password? Anyone who can reach this server can then open the page."))return;
+ btn.disabled=true;await wbSettings({page_password:pw});btn.disabled=false;$("wb_pw").value=""}
+let WBH=[];
+async function wbHosts(btn,add){const l=add?[...WBH,add]:$("wb_hosts").value.split(/[\s,]+/).filter(Boolean);
+ if(l.some(h=>!/^[A-Za-z0-9.\-:\[\]]{1,100}$/.test(h))){$("wbmsg").className="poor small";$("wbmsg").textContent=" Host names look like mesh.example.com or 10.0.0.5:8081.";return}
+ btn.disabled=true;await wbSettings({web_hosts:l});btn.disabled=false}
+async function wbMotd(btn){btn.disabled=true;await wbSettings({motd:$("wb_motd").value});btn.disabled=false}
+async function wbUnknown(btn){const t=$("wb_unk").value.trim();
+ if(!t){$("wbmsg").className="poor small";$("wbmsg").textContent=" The unknown key message can't be empty.";return}
+ btn.disabled=true;await wbSettings({unknown_key_message:t});btn.disabled=false}
+async function wbGiphy(btn,remove){const k=remove?"":$("wb_giphy").value.trim();
+ if(!remove&&!/^[A-Za-z0-9]{8,64}$/.test(k)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A Giphy API key is letters and digits.";return}
+ btn.disabled=true;await wbSettings({giphy_key:k});btn.disabled=false;$("wb_giphy").value=""}
+async function wbSettings(o){const m=await tnPost("api/v1/web/settings",o);$("wbmsg").className="poor small";$("wbmsg").textContent=m?" "+m:"";setTimeout(loadWeb,500)}
+function wbBan(btn){const d=btn.dataset,p=d.pub,ip=d.ip,dlg=$("wbbandlg");
+ $("wbban_title").textContent="Ban "+(d.name||p.slice(0,8));$("wbban_pub").textContent=p.slice(0,16)+"\u2026";
+ $("wbban_key").checked=!d.banned;$("wbban_key").disabled=!!d.banned;
+ $("wbban_addr").textContent=ip||"(not known)";$("wbban_ip").checked=false;$("wbban_ip").disabled=!ip||!!d.ipbanned;
+ const sh=+d.shared||0;$("wbban_note").className="small"+(sh?" poor":" dim");
+ $("wbban_note").textContent=d.banned?"The key is banned already.":sh?"That address was also used by "+sh+" other user"+(sh>1?"s":"")+": banning it shuts them out too. (Behind a proxy that doesn't pass on the visitor's address, everyone shares one.)":
+  "A key is free to make, so a key ban alone is easy to get round; an address ban hits everyone behind that address.";
+ dlg.onclose=async()=>{if(dlg.returnValue!=="ban")return;const k=$("wbban_key").checked&&!d.banned,i=$("wbban_ip").checked;
+  if(!k&&!i)return;btn.disabled=true;const m=await tnPost("api/v1/web/users/"+p+"/ban",{name:d.name||"",key:k,ip:i});if(m)alert(m);setTimeout(loadWeb,500)};
+ dlg.returnValue="";dlg.showModal()}
+async function wbIp(btn){btn.disabled=true;const m=await tnPost("api/v1/web/ips/"+encodeURIComponent(btn.dataset.ip)+"/unban",{});if(m)alert(m);setTimeout(loadWeb,500)}
+async function wbAct(btn){const a=btn.dataset.act,p=btn.dataset.pub;if(!a)return;
+ if(a==="ban")return wbBan(btn);
+ if(a==="kick"&&!confirm("Disconnect "+p.slice(0,8)+"? They can log in again."))return;
+ if(a==="delete"&&!confirm("Delete "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected and forgotten, and lose \"allow send\". It isn't a ban: they can log in again as a new user."))return;
+ if(a==="purge"&&!confirm("Purge "+(btn.dataset.name||p.slice(0,8))+"'s backlog? They'll count as caught up to now, and won't get what they missed."))return;
+ btn.disabled=true;const m=await tnPost("api/v1/web/users/"+p+"/"+a,{name:btn.dataset.name||""});if(m)alert(m);setTimeout(loadWeb,500)}
+async function wbBanKey(btn){const p=$("wb_banpub").value.trim().toLowerCase();if(!/^[0-9a-f]{64}$/.test(p)){$("wbbanmsg").className="poor small";$("wbbanmsg").textContent=" A public key is 64 hex characters.";return}
+ btn.disabled=true;const m=await tnPost("api/v1/web/users/"+p+"/ban",{});btn.disabled=false;$("wbbanmsg").className=m?"poor small":"dim small";$("wbbanmsg").textContent=" "+(m||"Banned.");if(!m)$("wb_banpub").value="";setTimeout(loadWeb,500)}
+async function tnPost(url,o){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
+ let m="";if(!r.ok){m="Failed";try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}return m}
+async function tnCreate(btn){const o={name:$("tn_name").value.trim(),path:$("tn_path").value.trim(),private_key:$("tn_key").value.trim(),
+ room_password:$("tn_join").value,admin_password:$("tn_admin").value,web_password:$("tn_web").value,lat:$("tn_lat").value.trim(),lon:$("tn_lon").value.trim()};
+ btn.disabled=true;const m=await tnPost("api/tenants",o);btn.disabled=false;
+ $("tnmsg").className=m?"poor small":"good small";$("tnmsg").textContent=m?" "+m:" created: /"+o.path.toLowerCase()+"/";
+ if(!m){["tn_name","tn_path","tn_key","tn_join","tn_admin","tn_web","tn_lat","tn_lon"].forEach(id=>$(id).value="");setTimeout(loadTenants,700)}}
+async function tnAction(sel){const k=sel.dataset.key,n=sel.dataset.name,a=sel.value;sel.value="";if(!a)return;let m;
+ if(a==="loc"){const v=prompt("Location of "+n+" as latitude, longitude (e.g. 37.77490, -122.41940). Leave empty for none.",sel.dataset.loc);if(v===null)return;
+  const p=v.split(",").map(x=>x.trim());if(v.trim()&&p.length!==2){alert("Enter latitude, longitude separated by a comma.");return}
+  m=await tnPost("api/tenants/"+k+"/location",v.trim()?{lat:p[0],lon:p[1]}:{lat:"",lon:""});alert(m||"Location of "+n+" saved; it advertises it shortly.")}
+ else if(a==="pw"){const pw=prompt("New web UI password for "+n+" (6+ characters). Anyone logged in to its page is logged out.");if(pw===null)return;
+  m=await tnPost("api/tenants/"+k+"/password",{web_password:pw});alert(m||"Web UI password for "+n+" reset.")}
+ else if(a==="del"){if(!confirm("Delete the room "+n+"? Its members, posts, settings and key are erased for good."))return;
+  const pw=prompt("Your admin (web) password, to confirm deleting "+n+":");if(pw===null)return;
+  m=await tnPost("api/tenants/"+k+"/delete",{password:pw});alert(m||n+" deleted.")}
+ setTimeout(loadTenants,700)}
 async function mqSet(o){const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  if(r.status===401){alert("Your admin session has expired: log in again.");session()}setTimeout(load,400)}
 async function mqCredentials(){const u=$("mq_user").value.trim(),p=$("mq_pass").value;if(!u||!p){$("mqcred").textContent="username and password are both required";$("mqcred").className="poor small";return}
  const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u,password:p})});let m="credentials were not saved";if(r.ok){$("mq_user").value="";$("mq_pass").value="";m="subscriber credentials saved; reconnecting"}else{try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("mqcred").className=r.ok?"good small":"poor small";$("mqcred").textContent=m;setTimeout(load,700)}
+// The region codes a set of topic filters stands for ("" = every region), or null when they're something else.
+function regionsOf(topics){const l=(topics||[]).map(t=>String(t).trim()).filter(Boolean);if(!l.length||(l.length===1&&l[0]==="meshcore/#"))return "";
+ const m=l.map(t=>/^meshcore\/([A-Za-z0-9]+)\/(\+\/packets|#)$/.exec(t));return m.every(Boolean)?m.map(x=>x[1].toUpperCase()).join(", "):null}
+async function mqRegions(btn){const codes=[...new Set($("mq_regions").value.toUpperCase().split(/[\s,]+/).filter(Boolean))];
+ if(codes.some(c=>!/^[A-Z0-9]{2,8}$/.test(c))||codes.length>16){$("mqreg").className="poor small";$("mqreg").textContent=" Regions are codes like SJC, SFO, MRY (up to 16).";return}
+ btn.disabled=true;const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({topics:codes.length?codes.map(c=>"meshcore/"+c+"/+/packets"):["meshcore/#"]})});btn.disabled=false;
+ let m=r.ok?(codes.length?"saved: only "+codes.join(", ")+"; reconnecting":"saved: every region; reconnecting"):"not saved";if(!r.ok){try{m=(await r.json()).error||m}catch(e){}}
+ if(r.status===401){m="Your admin session has expired: log in again.";session()}$("mqreg").className=r.ok?"good small":"poor small";$("mqreg").textContent=m;delete SIG.mqconn;setTimeout(load,700)}
 async function mqConnection(){const o={host:$("mq_host").value.trim(),port:+$("mq_port").value,transport:$("mq_transport").value,ws_path:$("mq_path").value.trim(),tls:$("mq_tls").checked,tls_verify:$("mq_verify").checked,topics:$("mq_topics").value};const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});let m="broker settings were not saved";if(r.ok)m="broker settings saved; reconnecting";else{try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("mqconn").className=r.ok?"good small":"poor small";$("mqconn").textContent=m;delete SIG.mqconn;setTimeout(load,700)}
-async function sendAdvert(flood,btn){
+async function sendAdvert(flood,btn,node){
  if(flood&&!confirm("Send a flood advert? It is relayed across the whole mesh."))return;
- btn.disabled=true;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({flood})});
- let m=r.ok?(flood?"Flood advert sent":"Advert sent (zero-hop)"):"Could not send";try{const d=await r.json();if(!r.ok)m=d.error||m;else if(d.repeater)m+=" (room and repeater)"}catch(e){}
+ btn.disabled=true;btn.dataset.busy=1;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(node?{flood,node}:{flood})});
+ let m=r.ok?(flood?"Flood advert sent":"Advert sent (zero-hop)"):"Could not send";try{const d=await r.json();if(!r.ok)m=d.error||m}catch(e){}
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
- $("advmsg").textContent=m+" · "+new Date().toLocaleTimeString();setTimeout(()=>btn.disabled=false,10000)}
+ btn.parentElement.querySelector(".advmsg").textContent=m+" · "+new Date().toLocaleTimeString();setTimeout(()=>{btn.disabled=false;delete btn.dataset.busy},10000)}
+async function roomLoc(btn){btn.disabled=true;const r=await fetch("api/location",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({lat:$("rm_lat").value.trim(),lon:$("rm_lon").value.trim()})});btn.disabled=false;
+ let m=r.ok?"saved":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}
+ $("rmlocmsg").className=r.ok?"good small":"poor small";$("rmlocmsg").textContent=" "+m;delete SIG.rmloc;setTimeout(load,600)}
 async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chaterr").textContent="";
  const r=await fetch("api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})});
  if(r.ok){$("chatmsg").value="";chatLeft();setTimeout(()=>loadChat(false),700)}
  else{let e="Could not send";try{e=(await r.json()).error||e}catch(x){}if(r.status===401){e="Your admin session has expired: log in again.";session()}$("chaterr").textContent=e}}
 async function session(){try{const r=await (await fetch("api/session")).json();ADMIN=r.admin;LOGIN_ON=r.login_enabled}catch(e){}
- const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=ADMIN?"":"none";$("trafficcard").style.display=ADMIN?"":"none";$("welcomecard").style.display=ADMIN?"":"none";if(ADMIN&&!was)loadChat(true);if(ADMIN&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
- $("mqcard").style.display=ADMIN?"":"none";
- $("rpcard").style.display=ADMIN?"":"none";
+ MAINADM=ADMIN&&!TENANT;
+ const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("roomcard").style.display=ADMIN&&TENANT?"":"none";$("observercard").style.display=MAINADM?"":"none";$("trafficcard").style.display=MAINADM?"":"none";$("welcomecard").style.display=ADMIN&&TENANT?"":"none";if(ADMIN&&!was)loadChat(true);if(ADMIN&&TENANT&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
+ $("mqcard").style.display=MAINADM?"":"none";
+ $("rpcard").style.display=MAINADM?"":"none";$("aircard").style.display=MAINADM?"":"none";
+ $("vccard").style.display=MAINADM?"":"none";
+ $("tncard").style.display=MAINADM?"":"none";if(MAINADM)loadTenants();
+ $("kaascard").style.display=MAINADM?"":"none";if(MAINADM)loadKaas();$("webcard").style.display=MAINADM?"":"none";if(MAINADM)loadWeb();
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
 let OBS_SERVERS=[];
 function renderObserverServers(){const t=$("observerservers");t.innerHTML="<tr><th>Name</th><th>Endpoint</th><th>Audience</th><th>Prefix</th><th>State</th><th></th></tr>"+OBS_SERVERS.map((s,i)=>`<tr><td>${esc(s.name)}</td><td>${esc(s.host)}:${s.port}${esc(s.ws_path)}</td><td>${esc(s.audience)}</td><td>${esc(s.topic_prefix)}</td><td>${s.enabled?"enabled":"off"}</td><td><button onclick="removeObserverServer(${i})">Delete</button></td></tr>`).join("")}
 function saveObserverServers(){fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({observer_servers:OBS_SERVERS})}).then(r=>r.json().then(d=>({ok:r.ok,d}))).then(x=>{$("obsmsg").textContent=x.ok?"Observer servers saved; refreshing.":(x.d.error||"Could not save");setTimeout(load,500)}).catch(()=>{$("obsmsg").textContent="Could not save"})}
 function addObserverServer(){const n=$("os_name").value.trim(),h=$("os_host").value.trim();if(!n||!h){$("obsmsg").textContent="Server name and host are required";return}OBS_SERVERS.push({name:n,host:h,port:+$("os_port").value,audience:$("os_aud").value.trim()||h,ws_path:$("os_path").value.trim()||"/",topic_prefix:$("os_prefix").value.trim()||"meshcore",enabled:$("os_enabled").checked,tls:$("os_tls").checked,tls_verify:$("os_verify").checked});saveObserverServers()}
 function removeObserverServer(i){if(confirm("Delete this observer server?")){OBS_SERVERS.splice(i,1);saveObserverServers()}}
-function observerState(o,key){
- const d=o||{enabled:false,iata:"SJC",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
- if(ADMIN){$("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"SJC";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
-  $("obs_queue").value=d.queue_max||1000;OBS_SERVERS=d.servers||[];renderObserverServers();}
+function observerState(o){
+ const d=o||{enabled:false,iata:"",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
+ if(ADMIN){const ch=d.choices||[],sel=$("obs_who"),valid=ch.some(c=>c.id===d.identity);
+  if(document.activeElement!==sel&&changed("obswho",[ch,d.identity])){sel.innerHTML='<option value="">— choose —</option>'+ch.map(c=>`<option value="${esc(c.id)}">${esc(c.label)}</option>`).join("");sel.value=valid?d.identity:""}
+  $("obs_enabled").disabled=!valid&&!d.enabled;
+  $("obswho_note").textContent=!ch.length?"Turn on the virtual repeater or create a room: the observer reports as one of them.":!valid?"Choose who it reports as to enable it.":"";
+  $("obs_enabled").checked=!!d.enabled;
+  const f=document.activeElement,typing=f&&f.closest&&f.closest("#observercard")&&f.tagName!=="BUTTON"&&f.type!=="checkbox";
+  if(!typing&&changed("obsform",[d.iata,d.status,d.packets,d.rx,d.queue_max])){$("obs_iata").value=d.iata||"";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;$("obs_queue").value=d.queue_max||1000}
+  if(changed("obssrv",d.servers||[])){OBS_SERVERS=d.servers||[];renderObserverServers()}}
  const bs=d.brokers||{}, row=n=>{const b=bs[n]||{},s=b.connected?'<span class="good">connected</span>':'<span class="poor">disconnected</span>';return `<tr><td>${n}</td><td>${s}</td><td>${b.last_publish?ago(b.last_publish)+" ago":"never"}</td><td class="small">${esc(b.last_error||"-")}</td></tr>`};
- $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||key)}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
+ $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||((d.choices||[]).find(c=>c.id===d.identity)||{}).key||"-")}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
   `<tr><th>Broker</th><th>State</th><th>Last publish</th><th colspan="3">Last error</th></tr>`+Object.keys(bs).map(row).join("")+(d.last_error?`<tr><th>Observer</th><td colspan="5" class="poor">${esc(d.last_error)}</td></tr>`:"");
 }
 async function saveObserver(){
  const body={observer_enabled:$("obs_enabled").checked,observer_iata:$("obs_iata").value.trim().toUpperCase(),observer_status:$("obs_status").checked,observer_packets:$("obs_packets").checked,observer_rx:$("obs_rx").checked,observer_queue_max:Number($("obs_queue").value)};
  const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Saved; broker settings are being refreshed.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
 }
+async function saveObserverWho(){const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({observer_identity:$("obs_who").value})});
+ let m=r.ok?"Saved: the observer now reports as "+($("obs_who").selectedOptions[0]||{}).text+".":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}$("obsmsg").textContent=m;delete SIG.obswho;setTimeout(load,500)}
 async function saveObserverToggle(){
  const enabled=$("obs_enabled").checked;$("obsmsg").textContent="Saving observer state…";
  const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({observer_enabled:enabled})});let m=r.ok?(enabled?"Observer enabled; broker settings are being refreshed.":"Observer disabled; brokers are disconnecting."):"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
@@ -4854,7 +9432,7 @@ async function loadMap(){
  MAPSIG=sig;
  $("rpts").innerHTML="<tr><th>Repeater</th><th>Activity</th><th>Last seen</th><th>Heard directly</th><th>SNR (direct)</th><th>Position</th><th>Best routes from room</th></tr>"+
   MP.repeaters.map((r,i)=>`<tr data-i="${i}"><td>${esc(r.name)||'<span class="dim">?</span>'} <span class="dim">${r.hash}</span></td><td>${r.activity}</td><td>${ago(r.last)}</td><td>${r.last_direct?ago(r.last_direct):"-"}</td><td>${r.snr??"-"}</td><td class="small">${r.lat!=null?r.lat.toFixed(4)+", "+r.lon.toFixed(4):'<span class="dim">none sent</span>'}</td><td class="small">${r.routes.length?r.routes.map(x=>route(x.path)+` <span class="dim">${x.conf}%</span>`).join("<br>"):"-"}</td></tr>`).join("");
- RPTS=MP.repeaters; LAST=MP; MAPSHAPE=shapeChanged;
+ RPTS=MP.repeaters; LAST=MP; MAPSHAPE=shapeChanged; drawBestMap();
  document.querySelectorAll("#rpts tr[data-i]").forEach(tr=>{const r=RPTS[+tr.dataset.i];tr.onclick=()=>select(r.hash)});
  if(SEL)select(SEL); else if(shapeChanged||!map)drawMap(MP);
 }
@@ -4880,13 +9458,18 @@ async function load(){
   $("mqch").textContent=(Mq.channels||[]).length?" · channels watched: "+Mq.channels.join(", "):"";
   $("mqcred").innerHTML=Mq.credentials_configured?'<span class="good">subscriber credentials configured</span>':'<span class="mid">subscriber credentials not configured</span>';
   const mf=document.activeElement,mqTyping=mf&&mf.closest&&mf.closest("#mqcard")&&["text","password","number"].includes(mf.type);
-  if(!mqTyping&&changed("mqconn",[Mq.host,Mq.port,Mq.transport,Mq.ws_path,Mq.tls,Mq.tls_verify,Mq.topics])){$("mq_host").value=Mq.host||"";$("mq_port").value=Mq.port||"";$("mq_transport").value=Mq.transport||"websockets";$("mq_path").value=Mq.ws_path||"/mqtt";$("mq_tls").checked=!!Mq.tls;$("mq_verify").checked=!!Mq.tls_verify;$("mq_topics").value=(Mq.topics||[]).join(", ")}
+  if(!mqTyping&&changed("mqconn",[Mq.host,Mq.port,Mq.transport,Mq.ws_path,Mq.tls,Mq.tls_verify,Mq.topics])){$("mq_host").value=Mq.host||"";$("mq_port").value=Mq.port||"";$("mq_transport").value=Mq.transport||"websockets";$("mq_path").value=Mq.ws_path||"/mqtt";$("mq_tls").checked=!!Mq.tls;$("mq_verify").checked=!!Mq.tls_verify;$("mq_topics").value=(Mq.topics||[]).join(", ");
+  const rg=regionsOf(Mq.topics);$("mq_regions").value=rg||"";$("mqreg").className="dim small";$("mqreg").textContent=rg===null?"custom topic filters in use (below)":rg?"taking in only these regions":"every region";}
   $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; ${subStatus} &middot; MQTT packets received: ${Md.received||0}; accepted: ${Md.accepted||0} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
    :`<span class="poor">not connected</span> ${esc(Mq.error||"(connecting...)")}`):"off"}
+ if(MAINADM)renderAir(st.airtime);
+ if(TENANT&&ADMIN){const f=document.activeElement,typing=f&&f.closest&&f.closest("#roomcard")&&f.tagName==="INPUT";
+  if(!typing&&changed("rmloc",[R.lat,R.lon])){const has=R.lat||R.lon;$("rm_lat").value=has?R.lat:"";$("rm_lon").value=has?R.lon:""}}
  const Rp=st.repeater||{};
  $("rrpt").innerHTML=Rp.enabled?`<span class="dim">Repeater</span> ${esc(Rp.name)} <span class="dim small">${esc(Rp.id||"")}</span> `+
-   (Rp.relay?`<span class="good">relaying</span> <span class="dim small">${Rp.per_min}/min &middot; ${Rp.airtime_used}% air (cap ${Rp.airtime_cap}%)</span>`:'<span class="mid">not relaying</span>')
+   (Rp.relay?`<span class="good">relaying</span> <span class="dim small">${Rp.per_min}/min &middot; ${Rp.airtime_used}% air (airtime weight ${Rp.airtime_cap})</span>`:'<span class="mid">not relaying</span>')
    :'<span class="dim">Repeater off</span>';
+ document.querySelectorAll("#rpcard .advbtns .act").forEach(b=>{if(!b.dataset.busy)b.disabled=!Rp.enabled});
  if(ADMIN){$("rp_en").checked=!!Rp.enabled;$("rp_relay").checked=!!Rp.relay;$("rp_relay").disabled=!Rp.enabled;
   const f=document.activeElement,typing=f&&f.closest&&f.closest("#rpcard")&&f.tagName!=="BUTTON"&&f.type!=="checkbox";
   if(!typing&&changed("rpform",[Rp.name,Rp.lat,Rp.lon,Rp.scope_mode,Rp.regions,Rp.airtime_cap,Rp.loop_detect,Rp.advert_min,Rp.flood_advert_h])){
@@ -4895,7 +9478,23 @@ async function load(){
   $("rpstat").innerHTML=Rp.enabled?`id ${esc(Rp.id)} &middot; key ${esc((Rp.key||"").slice(0,16))}&hellip;`:"off";
   $("rpcounts").innerHTML=Rp.enabled?`relayed: ${Rp.flood} flood, ${Rp.direct} direct, ${Rp.acks} ACKs, ${Rp.traces} traces &middot; discovery answers: ${Rp.discovery} &middot; `+
    `kept internal: ${Rp.internal} &middot; duplicates: ${Rp.dups} &middot; not relayed: ${Rp.drop_scope} scope, ${Rp.drop_hops} hop limit, ${Rp.drop_loop} loop, `+
-   `${Rp.drop_airtime} airtime cap, ${Rp.drop_queue} queue full${Rp.relay?"":`, ${Rp.drop_off} while off`} &middot; adverts: ${Rp.adverts}`:""}
+   `${Rp.drop_airtime} airtime, ${Rp.drop_queue} queue full${Rp.relay?"":`, ${Rp.drop_off} while off`} &middot; adverts: ${Rp.adverts}`:""}
+ const Vc=st.companion||{};
+ document.querySelectorAll("#vccard .advbtns .act").forEach(b=>{if(!b.dataset.busy)b.disabled=!Vc.enabled});
+ if(MAINADM){try{const r=await fetch("api/companion");if(r.ok)VCA=await r.json()}catch(e){}}
+ $("rvc").innerHTML=Vc.enabled?`<span class="dim">Companion</span> ${esc(Vc.name)} `+(Vc.client?`<span class="good">app connected</span>`:Vc.listening?'<span class="dim small">no app connected</span>':'<span class="poor">port not open</span>'):"";
+ if(ADMIN){if(!$("vc_en").disabled)$("vc_en").checked=!!Vc.enabled;
+  $("vcopts").classList.toggle("locked",!!Vc.enabled);$("vcopts").querySelectorAll("input,select,button").forEach(e=>e.disabled=!!Vc.enabled);
+  $("vclockhint").textContent=Vc.enabled?"Turn the companion off to change these settings (name and position can also be set from the app).":
+   "Settings are saved when you turn the companion on.";
+  const f=document.activeElement,typing=f&&f.closest&&f.closest("#vccard")&&f.tagName!=="BUTTON"&&f.id!=="vc_en";
+  if(!typing&&changed("vcform",[Vc.name,Vc.port,VCA.allow,Vc.auto_advert,Vc.advert_min,Vc.advert_flood])){
+   $("vc_name").value=Vc.name||"";$("vc_port").value=Vc.port;$("vc_allow").value=(VCA.allow||[]).join(", ");$("vc_auto").checked=!!Vc.auto_advert;
+   $("vc_int").value=Vc.advert_min;$("vc_flood").value=Vc.advert_flood?"1":"0"}
+  $("vcstat").innerHTML=Vc.enabled?(Vc.listening?`listening on port ${esc(Vc.listen_port)}`:`<span class="poor">port ${esc(Vc.port)} not open: ${esc(Vc.error)}</span>`)+
+   ` &middot; id ${esc(Vc.id)} &middot; key ${esc((Vc.key||"").slice(0,16))}&hellip; &middot; `+(Vc.client?`<span class="good">app connected</span>${VCA.client?" from "+esc(VCA.client):""}`:"no app connected"):"off (port closed)";
+  $("vccounts").innerHTML=Vc.enabled?`${Vc.contacts} contacts &middot; ${Vc.channels} channels &middot; ${Vc.queued} message(s) waiting for the app &middot; `+
+   `messages received ${Vc.msgs_in}, sent ${Vc.msgs_out} &middot; kept off the air: ${Vc.internal_in} in, ${Vc.internal_out} out &middot; app settings ignored: ${Vc.ignored}`:""}
  const Wb=st.web||{};
  $("rweb").innerHTML=`<span class="dim">Web</span> ${Wb.viewers||0} viewer${Wb.viewers==1?"":"s"}${Wb.admins?` <span class="dim small">(${Wb.admins} admin)</span>`:""}`;
  if(st.map_version!==MAPVER)loadMap();                       // the map's shape changed (e.g. a new repeater): fetch now
@@ -4908,17 +9507,19 @@ async function load(){
   `<span><span class="dim">Noise floor</span><b>${Hs.nf_avg??"-"}</b> <span class="dim small">avg &middot; ${Hs.nf_min??"-"} / ${Hs.nf_max??"-"} min / max dBm</span></span>`,
   `<span><span class="dim">Channel use</span>TX <b>${Hs.tx_pct}%</b> &middot; RX <b>${Hs.rx_pct}%</b></span>`,
   `<span><span class="dim">Packets / min</span>RX <b>${Hs.rx_pm}</b> &middot; TX <b>${Hs.tx_pm}</b></span>`,
-  `<span><span class="dim">Push pace</span><b>${Hs.pace} s</b></span>`,
-  `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_rf!=null?` &middot; <b class="${Hs.push_rf>=80?"good":Hs.push_rf>=50?"mid":"poor"}">${Hs.push_rf}%</b> delivered${(st.mqtt||{}).enabled?` <span class="dim small">(${Hs.push_ok}% per MQTT)</span>`:""}`:""}</span>`,
+  ...(R.host?[]:[`<span><span class="dim">Push pace</span><b>${Hs.pace} s</b></span>`,
+  `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_rf!=null?` &middot; <b class="${Hs.push_rf>=80?"good":Hs.push_rf>=50?"mid":"poor"}">${Hs.push_rf}%</b> delivered${(st.mqtt||{}).enabled?` <span class="dim small">(${Hs.push_ok}% per MQTT)</span>`:""}`:""}</span>`]),
   `<span class="dim small">last ${Hs.minutes>=60?"hour":Hs.minutes+" min"}</span>`].join(""):'<span class="dim small">stats appear after the first minute</span>';
  $("rclock").textContent="up "+ago(Date.now()/1000-R.uptime).replace("s"," s")+(R.clock_ok?"":"  CLOCK NOT SYNCED");
- observerState(st.observer,R.key);if(ADMIN)loadObserverTraffic();
- const k=[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks],["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
+ observerState(st.observer);if(MAINADM)loadObserverTraffic();
+ const k=[...(R.host?[["Rooms",R.rooms]]:[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks]]),
+  ["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
  $("kpis").innerHTML=k.map(x=>`<div class="kpi"><span class="dim small">${x[0]}</span><b>${esc(x[1])}</b></div>`).join("");
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
  const memSig=JSON.stringify(st.members)+"|"+ADMIN+"|"+[...EXP].join(",");
  if(changed("members",memSig)){
- const ACTS=(m,i)=>ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff/suspension, retry now via best routes, then flood${m.outstanding?"":" (nothing outstanding)"}" onclick="event.stopPropagation();resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="event.stopPropagation();openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" onclick="event.stopPropagation();act('api/members/${m.pub}/kick','Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again.')">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" onclick="event.stopPropagation();act('api/members/${m.pub}/ban','Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely.')">${IC("ban")}</button></td>`:"";
+ const PUSH_TIP={synced:"Up to date: nothing to send",queued:"Posts waiting; nothing sent yet",sent:"First attempt sent",retry:"Retrying: count of retries sent for this post",backoff:"Every attempt failed: one more try (best route, then floods) when the timer ends",suspended:"No ACKs: paused until we hear from them (a flood probe every 6 h)"};
+ const ACTS=(m,i)=>ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff/suspension, retry now via best routes, then floods${m.outstanding?"":" (nothing outstanding)"}" onclick="event.stopPropagation();resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="event.stopPropagation();openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" data-u="api/members/${m.pub}/kick" data-m="Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again." onclick="event.stopPropagation();act(this.dataset.u,this.dataset.m)">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" data-u="api/members/${m.pub}/ban" data-m="Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely." onclick="event.stopPropagation();act(this.dataset.u,this.dataset.m)">${IC("ban")}</button></td>`:"";
  const IDC=(m,caret)=>`<td class="idcell">${caret}<b>${esc(m.name)||'<span class="dim">unknown</span>'}</b><br><span class="dim mono4">${m.key.slice(0,4)}</span><br><span class="small">${m.role}</span></td>`;
  const HX=h=>h==null?'<span class="dim">unknown</span>':h.length?h.join(" &rsaquo; "):"direct";
  const NM=p=>p==null?'<span class="dim">unknown</span>':p.length?p.map(esc).join(" &rsaquo; "):"direct";
@@ -4931,7 +9532,7 @@ async function load(){
               :[...others.slice(0,2).map(r=>row("TX","tx",`<span class="hexr">${HX(r.hex)}</span> <span class="dim">${r.rate}%</span>`)),...(m.in_routes||[]).slice(0,2).map(r=>row("RX","rx",`<span class="hexr">${HX(r.hex)}</span> <span class="dim">${r.share}%</span>`))].join("");
    const near=ex?m.near.map(n=>esc(n.rpt)+` <span class="dim">${n.share}%</span>`).join("<br>"):m.near.slice(0,4).map(n=>`<span class="hexr">${n.hex}</span> <span class="dim">${n.share}%</span>`).join("<br>");
    return `<tr class="mrow${ex?" exp":""}" data-k="${m.key}">${ACTS(m,i)}${IDC(m,`<span class="caret">${ex?"&#9662;":"&#9656;"}</span>`)}<td>${score(m)}</td><td>${ago(m.last_heard)}</td><td>${ago(m.sync_since)}</td><td>${m.outstanding}</td>
-   <td><span class="tag ${m.push}">${m.push}${m.retry_in?" "+Math.ceil(m.retry_in/60)+"m":""}</span></td>
+   <td><span class="tag ${m.push}" title="${PUSH_TIP[m.push]||""}">${m.push==="retry"?"retry \u00d7"+m.retries:m.push}${m.retry_in?" "+Math.ceil(m.retry_in/60)+"m":""}</span></td>
    <td class="small ${ex?"rcell":""}">${cur}</td><td class="small ${ex?"rcell":""}">${oth||'<span class="dim">-</span>'}</td><td class="small">${near||'<span class="dim">-</span>'}</td></tr>`}).join("")
   :`<tr><td class="dim">no active members</td></tr>`);
  document.querySelectorAll("#members tr.mrow").forEach(tr=>tr.onclick=()=>{const k=tr.dataset.k;EXP.has(k)?EXP.delete(k):EXP.add(k);SIG.members="";load()});
@@ -4941,21 +9542,63 @@ async function load(){
   :'<tr><td class="dim">nobody</td></tr>';
  }
  if(changed("toplinks",{t:st.top_links,d:st.discovery_min})){
- const TL=st.top_links||[], sn2=(a,b)=>`${a==null?"-":(a>0?"+":"")+a}<span class="dim"> / ${b==null?"-":(b>0?"+":"")+b}</span>`;
- $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Packet loss</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
-  TL.map(r=>{const c=r.loss==null?"dim":r.loss<=5?"good":r.loss<=20?"mid":"poor";
-   return `<tr><td>${esc(r.name)}</td><td>${r.virtual?'<span class="good">0%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${r.loss.toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
-   `<td>${sn2(r.in_last,r.in_avg)}</td><td>${sn2(r.out_last,r.out_avg)}</td><td>${r.rtt!=null?r.rtt+" ms":"-"}</td><td>${r.last_ok?ago(r.last_ok)+" ago":"never"}</td></tr>`}).join("")
+ const TL=st.top_links||[], sn=a=>a==null?"-":(a>0?"+":"")+a;
+ BEST=TL;
+ $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Reliability</th><th>SNR in/out avg</th><th>Last test</th></tr>"+
+  TL.map(r=>{const c=relClass(r);
+   return `<tr><td><span class="reldot ${c}"></span>${esc(r.name)}</td><td>${r.virtual?'<span class="good">100%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${(100-r.loss).toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
+   `<td>${sn(r.in_avg)}<span class="dim"> / </span>${sn(r.out_avg)}</td><td>${r.last_test?ago(r.last_test)+" ago":r.virtual?'<span class="dim">-</span>':"never"}</td></tr>`}).join("")
   :`<tr><td class="dim">no neighbours yet: the room discovers its direct repeaters every ${st.discovery_min||15} minutes</td></tr>`;
+ drawBestMap();
  }
  MEMBERS=st.members;
  const bans=st.bans||[];
  if(changed("bans",{b:bans,a:ADMIN}))
- $("bans").innerHTML=bans.length?"<tr><th>Name</th><th>Key</th><th>Banned</th><th></th></tr>"+bans.map(b=>`<tr><td>${esc(b.name)||'<span class="dim">unknown</span>'}</td><td class="dim">${b.key}</td><td>${ago(b.ts)} ago</td><td>${ADMIN?`<button onclick="act('api/bans/${b.pub}/unban','Unban ${esc(b.name||b.key)}? They will be able to log in again.')">Unban</button>`:""}</td></tr>`).join(""):'<tr><td class="dim">nobody</td></tr>';
+ $("bans").innerHTML=bans.length?"<tr><th>Name</th><th>Key</th><th>Banned</th><th></th></tr>"+bans.map(b=>`<tr><td>${esc(b.name)||'<span class="dim">unknown</span>'}</td><td class="dim">${b.key}</td><td>${ago(b.ts)} ago</td><td>${ADMIN?`<button data-u="api/bans/${b.pub}/unban" data-m="Unban ${esc(b.name||b.key)}? They will be able to log in again." onclick="act(this.dataset.u,this.dataset.m)">Unban</button>`:""}</td></tr>`).join(""):'<tr><td class="dim">nobody</td></tr>';
+}
+// Reliability class for a best-neighbour row: green 80%+, yellow 70%+, red below (grey: not traced yet).
+function relClass(r){return r.virtual?"good":r.loss==null?"dim":r.loss<=20?"good":r.loss<=30?"mid":"poor"}
+// Best neighbours mini map: each neighbour a dot, joined to the room by a line, both in its reliability colour;
+// links between neighbours that are known to hear each other in light blue.
+let BEST=[],bestmap=null,bestlayer=null,BESTSIG="";
+function drawBestMap(){
+ const box=$("bestmapbox"),note=$("bestmapnote");
+ if(typeof L==="undefined"){box.style.display="none";return}
+ if(!LAST||!LAST.repeaters)return;                              // map data not loaded yet: loadMap() calls back
+ const pos={};LAST.repeaters.forEach(r=>{if(r.on_map!==false&&r.lat!=null&&(r.lat||r.lon))pos[r.hash]=[r.lat,r.lon]});
+ const R=LAST.room,room=(R.lat||R.lon)?[R.lat,R.lon]:null;
+ const css=getComputedStyle(document.documentElement),col={good:css.getPropertyValue("--ok").trim(),mid:css.getPropertyValue("--warn").trim(),
+  poor:css.getPropertyValue("--bad").trim(),dim:css.getPropertyValue("--dim").trim()},link=css.getPropertyValue("--link").trim();
+ const pts=BEST.filter(r=>pos[r.hash]).map(r=>({h:r.hash,p:pos[r.hash],c:col[relClass(r)],name:r.name,
+  rel:r.virtual?"same radio":r.loss==null?"not traced yet":(100-r.loss).toFixed(1)+"%"}));
+ const inBest=new Set(pts.map(x=>x.h));
+ const links=(LAST.edges||[]).filter(e=>e.a&&e.b&&e.a!==e.b&&inBest.has(e.a)&&inBest.has(e.b));
+ const missing=BEST.length-pts.length;
+ note.textContent=!pts.length?(BEST.length?"No positions known for these repeaters yet.":""):missing?`${missing} without a known position not shown.`:"";
+ if(!pts.length){$("bestmap").style.display="none";return}
+ $("bestmap").style.display="";
+ const sig=JSON.stringify([room,pts.map(x=>[x.h,x.p,x.c]),links.map(e=>[e.a,e.b,e.obs])]);
+ if(sig===BESTSIG&&bestmap)return; BESTSIG=sig;
+ if(!bestmap){
+  bestmap=L.map("bestmap",{zoomControl:true,attributionControl:true}).setView(pts[0].p,11);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribution:"&copy; OpenStreetMap",
+   referrerPolicy:"strict-origin-when-cross-origin"}).addTo(bestmap);
+ }
+ if(bestlayer)bestlayer.remove(); bestlayer=L.layerGroup().addTo(bestmap);
+ const name=h=>{const x=pts.find(p=>p.h===h);return x?esc(x.name):h};
+ links.forEach(e=>L.polyline([pos[e.a],pos[e.b]],{color:link,weight:2,opacity:.9,dashArray:e.obs?"4 4":null})
+  .bindTooltip(`${name(e.a)} &harr; ${name(e.b)}${e.obs?"<br><i>via observers</i>":""}`).addTo(bestlayer));
+ if(room)pts.forEach(x=>L.polyline([room,x.p],{color:x.c,weight:3,opacity:.85}).bindTooltip(`${esc(x.name)}: ${x.rel}`).addTo(bestlayer));
+ pts.forEach(x=>L.circleMarker(x.p,{radius:7,color:"#0d1014",weight:1.5,fillColor:x.c,fillOpacity:1})
+  .bindTooltip(`${esc(x.name)}<br>reliability ${x.rel}`).addTo(bestlayer));
+ if(room)L.circleMarker(room,{radius:8,color:"#d8dee6",weight:2,fillColor:"#1a1f26",fillOpacity:1}).bindTooltip(esc(R.name)+" (room)").addTo(bestlayer);
+ const all=pts.map(x=>x.p).concat(room?[room]:[]);
+ bestmap.fitBounds(all,{padding:[24,24],maxZoom:13});
+ setTimeout(()=>bestmap.invalidateSize(),0);
 }
 function drawMap(st){
  if(typeof L==="undefined"){$("mapnote").textContent="Map needs internet access (Leaflet / OpenStreetMap). Tables above still work.";return}
- const R=st.room,pos={},tip={};st.repeaters.forEach(r=>{if(r.lat!=null&&(r.lat||r.lon)){pos[r.hash]=[r.lat,r.lon,r.name||r.hash];tip[r.hash]=`${esc(r.name||r.hash)} (${hopsTxt(hops(r))})`}});
+ const R=st.room,pos={},tip={};st.repeaters.forEach(r=>{if(r.on_map!==false&&r.lat!=null&&(r.lat||r.lon)){pos[r.hash]=[r.lat,r.lon,r.name||r.hash];tip[r.hash]=`${esc(r.name||r.hash)} (${hopsTxt(hops(r))})`}});
  if(R.lat||R.lon)pos[""]=[R.lat,R.lon,R.name+" (room)"];
  const pts=Object.values(pos);
  if(!map){
@@ -4964,7 +9607,7 @@ function drawMap(st){
   map=L.map("map").setView([c[0],c[1]],z);
   // OSM's tile servers refuse requests without a Referer: set it on the tiles themselves so a strict
   // Referrer-Policy from a proxy / load balancer can't strip it
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribution:"&copy; OpenStreetMap",
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribution:"&copy; OpenStreetMap",
    referrerPolicy:"strict-origin-when-cross-origin"}).addTo(map);
   map.on("click",()=>{if(SEL)select(null)});                 // empty map: show everything again
  }
@@ -4991,13 +9634,14 @@ $("sgpath").addEventListener("keydown",e=>{const it=acItems();
  else if((e.key==="Enter"||e.key==="Tab")&&ACI>=0&&$("aclist").style.display==="block"){acPick(it[ACI]);e.preventDefault()}
  else if(e.key==="Enter"){doSuggest()}else if(e.key==="Escape"){closeSuggest()}});
 $("chatmsg").addEventListener("input",chatLeft);$("chatmsg").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});chatLeft();
-setInterval(()=>loadChat(false),3000);
+setInterval(()=>loadChat(false),3000);setInterval(loadTenants,5000);setInterval(loadKaas,5000);setInterval(loadWeb,5000);
 session().then(()=>{load();loadMap()});setInterval(load,1000);setInterval(loadMap,30000);setInterval(session,60000);
 </script></body></html>"""
 
 
 ICON_NAMES = ("resync", "suggest", "kick", "ban", "advert", "flood_advert")
 PACKAGED_ICONS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data", "icons")
+MESHCORE_WEB_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data", "meshcore-web.html")   # web/
 
 
 def dashboard_icon_file(data_dir, name):
@@ -5034,6 +9678,8 @@ class WebUI:
         # threads, not the main loop), cache the history query, and cap concurrent requests
         clock_ = threading.Lock()
         slots = threading.BoundedSemaphore(16)
+        failures, flock = {}, threading.Lock()              # address -> recent failed logins (monotonic): see _locked_out
+        recent_by_ip = {}                                   # (what, address) -> recent requests (monotonic): see _ip_rate
         last_advert = [float("-inf")]
 
         files = {}                                          # path -> (mtime, raw, gzipped or None)
@@ -5056,6 +9702,13 @@ class WebUI:
             return ent
 
         snaps = {}                                          # name -> (dict object, raw json, gzipped)
+        # tenant rooms' pages: the same dashboard in tenant mode, their own logins (cookie scoped to /{path}/)
+        assert DASHBOARD_HTML.count("<script>\nconst TENANT=") == 1
+        thtml = DASHBOARD_HTML.replace("<script>\nconst TENANT=", "<script>window.TENANT=true</script><script>\nconst TENANT=")
+        tpage = (thtml.encode(), gzip.compress(thtml.encode(), 6))
+        tsessions = {}                                      # token -> (expiry, tenant key hex)
+        tsnaps = {}                                         # tenant key -> (state dict, raw, gzipped)
+        t_last_advert = {}
         viewers = {}                                        # client id -> (last seen, admin)
 
         def note_viewer(qs, admin):
@@ -5084,8 +9737,114 @@ class WebUI:
                 return hit[2] if gz else hit[1]
 
         class H(http.server.BaseHTTPRequestHandler):
+            timeout = HTTP_TIMEOUT_S                        # (a websocket lifts it once it's open: pings take over)
+
             def log_message(self, *a):
                 pass
+
+            def _raw_body(self):
+                """The request body, read once (do_POST reads it before taking a request slot). At most
+                HTTP_MAX_BODY: a bigger one is refused there with 413, unread."""
+                if not hasattr(self, "_body_bytes"):
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        n = 0
+                    self._body_bytes = self.rfile.read(n) if 0 < n <= HTTP_MAX_BODY else b""
+                return self._body_bytes
+
+            def _https(self):
+                """The browser reached us over HTTPS: a TLS proxy on a private address says so (X-Forwarded-Proto)."""
+                if (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower() != "https":
+                    return False
+                try:
+                    return ipaddress.ip_address(self.client_address[0].replace("::ffff:", "")).is_private
+                except ValueError:
+                    return False
+
+            def _cross_site(self):
+                """A POST another site's page sent (its Origin isn't this server): refused unless it's one of the
+                public login endpoints. SameSite=Strict cookies already keep the admin session out of those; this is
+                the second lock."""
+                if self.path.split("?")[0] in CROSS_SITE_POSTS:
+                    return False
+                site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+                if site:                                    # (browsers say so even where Origin is "null": no-referrer)
+                    return site == "cross-site"
+                origin = self.headers.get("Origin")
+                if origin is None:
+                    return False                            # (not a browser's request: no cookie to misuse)
+                host = urllib.parse.urlsplit(origin).netloc.lower()
+                return host not in {(self.headers.get("Host") or "").lower()} | self._web_hosts()
+
+            def _client_ip(self):
+                """Who's asking: the connecting address, or behind a proxy on a private address, the address it says
+                it forwarded for (X-Forwarded-For, last entry). Else everyone behind a proxy would share one lockout."""
+                ip = self.client_address[0]
+                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+                if fwd:
+                    try:
+                        if ipaddress.ip_address(ip.replace("::ffff:", "")).is_private:
+                            return str(ipaddress.ip_address(fwd))
+                    except ValueError:
+                        pass
+                return ip
+
+            def _ip_limited(self):
+                """The per-address limits are for visitors' addresses: not the LAN's, nor a proxy's that doesn't pass
+                on who it forwarded for (that would put everyone behind it under one limit)."""
+                try:
+                    a = ipaddress.ip_address(self._client_ip().replace("::ffff:", ""))
+                except ValueError:
+                    return True
+                return not (a.is_loopback or a.is_link_local or any(a in n for n in LAN_NETS))
+
+            def _ip_rate(self, what, limit, window=60.0):
+                """Count one request of this kind from this address: 0 if within limit a window, else seconds to wait."""
+                if not self._ip_limited():
+                    return 0
+                ip, now = self._client_ip(), time.monotonic()
+                with flock:
+                    q = recent_by_ip.setdefault((what, ip), collections.deque())
+                    while q and now - q[0] >= window:
+                        q.popleft()
+                    if len(q) >= limit:
+                        return max(1, int(q[0] + window - now + 1)) if q else int(window)
+                    q.append(now)
+                    if len(recent_by_ip) > 20000:           # (addresses gone quiet)
+                        for k in [k for k, d in recent_by_ip.items() if not d or now - d[-1] >= window]:
+                            del recent_by_ip[k]
+                return 0
+
+            def _locked_out(self):
+                """Too many wrong passwords, keys or tickets from this address lately: 429, at once."""
+                ip, now = self._client_ip(), time.monotonic()
+                with flock:
+                    q = failures.get(ip)
+                    while q and now - q[0] >= FAIL_WINDOW_S:
+                        q.popleft()
+                    locked = bool(q) and len(q) >= FAIL_LIMIT
+                if locked:
+                    self.close_connection = True
+                    self._send(429, '{"error":"too many failed attempts from your address: try again in a few minutes"}',
+                               headers={"Retry-After": str(FAIL_WINDOW_S)})
+                return locked
+
+            def _penalty(self):
+                """A wrong password, key or ticket: counted against this address (see _locked_out), and answered a
+                second late, without holding a request slot meanwhile (else 16 bad guesses a second would turn
+                everyone else away)."""
+                ip, now = self._client_ip(), time.monotonic()
+                with flock:
+                    failures.setdefault(ip, collections.deque(maxlen=FAIL_LIMIT * 2)).append(now)
+                    if len(failures) > 10000:               # (addresses gone quiet)
+                        for k in [k for k, q in failures.items() if not q or now - q[-1] >= FAIL_WINDOW_S]:
+                            del failures[k]
+                slots.release()
+                try:
+                    time.sleep(1.0)
+                finally:
+                    slots.acquire()
 
             def _token(self):
                 for part in (self.headers.get("Cookie") or "").split(";"):
@@ -5105,7 +9864,151 @@ class WebUI:
                         return False
                     return True
 
-            def _send(self, code, body, ctype="application/json", cookie=None, gz=False, cache_s=0):
+            def _body(self):
+                try:
+                    return json.loads(self._raw_body() or b"{}")
+                except ValueError:
+                    return None
+
+            def _tenant_admin(self, t):
+                """A tenant room's page: its own login, or the main admin's."""
+                if self._is_admin():
+                    return True
+                for part in (self.headers.get("Cookie") or "").split(";"):
+                    k, _, v = part.strip().partition("=")
+                    if k == "mr_tenant":
+                        with slock:
+                            e = tsessions.get(v)
+                            if e is not None and e[0] >= time.monotonic() and e[1] == t.key:
+                                return True
+                return False
+
+            def _tenant(self, t, sub, post):
+                """Everything under /{path}/: the tenant's page and API, scoped to that room only."""
+                path = sub.split("?")[0]
+                key, base = t.key, "/%s/" % t.path
+                if not post:
+                    if path.startswith(("/static/", "/icons/")):
+                        self.path = sub                         # shared files
+                        return self._get()
+                    if path in ("/", "/index.html"):
+                        gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                        return self._send(200, tpage[1] if gz else tpage[0], "text/html; charset=utf-8", gz=gz,
+                                          headers=DASHBOARD_HEADERS)
+                    if path == "/api/session":
+                        return self._send(200, json.dumps({"admin": self._tenant_admin(t), "login_enabled": True}))
+                    if path == "/api/state":
+                        t.web_last_request = time.monotonic()   # (the main loop refreshes it while it's being viewed)
+                        deadline = time.monotonic() + 1.5
+                        while not t.web_state and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        st = t.web_state
+                        with clock_:
+                            hit = tsnaps.get(key)
+                            if hit is None or hit[0] is not st:
+                                raw = json.dumps(st, default=str, separators=(",", ":")).encode()
+                                hit = tsnaps[key] = (st, raw, gzip.compress(raw, 5))
+                        gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                        return self._send(200, hit[2] if gz else hit[1], gz=gz)
+                    if path == "/api/map":
+                        gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                        return self._send(200, snap_bytes("web_map", gz), gz=gz)
+                    if path == "/api/welcome":
+                        if not self._tenant_admin(t):
+                            return self._send(401, '{"error":"log in first"}')
+                        return self._send(200, json.dumps({"welcome_new_members": bool(t.cfg.welcome_new_members),
+                                                           "welcome_message": str(t.cfg.welcome_message),
+                                                           "welcome_advert_hint": str(t.cfg.welcome_advert_hint)}))
+                    if path == "/api/chat":
+                        if not self._tenant_admin(t):
+                            return self._send(401, '{"error":"log in first"}')
+                        since = 0
+                        for kv in sub.partition("?")[2].split("&"):
+                            k, _, v = kv.partition("=")
+                            if k == "since" and v.isdigit():
+                                since = int(v)
+                        msgs = [dict(ts=ts, who=t.chat_label(a), room=(a == t.id.pub_key), text=txt)
+                                for ts, a, txt, to in list(t.posts) if to is None and ts > since]
+                        return self._send(200, json.dumps({"messages": msgs, "max_bytes": MAX_POST_TEXT_LEN}))
+                    return self._send(404, '{"error":"not found"}')
+                parts = path.strip("/").split("/")
+                if parts == ["api", "login"]:
+                    body = self._body() or {}
+                    if not check_web_password(str(body.get("password", "")), t.cfg.web_password_hash):
+                        self._penalty()
+                        return self._send(401, '{"error":"wrong password"}')
+                    tok = secrets.token_hex(24)
+                    with slock:
+                        now_m = time.monotonic()
+                        for k in [k for k, e in tsessions.items() if e[0] < now_m]:
+                            del tsessions[k]
+                        tsessions[tok] = (now_m + SESSION_S, key)
+                    return self._send(200, '{"ok":true}', cookie="mr_tenant=%s; HttpOnly; SameSite=Strict; Path=%s; Max-Age=%d" % (tok, base, SESSION_S))
+                if parts == ["api", "logout"]:
+                    with slock:
+                        for part in (self.headers.get("Cookie") or "").split(";"):
+                            k, _, v = part.strip().partition("=")
+                            if k == "mr_tenant":
+                                tsessions.pop(v, None)
+                    return self._send(200, '{"ok":true}', cookie="mr_tenant=; HttpOnly; SameSite=Strict; Path=%s; Max-Age=0" % base)
+                if not self._tenant_admin(t):                   # everything below changes things: this room's admins only
+                    return self._send(401, '{"error":"log in first"}')
+                if parts == ["api", "advert"]:
+                    body = self._body() or {}
+                    with slock:
+                        if time.monotonic() - t_last_advert.get(key, float("-inf")) < 10:
+                            return self._send(429, '{"error":"an advert was just sent: wait a few seconds"}')
+                        t_last_advert[key] = time.monotonic()
+                    events.put(("t_advert", key, bool(body.get("flood"))))
+                    return self._send(200, json.dumps({"ok": True, "flood": bool(body.get("flood")), "repeater": False}))
+                if parts == ["api", "welcome"]:
+                    try:
+                        updates = welcome_changes(self._body(), t.cfg.name, t.cfg)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
+                    events.put(("t_welcome", key, updates))
+                    return self._send(200, json.dumps({"ok": True, "updates": updates}))
+                if parts == ["api", "location"]:
+                    try:
+                        lat, lon = tenant_location(self._body() or {})
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
+                    events.put(("t_loc", key, lat, lon))
+                    return self._send(200, json.dumps({"ok": True, "lat": lat, "lon": lon}))
+                if parts == ["api", "chat"]:
+                    text = str((self._body() or {}).get("text", "")).strip()
+                    if not text:
+                        return self._send(400, '{"error":"empty message"}')
+                    if len(text.encode()) > MAX_POST_TEXT_LEN:
+                        return self._send(400, json.dumps({"error": "too long: %d bytes max" % MAX_POST_TEXT_LEN}))
+                    events.put(("t_say", key, text))
+                    return self._send(200, '{"ok":true}')
+                if len(parts) == 4 and parts[0] == "api" and (parts[1], parts[3]) in (
+                        ("members", "kick"), ("members", "ban"), ("members", "resync"), ("members", "route"), ("bans", "unban")):
+                    try:
+                        pub = bytes.fromhex(parts[2])
+                    except ValueError:
+                        return self._send(400, '{"error":"bad key"}')
+                    if len(pub) != 32:
+                        return self._send(400, '{"error":"bad key"}')
+                    if parts[3] == "route":
+                        try:
+                            reps = [(r.get("name") or "", r["hash"]) for r in (room.web_map or {}).get("repeaters", [])]
+                            hops = resolve_route(str((self._body() or {}).get("path", "")), reps)
+                        except ValueError as e:
+                            return self._send(400, json.dumps({"error": str(e)}))
+                        events.put(("t_act", key, "suggest", pub, hops))
+                        return self._send(200, json.dumps({"ok": True, "hops": [h.hex().upper() for h in hops]}))
+                    events.put(("t_act", key, parts[3], pub))   # applied to this room only, by the main loop
+                    return self._send(200, '{"ok":true}')
+                return self._send(404, '{"error":"not found"}')
+
+            def _tenant_of(self):
+                seg, _, rest = self.path.lstrip("/").partition("/")
+                t = room.web_tenants.get(seg.split("?")[0]) if seg else None
+                return t, rest
+
+            def _send(self, code, body, ctype="application/json", cookie=None, gz=False, cache_s=0, headers=None):
                 b = body if isinstance(body, bytes) else body.encode()
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
@@ -5117,7 +10020,9 @@ class WebUI:
                 if code == 503:
                     self.send_header("Retry-After", "1")
                 if cookie:
-                    self.send_header("Set-Cookie", cookie)
+                    self.send_header("Set-Cookie", cookie + ("; Secure" if self._https() else ""))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
                 self.end_headers()
                 try:
                     self.wfile.write(b)
@@ -5127,6 +10032,8 @@ class WebUI:
             def do_GET(self):
                 if self.path.startswith(("/icons/", "/static/")):
                     return self._get()                      # small, cacheable files: don't count toward the cap
+                if self.path.split("?")[0] == KAAS_PATH:
+                    return self._kaas()                     # a websocket: holds this thread, not a request slot
                 if not slots.acquire(blocking=False):
                     return self._send(503, '{"error":"busy"}')    # flood guard: at most 16 requests at once
                 try:
@@ -5135,6 +10042,18 @@ class WebUI:
                     slots.release()
 
             def do_POST(self):
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = -1
+                if not 0 <= n <= HTTP_MAX_BODY:
+                    self.close_connection = True
+                    return self._send(413 if n > 0 else 400, '{"error":"a request body is at most %d bytes"}' % HTTP_MAX_BODY)
+                if self._locked_out():
+                    return
+                if self._cross_site():
+                    return self._send(403, '{"error":"a request from another site"}')
+                self._raw_body()                            # (before a slot: a slow body only holds its own thread)
                 if not slots.acquire(blocking=False):
                     return self._send(503, '{"error":"busy"}')
                 try:
@@ -5142,10 +10061,237 @@ class WebUI:
                 finally:
                     slots.release()
 
+            def _tokens(self, name):
+                """A header's comma-separated tokens, lowercased, across every copy of it (a proxy may send two)."""
+                return {t.strip().lower() for v in (self.headers.get_all(name) or []) for t in v.split(",")} - {""}
+
+            def _kaas(self):
+                """KaaS: upgrade to a websocket for an API key (Authorization: Bearer ...), or for a web login's
+                one-time ?ticket= (browsers can't send Authorization on a websocket), then stream packets."""
+                hub = room.kaas
+                ticket = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("ticket", [""])[0]
+
+                def refuse(code, error, outcome, why):
+                    log.warning("websocket from %s refused (%d): %s", self.client_address[0], code, why)
+                    if ticket:
+                        hub.ticket_outcome(ticket, outcome)
+                    return self._send(code, json.dumps({"error": error}))
+                if "websocket" not in self._tokens("Upgrade") or "upgrade" not in self._tokens("Connection"):
+                    return refuse(426, "a websocket endpoint: see docs/api.md", "no_upgrade",
+                                  "no websocket upgrade in the request (Upgrade: %r, Connection: %r, %s): a reverse proxy "
+                                  "in front of pyMeshRoom has to pass the Upgrade and Connection headers on" % (
+                                      ", ".join(self.headers.get_all("Upgrade") or []),
+                                      ", ".join(self.headers.get_all("Connection") or []), self.request_version))
+                wkey = self.headers.get("Sec-WebSocket-Key") or ""
+                if not wkey or self.headers.get("Sec-WebSocket-Version") != "13":
+                    return refuse(400, "websocket version 13 only", "bad_version", "not a version 13 websocket "
+                                  "(Sec-WebSocket-Version: %r)" % self.headers.get("Sec-WebSocket-Version"))
+                if self._locked_out():
+                    return
+                wait = self._ip_rate("ws", IP_WS_PER_MIN)
+                if wait:
+                    return refuse(429, "too many connections from your address: try again in %d s" % wait, "too_many",
+                                  "over %d websockets a minute from %s" % (IP_WS_PER_MIN, self._client_ip()))
+                if not slots.acquire(blocking=False):
+                    return refuse(503, "busy", "busy", "too many requests at once")
+                try:
+                    key, why = self._kaas_key(), None
+                    if key is None and ticket:
+                        key, why = hub.redeem(ticket)
+                    if not hub.valid(key):
+                        if why:
+                            log.warning("websocket from %s refused (401): %s ticket", self.client_address[0], {
+                                "unknown": "an unknown or already used", "expired": "an expired",
+                                "refused": "web logins are off, or the key is banned: a"}[why])
+                            hub.ticket_outcome(ticket, why)
+                        self._penalty()
+                        return self._send(401, '{"error":"missing, unknown, revoked or expired API key or ticket"}')
+                    if key.get("web") and hub.web_ip_banned(self._client_ip()):
+                        return refuse(403, "this address is banned from this server", "refused", "a banned address")
+                    conn = KaasConn(hub, self.connection, self.rfile, key, self.client_address[0])
+                    conn.ip = self._client_ip()
+                    if conn.web and self._ip_limited() and hub.web_sessions_from(conn.ip) >= IP_WEB_SESSIONS:
+                        return refuse(429, "at most %d web sessions from one address: close another tab" % IP_WEB_SESSIONS,
+                                      "too_many", "%s has %d web sessions open" % (conn.ip, IP_WEB_SESSIONS))
+                    if not hub.add(conn):
+                        return refuse(503, "at most %d %s at once" % (
+                            (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients")),
+                            "full", "all %d %s are in use" % (
+                                (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients")))
+                    try:
+                        self.protocol_version = "HTTP/1.1"  # (this upgrade only) an HTTP/1.0 101 isn't valid, and
+                        self.send_response(101, "Switching Protocols")   # a proxy may refuse it or add Connection: close
+                        self.send_header("Upgrade", "websocket")
+                        self.send_header("Connection", "Upgrade")
+                        self.send_header("Sec-WebSocket-Accept", ws_accept(wkey))
+                        self.end_headers()
+                        self.close_connection = True
+                        conn.send_json(hub.hello(key))
+                    except BaseException:
+                        hub.drop(conn)                      # (the peer hung up mid-upgrade: its slot isn't kept)
+                        raise
+                    self.connection.settimeout(None)            # (an open websocket: its pings keep watch)
+                    if ticket:
+                        hub.ticket_outcome(ticket, "connected")
+                    if not conn.web:
+                        events.put(("kaas_used", key["id"], now_s()))
+                finally:
+                    slots.release()
+                log.info("API client %s connected (key %s)", self.client_address[0], key["id"])
+                conn.run()
+                log.info("API client %s disconnected (key %s)", self.client_address[0], key["id"])
+
+            def _kaas_key(self):
+                auth = self.headers.get("Authorization") or ""
+                return room.kaas.find(auth[7:].strip()) if auth[:7].lower() == "bearer " else None
+
+            def _web_hosts(self):
+                """The host names a web login may be signed for: this server's own address as this connection reached
+                it (ip:port), and the names the admin lists in web_hosts (a domain, or a proxy's). Never the request's
+                Host header by itself: another server could relay its visitors' logins here under its own name."""
+                hosts = {str(h).strip().lower() for h in (cfg.web_hosts or [])}
+                ip, port = self.connection.getsockname()[:2]
+                ip = ip[7:] if ip.startswith("::ffff:") else ip
+                names = [("[%s]" % ip) if ":" in ip else ip] + (["localhost"] if ip in ("127.0.0.1", "::1") else [])
+                for n in names:
+                    hosts.add("%s:%d" % (n, port))
+                    if port in (80, 443):
+                        hosts.add(n)
+                hosts.discard("")
+                return hosts
+
+            def _page_unlocked(self):
+                """MeshCore Web's page password: none set, or this browser has a page session made under it."""
+                h = cfg.web_page_password
+                if not h:
+                    return True
+                for part in (self.headers.get("Cookie") or "").split(";"):
+                    k, _, v = part.strip().partition("=")
+                    if k == "mr_web" and web_page_session_ok(v, h):
+                        return True
+                return False
+
+            def _page_password_ok(self, pw):
+                if self._page_unlocked():
+                    return True
+                if pw and check_web_password(str(pw), cfg.web_page_password):
+                    return True
+                self._penalty()
+                return False
+
+            def _web_unlock_page(self, error=""):
+                msg = '<p class="err">%s</p>' % error if error else ""
+                html = WEB_UNLOCK_HTML.replace("{error}", msg)
+                return self._send(401 if error else 200, html, "text/html; charset=utf-8",
+                                  headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+                                           "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+                                           "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"})
+
+            def _web_unlock(self):
+                """POST /meshcore-web/unlock: the page password, from the form. Right: a page session (cookie), then
+                the app; wrong: the form again, after a second."""
+                n = int(self.headers.get("Content-Length") or 0)
+                form = urllib.parse.parse_qs(self._raw_body()[:4096].decode(errors="replace")) if n else {}
+                pw = (form.get("password") or [""])[0]
+                if not cfg.web_page_password or not check_web_password(pw, cfg.web_page_password):
+                    self._penalty()
+                    return self._web_unlock_page("That isn't the password." if cfg.web_page_password else "")
+                tok = web_page_session(cfg.web_page_password)
+                self.send_response(303)
+                self.send_header("Location", "./")
+                self.send_header("Set-Cookie", "mr_web=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=%d%s" % (
+                    tok, WEB_PAGE_SESSION_S, "; Secure" if self._https() else ""))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def _web_public(self, path):
+                """POST /api/v1/web/challenge and /api/v1/web/login: logging in to MeshCore Web by signing with the
+                node's private key, which never leaves the browser. Any origin may ask (CORS: *); no cookies."""
+                cors = {"Access-Control-Allow-Origin": "*"}
+                body = self._body()
+                if room.kaas.web_ip_banned(self._client_ip()):
+                    return self._send(403, '{"error":"this address is banned from this server"}', headers=cors)
+                if cfg.web_login and not self._page_password_ok((body or {}).get("page_password")):
+                    return self._send(401, json.dumps({"error": "MeshCore Web on this server has a password",
+                                                       "page_password": True}), headers=cors)
+                if path.endswith("/challenge"):
+                    if not cfg.web_login:
+                        return self._send(403, '{"error":"web logins are off on this server"}', headers=cors)
+                    wait = self._ip_rate("login", IP_LOGINS_PER_MIN)
+                    if wait:
+                        return self._send(429, json.dumps({"error": "too many logins from your address: try again in "
+                                                                    "%d s" % wait, "retry_after": wait}),
+                                          headers=dict(cors, **{"Retry-After": str(wait)}))
+                    ch = room.kaas.new_challenge()
+                    if ch is None:
+                        return self._send(503, '{"error":"too many logins at once: try again shortly"}', headers=cors)
+                    return self._send(200, json.dumps({"challenge": ch, "expires_in": WEB_CHALLENGE_S,
+                                                       "label": WEB_LOGIN_LABEL}), headers=cors)
+                code, answer = room.kaas.web_login(body, self._web_hosts(), self._client_ip())
+                if code == 200:
+                    log.info("web login %s (%s) from %s: %s", answer["state"], (body or {}).get("pub", "")[:8],
+                             self.client_address[0], (body or {}).get("name", ""))
+                return self._send(code, json.dumps(answer), headers=cors)
+
+            def _web_ticket(self):
+                """POST /api/v1/web/ticket {"ticket"}: what became of a web login's websocket, for a browser whose
+                websocket didn't open (it can't see why itself). The ticket is the credential (CORS: *)."""
+                body = self._body()
+                ticket = str((body or {}).get("ticket", "")) if isinstance(body, dict) else ""
+                return self._send(200, json.dumps({"outcome": room.kaas.ticket_status(ticket)}),
+                                  headers={"Access-Control-Allow-Origin": "*"})
+
+            def do_OPTIONS(self):
+                """CORS preflight, for the web login endpoints only."""
+                if self.path.split("?")[0] not in (WEB_PATH + "/challenge", WEB_PATH + "/login", WEB_PATH + "/ticket"):
+                    return self._send(404, '{"error":"not found"}')
+                self._send(204, b"", headers={"Access-Control-Allow-Origin": "*",
+                                              "Access-Control-Allow-Methods": "POST",
+                                              "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                                              "Access-Control-Allow-Private-Network": "true",
+                                              "Access-Control-Max-Age": "600"})
+
             def _get(self):
+                t, rest = self._tenant_of()
+                if t is not None:
+                    if "/" not in self.path.lstrip("/"):            # /path -> /path/ (the page uses relative URLs)
+                        self.send_response(301)
+                        self.send_header("Location", "/%s/" % t.path)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    return self._tenant(t, "/" + rest, False)
                 path = self.path.split("?")[0]
+                if path == "/api/tenants":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    return self._send(200, json.dumps({"rooms": room.web_tenant_rows, "max": TENANT_MAX}))
                 if path == "/api/session":
                     return self._send(200, json.dumps({"admin": self._is_admin(), "login_enabled": bool(cfg.web_password)}))
+                if path == WEB_PATH + "/users":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    hub = room.kaas
+                    return self._send(200, json.dumps({
+                        "enabled": bool(cfg.web_login), "unknown_key_message": str(cfg.web_unknown_key_message or ""),
+                        "motd_enabled": bool(cfg.web_motd_enabled), "motd": str(cfg.web_motd or ""),
+                        "hosts": [str(h) for h in (cfg.web_hosts or [])],
+                        "refused_hosts": [dict(host=h, count=v[0], last=v[1]) for h, v in list(hub.refused_hosts.items())
+                                          if h not in [str(x).lower() for x in (cfg.web_hosts or [])]],
+                        "page_password": bool(cfg.web_page_password), "giphy_key": bool(cfg.web_giphy_key),
+                        "backlog": hub.backlog_info(),
+                        "max": int(cfg.web_max_clients), "connected": sum(1 for c in hub.conns if c.web),
+                        "users": hub.web_rows(), "banned": [b for b in (cfg.web_banned or []) if isinstance(b, dict)],
+                        "banned_ips": [b for b in (cfg.web_banned_ips or []) if isinstance(b, dict)]}))
+                if path == KAAS_PATH + "/keys":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    hub = room.kaas
+                    return self._send(200, json.dumps({"keys": hub.key_rows(), "path": KAAS_PATH, "max": KAAS_MAX_KEYS,
+                                                       "send_burst": int(cfg.kaas_send_burst),
+                                                       "send_window_s": float(cfg.kaas_send_window_s),
+                                                       "airtime_pct": room.air.rates()[1]["kaas"] * 100.0,
+                                                       "stats": dict(hub.stats)}))
                 if path.startswith("/static/"):
                     # files in data_dir/static (e.g. a local copy of Leaflet); Leaflet falls back to the CDN
                     root = os.path.realpath(os.path.join(cfg.data_dir, "static"))
@@ -5174,7 +10320,25 @@ class WebUI:
                     return self._send(404, '{"error":"not found"}')
                 if path in ("/", "/index.html"):
                     gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
-                    return self._send(200, page[1] if gz else page[0], "text/html; charset=utf-8", gz=gz)
+                    return self._send(200, page[1] if gz else page[0], "text/html; charset=utf-8", gz=gz,
+                                      headers=DASHBOARD_HEADERS)
+                if path == "/meshcore-web":
+                    self.send_response(301)                     # (the page works out the server from its own address)
+                    self.send_header("Location", "meshcore-web/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if path in ("/meshcore-web/", "/meshcore-web/index.html"):
+                    if not self._page_unlocked():
+                        return self._web_unlock_page()
+                    if not os.path.isfile(MESHCORE_WEB_FILE):
+                        return self._send(404, '{"error":"MeshCore Web isn\'t built: run node build.mjs in web/"}')
+                    _, raw, gzd = cached_file(MESHCORE_WEB_FILE, True)
+                    gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                    return self._send(200, gzd if gz else raw, "text/html; charset=utf-8", gz=gz,
+                                      headers={"Content-Security-Policy": "frame-ancestors 'none'",   # it holds a key:
+                                               "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
+                                               "Referrer-Policy": "no-referrer"})                 # never framed
                 if path == "/api/state":
                     note_viewer(self.path.partition("?")[2], self._is_admin())
                     fresh = time.monotonic() - room.web_last_request > 20
@@ -5217,6 +10381,10 @@ class WebUI:
                     msgs = [dict(ts=ts, who=room.chat_label(a), room=(a == room.id.pub_key), text=txt)
                             for ts, a, txt, to in posts if to is None and ts > since]
                     return self._send(200, json.dumps({"messages": msgs, "max_bytes": MAX_POST_TEXT_LEN}))
+                if path == "/api/companion":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    return self._send(200, json.dumps(room.web_vc_admin))
                 if path == "/api/welcome":
                     if not self._is_admin():
                         return self._send(401, '{"error":"log in first"}')
@@ -5229,16 +10397,25 @@ class WebUI:
                 self._send(404, '{"error":"not found"}')
 
             def _post(self):
+                t, rest = self._tenant_of()
+                if t is not None:
+                    return self._tenant(t, "/" + rest, True)
+                if self.path.split("?")[0] == WEB_PATH + "/ticket":
+                    return self._web_ticket()
+                if self.path.split("?")[0] in (WEB_PATH + "/challenge", WEB_PATH + "/login"):
+                    return self._web_public(self.path.split("?")[0])
+                if self.path.split("?")[0] == "/meshcore-web/unlock":
+                    return self._web_unlock()
                 parts = self.path.strip("/").split("/")
                 if parts == ["api", "login"]:
                     if not cfg.web_password:
                         return self._send(403, '{"error":"admin login is off: set web_password in the config"}')
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         body = {}
                     if not hmac.compare_digest(str(body.get("password", "")).encode(), str(cfg.web_password).encode()):
-                        time.sleep(1.0)                         # slow down guessing
+                        self._penalty()
                         return self._send(401, '{"error":"wrong password"}')
                     tok = secrets.token_hex(24)
                     with slock:
@@ -5254,9 +10431,141 @@ class WebUI:
                     return self._send(200, '{"ok":true}', cookie="mr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 if not self._is_admin():                        # everything below changes things: admins only
                     return self._send(401, '{"error":"log in first"}')
+                if parts == ["api", "v1", "kaas", "keys"]:
+                    if len(room.kaas.keys()) >= KAAS_MAX_KEYS:
+                        return self._send(409, json.dumps({"error": "the limit is %d API keys" % KAAS_MAX_KEYS}))
+                    try:
+                        spec = kaas_key_spec(self._body())
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
+                    token, entry = room.kaas.new_key(spec)
+                    events.put(("kaas_key_add", entry))             # saved (hash only) by the main loop
+                    return self._send(200, json.dumps({"ok": True, "id": entry["id"], "token": token}))
+                if parts == ["api", "v1", "web", "settings"]:
+                    body = self._body() or {}
+                    change = {k: body[k] for k in ("web_login",) if isinstance(body.get(k), bool)}
+                    if "web_hosts" in body:
+                        hl = body["web_hosts"]
+                        if not isinstance(hl, list) or len(hl) > 16 or not all(
+                                isinstance(h, str) and re.fullmatch(r"[A-Za-z0-9.\-:\[\]]{1,100}", h.strip()) for h in hl):
+                            return self._send(400, '{"error":"host names: up to 16, like mesh.example.com or 10.0.0.5:8081"}')
+                        change["web_hosts"] = sorted({h.strip().lower() for h in hl})
+                    if "motd_enabled" in body and isinstance(body["motd_enabled"], bool):
+                        change["web_motd_enabled"] = body["motd_enabled"]
+                    if "motd" in body:
+                        t = body["motd"]
+                        if not isinstance(t, str) or len(t) > 1000:
+                            return self._send(400, '{"error":"the message of the day: at most 1000 characters"}')
+                        change["web_motd"] = t.replace("\r\n", "\n").strip()
+                    if "unknown_key_message" in body:
+                        t = body["unknown_key_message"]
+                        if not isinstance(t, str) or not t.strip() or len(t) > 200:
+                            return self._send(400, '{"error":"the unknown key message: 1 to 200 characters"}')
+                        change["web_unknown_key_message"] = " ".join(t.split())
+                    if "page_password" in body:
+                        pw = body["page_password"]
+                        if not isinstance(pw, str) or (pw and not 4 <= len(pw) <= 64):
+                            return self._send(400, '{"error":"page password: 4 to 64 characters, or empty for none"}')
+                        change["web_page_password"] = hash_web_password(pw) if pw else ""   # (hashed here: never stored)
+                    if "giphy_key" in body:
+                        k = body["giphy_key"]
+                        if not isinstance(k, str) or not re.fullmatch(r"[A-Za-z0-9]{0,64}", k.strip()):
+                            return self._send(400, '{"error":"a Giphy API key is letters and digits"}')
+                        change["web_giphy_key"] = k.strip()
+                    if "web_backlog_mqtt" in body and isinstance(body["web_backlog_mqtt"], bool):
+                        change["web_backlog_mqtt"] = body["web_backlog_mqtt"]
+                    if "web_backlog_days" in body:
+                        n = body["web_backlog_days"]
+                        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                            return self._send(400, '{"error":"backlog days: a whole number, 0 for none"}')
+                        change["web_backlog_days"] = n
+                    if "web_max_clients" in body:
+                        n = body["web_max_clients"]
+                        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 256:
+                            return self._send(400, '{"error":"web_max_clients: 0 to 256"}')
+                        change["web_max_clients"] = n
+                    if not change:
+                        return self._send(400, '{"error":"nothing to change"}')
+                    events.put(("kaas_web_admin", "settings", change))
+                    return self._send(200, '{"ok":true}')
+                if len(parts) == 6 and parts[:4] == ["api", "v1", "web", "users"] and \
+                        parts[5] in ("allow", "unallow", "kick", "ban", "unban", "purge", "delete"):
+                    try:
+                        pub = bytes.fromhex(parts[4])
+                    except ValueError:
+                        pub = b""
+                    if len(pub) != PUB_KEY_SIZE:
+                        return self._send(400, '{"error":"a 32-byte public key in hex"}')
+                    body = self._body() or {}
+                    name = str(body.get("name", ""))[:32]
+                    if parts[5] == "ban":
+                        by_key, by_ip = body.get("key", True) is not False, body.get("ip") is True
+                        ip = room.kaas.wusers.get(pub.hex(), {}).get("ip") if by_ip else None
+                        if by_ip and not ip:
+                            return self._send(400, '{"error":"no address is known for that key"}')
+                        if not (by_key or by_ip):
+                            return self._send(400, '{"error":"ban the key, the address, or both"}')
+                        if by_ip:
+                            events.put(("kaas_web_admin", "ban_ip", ip, name))
+                        if by_key:
+                            events.put(("kaas_web_admin", "ban", pub.hex(), name))
+                        return self._send(200, json.dumps({"ok": True, "ip": ip}))
+                    events.put(("kaas_web_admin", parts[5], pub.hex(), name))
+                    return self._send(200, '{"ok":true}')
+                if parts[:4] == ["api", "v1", "web", "ips"] and len(parts) == 6 and parts[5] in ("ban", "unban"):
+                    try:
+                        ip = str(ipaddress.ip_address(urllib.parse.unquote(parts[4])))
+                    except ValueError:
+                        return self._send(400, '{"error":"an IP address"}')
+                    events.put(("kaas_web_admin", parts[5] + "_ip", ip, str((self._body() or {}).get("name", ""))[:32]))
+                    return self._send(200, '{"ok":true}')
+                if len(parts) == 6 and parts[:4] == ["api", "v1", "kaas", "keys"] and parts[5] == "revoke":
+                    if room.kaas.key_by_id(parts[4]) is None:
+                        return self._send(404, '{"error":"no such key"}')
+                    events.put(("kaas_key_del", parts[4]))          # removed, and its connections closed, by the main loop
+                    return self._send(200, '{"ok":true}')
+                if parts == ["api", "tenants"]:
+                    if len(room.web_tenants) >= TENANT_MAX:
+                        return self._send(409, json.dumps({"error": "the limit is %d tenant rooms" % TENANT_MAX}))
+                    keys = {x.id.pub_key for x in room.web_tenants.values()} | room.own_node_keys()
+                    try:
+                        spec = tenant_spec(self._body(), set(room.web_tenants), keys)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e) or "bad request"}))
+                    events.put(("t_create", spec))                  # created by the main loop
+                    return self._send(200, json.dumps({"ok": True, "path": spec["path"]}))
+                if len(parts) == 4 and parts[:2] == ["api", "tenants"] and parts[3] == "location":
+                    key = parts[2].upper()
+                    if not any(x.key == key for x in room.web_tenants.values()):
+                        return self._send(404, '{"error":"no such tenant room"}')
+                    try:
+                        lat, lon = tenant_location(self._body() or {})
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
+                    events.put(("t_loc", key, lat, lon))
+                    return self._send(200, json.dumps({"ok": True, "lat": lat, "lon": lon}))
+                if len(parts) == 4 and parts[:2] == ["api", "tenants"] and parts[3] in ("delete", "password"):
+                    key = parts[2].upper()
+                    if not any(x.key == key for x in room.web_tenants.values()):
+                        return self._send(404, '{"error":"no such tenant room"}')
+                    body = self._body() or {}
+                    if parts[3] == "delete":
+                        if not hmac.compare_digest(str(body.get("password", "")).encode(), str(cfg.web_password).encode()):
+                            self._penalty()
+                            return self._send(403, '{"error":"wrong admin password: the room was not deleted"}')
+                        events.put(("t_delete", key))
+                    else:
+                        pw = str(body.get("web_password", ""))
+                        if len(pw) < 6:
+                            return self._send(400, '{"error":"web UI password: at least 6 characters"}')
+                        events.put(("t_webpw", key, hash_web_password(pw)))
+                    with slock:                                 # either way, its logged-in sessions end now
+                        for k in [k for k, e in tsessions.items() if e[1] == key]:
+                            del tsessions[k]
+                    return self._send(200, '{"ok":true}')
                 if parts == ["api", "observer"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         return self._send(400, '{"error":"invalid JSON"}')
                     bool_keys = ("observer_enabled", "observer_status", "observer_packets", "observer_rx",
@@ -5269,9 +10578,23 @@ class WebUI:
                             updates[key] = body[key]
                     if "observer_iata" in body:
                         iata = str(body["observer_iata"]).strip().upper()
-                        if len(iata) != 3 or any(c < "A" or c > "Z" for c in iata):
+                        if iata and not valid_iata(iata):
                             return self._send(400, '{"error":"IATA must be exactly three letters"}')
                         updates["observer_iata"] = iata
+                    if "observer_identity" in body:
+                        who = str(body["observer_identity"] or "")
+                        if who and who not in {c["id"] for c in room.observer_choices()}:
+                            return self._send(400, '{"error":"choose the virtual repeater or one of the rooms"}')
+                        updates["observer_identity"] = who
+                    if updates.get("observer_enabled", cfg.observer_enabled) and \
+                            updates.get("observer_identity", cfg.observer_identity) not in \
+                            {c["id"] for c in room.observer_choices()}:
+                        return self._send(400, '{"error":"choose who the observer reports as first: the virtual '
+                                               'repeater or a room (with neither, it can\'t be enabled)"}')
+                    if updates.get("observer_enabled", cfg.observer_enabled) and \
+                            not valid_iata(updates.get("observer_iata", cfg.observer_iata)):
+                        return self._send(400, '{"error":"set the IATA region code first: your nearest airport, like '
+                                               'SJC (everything the observer publishes is filed under it)"}')
                     if "observer_queue_max" in body:
                         qmax = body["observer_queue_max"]
                         if isinstance(qmax, bool) or not isinstance(qmax, int) or not 10 <= qmax <= 10000:
@@ -5286,37 +10609,16 @@ class WebUI:
                         return self._send(400, '{"error":"no observer settings supplied"}')
                     events.put(("observer_config", updates))     # persisted and applied by the main loop
                     return self._send(200, json.dumps({"ok": True, "updates": updates}))
-                if parts == ["api", "welcome"]:
+                if parts == ["api", "welcome"]:                # (the default for rooms without their own)
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
-                    except ValueError:
-                        return self._send(400, '{"error":"invalid JSON"}')
-                    updates = {}
-                    if "welcome_new_members" in body:
-                        if not isinstance(body["welcome_new_members"], bool):
-                            return self._send(400, '{"error":"welcome_new_members must be true or false"}')
-                        updates["welcome_new_members"] = body["welcome_new_members"]
-                    for key in ("welcome_message", "welcome_advert_hint"):
-                        if key in body:
-                            if not isinstance(body[key], str):
-                                return self._send(400, json.dumps({"error": "%s must be text" % key}))
-                            updates[key] = body[key]
-                    if not updates:
-                        return self._send(400, '{"error":"no welcome settings supplied"}')
-                    enabled = updates.get("welcome_new_members", bool(cfg.welcome_new_members))
-                    message = updates.get("welcome_message", str(cfg.welcome_message))
-                    hint = updates.get("welcome_advert_hint", str(cfg.welcome_advert_hint))
-                    if enabled and message:
-                        rendered = message.replace("{room}", str(cfg.name))
-                        if hint:
-                            rendered += " " + hint.replace("{room}", str(cfg.name))
-                        if len(rendered.encode()) > MAX_POST_TEXT_LEN:
-                            return self._send(400, json.dumps({"error": "welcome DM is too long after {room} is replaced (maximum %d UTF-8 bytes)" % MAX_POST_TEXT_LEN}))
+                        updates = welcome_changes(json.loads(self._raw_body() or b"{}"), cfg.name, cfg)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
                     events.put(("welcome_config", updates))      # main loop persists updates before a member can receive them
                     return self._send(200, json.dumps({"ok": True, "updates": updates}))
                 if parts == ["api", "mqtt"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                         ch = mqtt_changes(body)
                     except (ValueError, TypeError) as e:
                         return self._send(400, json.dumps({"error": str(e) or "bad request"}))
@@ -5324,9 +10626,18 @@ class WebUI:
                         return self._send(400, '{"error":"nothing to change"}')
                     events.put(("mqtt_cfg", ch))                    # applied (and saved) by the main loop
                     return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
+                if parts == ["api", "airtime"]:
+                    try:
+                        ch = airtime_changes(json.loads(self._raw_body() or b"{}"))
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e) or "bad request"}))
+                    if not ch:
+                        return self._send(400, '{"error":"nothing to change"}')
+                    events.put(("air_cfg", ch))                     # applied (and saved) by the main loop
+                    return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "repeater"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                         if "private_key" in body and room.cfg.repeater_enabled:
                             return self._send(409, '{"error":"disable the virtual repeater before importing a private key"}')
                         ch = repeater_changes(body)
@@ -5336,35 +10647,41 @@ class WebUI:
                         return self._send(400, '{"error":"nothing to change"}')
                     events.put(("rpt_cfg", ch))                     # applied (and saved) by the main loop
                     return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
+                if parts == ["api", "companion"]:
+                    try:
+                        body = json.loads(self._raw_body() or b"{}")
+                        if room.cfg.companion_enabled and set(body) - {"enabled"}:
+                            return self._send(409, '{"error":"turn the virtual companion off to change its settings"}')
+                        ch = companion_changes(body)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e) or "bad request"}))
+                    if not ch:
+                        return self._send(400, '{"error":"nothing to change"}')
+                    events.put(("vc_cfg", ch))                      # applied (and saved) by the main loop
+                    return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "advert"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         body = {}
+                    flood, node = bool(body.get("flood")), str(body.get("node") or "repeater")
+                    if node not in ("repeater", "companion"):
+                        return self._send(400, '{"error":"node: repeater or companion (rooms advertise from their page)"}')
+                    if not (room.web_state.get(node) or {}).get("enabled"):
+                        return self._send(409, json.dumps({"error": "the virtual %s is off" % node}))
                     with slock:
                         if time.monotonic() - last_advert[0] < 10:
                             return self._send(429, '{"error":"an advert was just sent: wait a few seconds"}')
                         last_advert[0] = time.monotonic()
-                    flood = bool(body.get("flood"))
-                    events.put(("advert", flood))                   # sent by the main loop
-                    rpt = bool((room.web_state.get("repeater") or {}).get("enabled"))
-                    return self._send(200, json.dumps({"ok": True, "flood": flood, "repeater": rpt}))
+                    events.put(("advert", flood, node))             # sent by the main loop
+                    return self._send(200, json.dumps({"ok": True, "flood": flood, "node": node}))
                 if parts == ["api", "chat"]:
-                    try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
-                    except ValueError:
-                        body = {}
-                    text = str(body.get("text", "")).strip()
-                    if not text:
-                        return self._send(400, '{"error":"empty message"}')
-                    if len(text.encode()) > MAX_POST_TEXT_LEN:
-                        return self._send(400, json.dumps({"error": "too long: %d bytes max" % MAX_POST_TEXT_LEN}))
-                    events.put(("say", text))                       # posted + pushed by the main loop
+                    return self._send(404, '{"error":"the server isn\'t a room: post from a Room\'s page"}')
                     return self._send(200, '{"ok":true}')
                 if len(parts) == 4 and parts[:2] == ["api", "members"] and parts[3] == "route":
                     try:
                         pub = bytes.fromhex(parts[2])
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                         reps = [(r.get("name") or "", r["hash"]) for r in (room.web_map or {}).get("repeaters", [])]
                         hops = resolve_route(str(body.get("path", "")), reps)
                     except ValueError as e:
@@ -5384,6 +10701,12 @@ class WebUI:
                 self._send(404, '{"error":"not found"}')
 
         class Server(http.server.ThreadingHTTPServer):
+            def process_request(self, request, client_address):
+                if threading.active_count() >= HTTP_MAX_THREADS:   # (a flood of connections: refuse, don't spawn)
+                    self.shutdown_request(request)
+                    return
+                super().process_request(request, client_address)
+
             def handle_error(self, request, client_address):
                 # clients disconnecting early is routine: no traceback. Anything else is logged briefly.
                 exc = sys.exc_info()[1]
@@ -5450,6 +10773,8 @@ def main():
     room = RoomServer(cfg, modem, identity, store)
     room.events_put = events.put
     room.events_q = events
+    room.companion_apply()                                  # (its TCP port needs the event queue)
+    room.tenants_load()
     observer = None
 
     def start_observer():
@@ -5457,17 +10782,36 @@ def main():
         nonlocal observer
         if observer or not cfg.observer_enabled:
             return
+        if not valid_iata(cfg.observer_iata):
+            log.error("MQTT observer not started: set its IATA region code (your nearest airport, like SJC) on the "
+                      "dashboard's Observer card")
+            return
+        who = room.observer_who()
+        if who is None:
+            log.error("MQTT observer not started: choose who it reports as (the virtual repeater, or a room) on the "
+                      "dashboard's Observer card")
+            return
         try:
             # Kept optional: installations that do not opt in never import
             # paho-mqtt and retain their existing MeshRoom behavior.
             from meshroom_observer import ObserverBridge
-            observer = ObserverBridge(cfg, identity)
+            observer = ObserverBridge(cfg, who[0], name=who[1])
             room.observer = observer
-            log.info("MQTT observer enabled for %s", observer.iata)
+            log.info("MQTT observer enabled for %s, as %s (%s)", observer.iata, who[1], hexs(who[0].pub_key[:4]))
         except Exception as e:
             # An observer failure must never prevent the radio room from
             # starting.  The error is visible in the normal MeshRoom log.
             log.error("MQTT observer disabled: %s", e)
+    def observer_sync():
+        """Stop the observer when it's turned off or its identity changed or went away; start it as the chosen one."""
+        nonlocal observer
+        who = room.observer_who() if cfg.observer_enabled else None
+        if observer and (who is None or observer.public_key != hexs(who[0].pub_key) or observer.origin != who[1]):
+            observer.close()
+            observer = room.observer = None
+            log.info("MQTT observer stopped%s", "" if who is None else ": now reporting as %s" % who[1])
+        if who is not None and not observer:
+            start_observer()
     start_observer()
     room.mqtt_apply()
     if cfg.web_port:
@@ -5480,7 +10824,7 @@ def main():
     room.apply_radio()
     if room.radio:
         log.info("radio: %.3f MHz, BW %.1f kHz, SF%d, CR4/%d", room.radio[0] / 1e6, room.radio[1] / 1e3, room.radio[2], room.radio[3])
-    log.info("room %r, public key %s", cfg.name, hexs(identity.pub_key))
+    log.info("host %r, public key %s, %d room(s)", cfg.name, hexs(identity.pub_key), len(room.tenants))
 
     def stop(*_):
         events.put(("quit",))
@@ -5507,7 +10851,7 @@ def main():
             getattr(room, "force_resync" if kind == "resync" else kind)(ev[1])
             room.web_dirty = True                           # refresh the dashboard once the radio is idle
         elif kind == "advert":
-            room.dashboard_advert(ev[1])
+            room.dashboard_advert(ev[1], ev[2] if len(ev) > 2 else "repeater")
         elif kind == "say":
             room.room_say(ev[1])
         elif kind == "suggest":
@@ -5521,21 +10865,33 @@ def main():
                 room.cfg.set(k, v)                          # saved to the config file, in place
             room.mqtt_apply(restart=reconnect)
             room.web_dirty = True
+        elif kind == "air_cfg":
+            for k, v in ev[1].items():
+                room.cfg.set(k, v)
+            room.web_dirty = True
         elif kind == "rpt_cfg":
             for k, v in ev[1].items():
                 room.cfg.set(k, v)
             room.repeater_apply()
+            observer_sync()                                 # (it may report as the repeater)
             room.web_dirty = True
+        elif kind in ("vc_cmd", "vc_conn", "vc_disc", "vc_cfg"):
+            room.companion_event(ev)
+        elif kind.startswith("t_"):
+            room.tenant_event(ev)
+            if kind == "t_delete":
+                observer_sync()                             # (it may report as that room)
+        elif kind.startswith("kaas_"):
+            room.kaas.event(ev)
         elif kind == "web_wake":
             room.web_dirty = True
             room.next_map = 0.0                             # first view after idle: the map part too
         elif kind == "observer_config":
             for key, value in ev[1].items():
                 cfg.set(key, value)
+            observer_sync()
             if observer:
                 observer.refresh()                            # worker owns all network lifecycle changes
-            else:
-                start_observer()
             room.web_dirty = True
         elif kind == "welcome_config":
             for key, value in ev[1].items():
@@ -5584,10 +10940,15 @@ def main():
         except Exception:
             log.exception("main loop")
     log.info("shutting down: saving state")
+    room.kaas.close_all()
     if room.feed:
         room.feed.stop()                                    # stop inbound producer before serial/state teardown
     room.flush()
     room.flush_topology()
+    if room.vc is not None:
+        room.vc.close()                                     # saves its contacts, closes its TCP port
+    for t in room.tenants.values():
+        t.close()
     if observer:
         observer.close()
     store.close()                                           # waits for the writer thread to finish

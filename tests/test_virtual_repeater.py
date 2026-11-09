@@ -9,7 +9,7 @@ from meshroom import DEFAULT_CONFIG, Packet, PT_ADVERT, RepeaterIdentity, Virtua
 
 class VirtualRepeaterTests(unittest.TestCase):
     def relay(self, **overrides):
-        cfg = SimpleNamespace(repeater_relay=True, repeater_airtime_pct=100,
+        cfg = SimpleNamespace(repeater_relay=True, tx_weight_relay=100,
                               repeater_regions=[], repeater_scope_mode="allow",
                               repeater_loop_detect="minimal")
         for key, value in overrides.items():
@@ -52,7 +52,7 @@ class VirtualRepeaterTests(unittest.TestCase):
                                     "airtime_cap": 25, "loop_detect": "strict"})
         self.assertEqual(changes["repeater_enabled"], False)
         self.assertEqual(changes["repeater_relay"], True)
-        self.assertEqual(changes["repeater_airtime_pct"], 25)
+        self.assertEqual(changes["tx_weight_relay"], 25)
         self.assertEqual(changes["repeater_loop_detect"], "strict")
 
     def test_admin_changes_reject_invalid_scope(self):

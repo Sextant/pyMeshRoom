@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshroom-kaas"
+version = "0.1.0"
+description = "Python client for pyMeshRoom's KaaS API: a MeshCore radio as a websocket service"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["cryptography"]
+
+[tool.setuptools]
+packages = ["meshroom_kaas"]

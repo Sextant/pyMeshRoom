@@ -1,0 +1,12 @@
+{
+  "name": "meshcore-web",
+  "//": "the source of pyMeshRoom's MeshCore Web; node build.mjs writes ../meshroom/data/meshcore-web.html",
+  "version": "0.1.0",
+  "description": "A MeshCore chat client in the browser, for pyMeshRoom's KaaS API",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "node build.mjs"
+  }
+}

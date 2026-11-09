@@ -25,10 +25,11 @@ See pyMeshRoom operating in the wild:
 
 | Capability | What it does | Default |
 | --- | --- | --- |
-| RF Room Server | Persistent room, routing, delivery planning, map, dashboard, and admin tools. | On |
+| Rooms | MeshCore room servers on the radio, each with its own key, members, passwords and admin page. The server itself is only the host: it has no room of its own. | None until you create one |
 | MQTT Observer | Publishes copies of locally received RF packets to one or more regional MeshCore observer brokers. | Off |
 | MQTT Augmentation | Read-only inbound MQTT observations can confirm deliveries and enrich map/activity data. | Off |
 | Virtual Repeater | A separate optional repeater identity sharing the room's KISS modem and TX scheduler. | Off |
+| Virtual Companion | A chat node on the room's radio that MeshCore apps connect to over TCP, like a WiFi companion. | Off |
 
 ### The three optional subsystems
 
@@ -38,9 +39,11 @@ See pyMeshRoom operating in the wild:
 
 **Virtual Repeater — RF.** Give the Pi a second MeshCore identity without a second serial connection. It is disabled by default; relaying has its own immediate kill switch. Use a generated key or import a previously created vanity private key while disabled.
 
+**Virtual Companion — RF, driven over your network.** A MeshCore companion radio in software: point a MeshCore app at the Pi's address as a WiFi/TCP companion and chat on the mesh through the room's modem. Its TCP port is closed until you enable it.
+
 Read the installation guide below to build an instance, then enable only the optional components you actually need.
 
-**Jump to:** [install and first configuration](#first-configuration) · [MQTT Observer](#outbound-mqtt-observer) · [MQTT Augmentation](#inbound-mqtt-ingestion) · [Virtual Repeater](#optional-virtual-repeater) · [dependencies](#dependencies)
+**Jump to:** [install and first configuration](#first-configuration) · [MQTT Observer](#outbound-mqtt-observer) · [MQTT Augmentation](#inbound-mqtt-ingestion) · [Virtual Repeater](#optional-virtual-repeater) · [Virtual Companion](#optional-virtual-companion) · [Rooms](#rooms) · [dependencies](#dependencies)
 
 See stats and what repeaters the room is well connected to
 <img width="1553" height="597" alt="image" src="https://github.com/user-attachments/assets/b9add1ee-5f80-4d57-b767-3be9e5889e07" />
@@ -86,7 +89,7 @@ Core functionality fixed:
    * Time via linux host (NTP)
    * A map of the mesh, learned from every packet heard (2/3-byte IDs only), so the room can build routes it was never told
    * Multiple routes per member with recency-weighted success rates, trying alternates before flood fallback
-   * A planned attempt order: best route, alternate, best again, next, flood; then backoff and give-up, instead of fixed retries
+   * A planned attempt order: the top 4 routes, then 2 floods; one retry a minute later (best route, then 2 floods), then suspension, instead of fixed retries
    * Newcomers reached direct on the first push: the companion directory knows where they are before they join by passively monitoring the mesh
    * Route shortcuts: unneeded hops are skipped when the room reaches a repeater directly, confirmed both ways
    * Adaptive push gaps sized from each route's measured ACK time; the ACK itselfends the wait, and flood gaps end once the rebroadcast wave passes
@@ -106,17 +109,18 @@ Core functionality fixed:
 
 ![Welcome DM settings](docs/images/welcome-dms-current.png)
 
-The admin-only **Welcome DMs** card lets an operator enable or disable the first-login message, customize the welcome text, and provide an optional prompt for members whose names are not yet known. Use `{room}` in either field to insert the room name.
+The admin-only **Welcome DMs** card on each room's page lets that room's admins enable or disable the first-login message, customize the welcome text, and provide an optional prompt for members whose names are not yet known. Use `{room}` in either field to insert the room name.
 
 # Additional useful features:
 * Web dashboard, public to view with an admin login, and isolated so it can't slow the radio.
    * Members table: delivery score, current TX/RX routes, and up to 5 alternates each way.
-   * Repeater map with links, and a detail pane for every repeater (key, position, routes, neighbors with SNR).
-   * Best-neighbor table: discovery every 15 minutes plus idle-time traces, ranked by packet loss, with SNR both ways.
+   * Repeater map with links, and a detail pane for every repeater (key, position, routes, neighbors with SNR). Repeaters not heard for 72 hours are left off the map.
+   * Best-neighbor table: discovery every 15 minutes plus idle-time traces, ranked by reliability (100% minus trace packet loss), with SNR both ways.
    * Stats: CPU and memory (now and 10-minute average), modem voltage, noise floor, channel use, packets/min, and pushes/min with delivery %.
    * Admin tools: resync, route suggestions with autocomplete, kick, ban/unban, and a chat box that posts as the room.
    * Messages: configurable welcome (with an advert reminder), plus kick/ban notices.
    * Passively collects SNR and Route data from traces as they pass by.
+* KaaS: the radio as a websocket API for bots and integrations, with hashed API keys and a Python client (see below).
 
 # Core capability detail
 
@@ -241,6 +245,7 @@ For either installation path, edit the private `meshroom/meshroom.json` and set 
 * Leave the supplied `.gitignore` in place. It excludes private configurations, runtime databases, logs, local Python environments, and key files; commit only `meshroom/meshroom.json.example`.
 * Give `admin_password` and `web_password` distinct, strong values if you enable RF or dashboard administration. Do not use known placeholders such as `changeme`; the installer rejects them when `--service` is requested. A blank `room_password` intentionally leaves the room open.
 * Keep the private configuration owner-readable only: `chmod 600 meshroom/meshroom.json`. The installer checks this before it installs a service.
+* If you enable the Virtual Companion, never forward its TCP port from the internet: the MeshCore companion protocol has no password. Use `companion_allow` to limit which addresses may connect.
 * Do not expose the built-in HTTP dashboard directly to the public internet. Bind it to a trusted interface, or place it behind an HTTPS reverse proxy with appropriate access controls.
 * Repository maintainers should enable GitHub secret scanning/push protection, Dependabot alerts, and branch protection for `main`. These are GitHub account settings, not configuration stored in this repository.
 
@@ -249,7 +254,8 @@ Start with every optional feature disabled:
 ```json
 "mqtt_enabled": false,
 "observer_enabled": false,
-"repeater_enabled": false
+"repeater_enabled": false,
+"companion_enabled": false
 ```
 
 This is the recommended initial installation. Confirm normal RF room operation before enabling any optional feature.
@@ -346,6 +352,7 @@ All fields below are for **inbound** MQTT augmentation. They do not change the o
 | Transport | `WebSockets` or `TCP`. | `WebSockets` for the GoMesh example. |
 | WebSocket path | The path supplied by the broker operator. | `/mqtt` for the GoMesh example. It is unused with TCP. |
 | TLS / Verify TLS certificate | Enable TLS when the broker supports it; leave certificate verification enabled for a public broker. | Both enabled for the GoMesh example. Disable verification only for a deliberately trusted private/self-signed deployment. |
+| Regions | Region codes to take in, like `SJC, SFO, MRY` (up to 16): the codes observers publish under. Saving fills in the topic filters below (`meshcore/SJC/+/packets`, ...); empty takes every region. Messages from any other region are dropped, even if the broker sends them. | Keeps nodes thousands of miles away out of the directory and MeshCore Web. |
 | Topic filter(s) | One or more MQTT subscription filters, separated with commas. | Use the operator-approved filter. `meshcore/#` is only a broad example; a region such as `SJC` is not portable to another installation. |
 | Subscriber username / password | The read-only credentials issued by the broker operator. Enter both fields together. | They are write-only and never appear in the status API or after page reload. |
 | ACK, Message, Topology, Advert, Activity ingestion | Choose which accepted MQTT packets can augment local room state. | All are enabled by default when MQTT augmentation is enabled. Disable a category if it is not useful to your deployment. |
@@ -356,7 +363,7 @@ After saving broker/topic fields or credentials, the inbound client reconnects a
 
 ### Outbound observer servers
 
-The **MQTT Observer** admin card manages the destinations for copies of locally received RF packets. Existing installations begin with GoMesh and MeshMapper as compatible defaults. The first server-list save makes the displayed list authoritative, so a server can be deleted when it is no longer wanted. Adding a regional destination requires that it implement the standard MeshCore observer protocol: modem-signed JWT authentication and packet/status topics shaped as `<topic prefix>/<IATA>/<room public key>/packets` and `.../status`.
+The **MQTT Observer** admin card manages the destinations for copies of locally received RF packets. Existing installations begin with GoMesh and MeshMapper as compatible defaults. The first server-list save makes the displayed list authoritative, so a server can be deleted when it is no longer wanted. Adding a regional destination requires that it implement the standard MeshCore observer protocol: modem-signed JWT authentication and packet/status topics shaped as `<topic prefix>/<IATA>/<room public key>/packets` and `.../status`. The IATA region code (your nearest airport, like `SJC`) starts empty and must be set before the observer can be turned on: everything it publishes is filed under that region, and other installations filter by it.
 
 | Server field | Purpose |
 | --- | --- |
@@ -388,7 +395,116 @@ If you already generated a matching private key for a vanity public key elsewher
 
 The RoomServer does not search for vanity keys and never exports a private key through the dashboard or status API. Preserve an encrypted offline backup of the private configuration before replacing a key. `repeater_relay` remains a separate relay kill switch: a repeater may advertise while forwarding is off.
 
-`repeater_relay` is an independent immediate relay kill switch. When false, the repeater may advertise but relays no packets. Configure its name, coordinates, scoped regions, advert intervals, airtime cap, and loop-detection mode through the admin dashboard. Keep it disabled until RF validation is explicitly planned.
+`repeater_relay` is an independent immediate relay kill switch. When false, the repeater may advertise but relays no packets. Configure its name, coordinates, scoped regions, advert intervals, airtime weight, and loop-detection mode through the admin dashboard. Keep it disabled until RF validation is explicitly planned.
+
+## Optional Virtual Companion
+
+`companion_enabled` runs a MeshCore companion (the `companion_radio` firmware's chat node) inside pyMeshRoom, with its own identity, on the room's modem. MeshCore apps connect to it over TCP exactly as to a WiFi companion radio, by default on port **5000**. The port is opened only while the companion is enabled and is closed again as soon as it is disabled. One app is connected at a time; a new connection replaces the previous one.
+
+Configure it from the **Virtual companion** admin card: enable it, set its name, the TCP port, allowed addresses (IP addresses or networks such as `192.168.1.0/24`; empty means anyone who can reach the port), and an optional auto advert (zero-hop or flood) with its interval in minutes. There is no separate Save button: the settings are saved when you turn the companion on, and they are locked (greyed out) while it runs. To change them, turn it off, edit, and turn it on again. The node name and position can also be changed from the app while it runs. Like the Virtual Repeater, a random key is created on first enable and saved in the private configuration, or you can import a private key (64 or 128 hex characters) while it is disabled. The private key is never exported: an app asking for it is told key export is disabled, as with default firmware. `companion_bind` (config file only) chooses the listening address; `127.0.0.1` keeps it to the Pi itself.
+
+The virtual companion is for a trusted local network only: its port has no login, as with MeshCore's Wi-Fi
+companions, so anyone who can reach it can read and delete its messages, read its channel secrets, send as it and have
+it sign data. Turning it on asks you to confirm that. Never forward the port to the internet; use **Allowed addresses**
+or `companion_bind`.
+
+What reaches the port still can't do everything: the companion won't sign an advert for itself or a MeshCore Web
+login (either would let someone impersonate the node), the app's transmissions are budgeted (10 at once, then one
+every 3 s; an advert at most every 10 s), replies to an app that stops reading are queued (it's disconnected past
+2048 replies or 512 KB) rather than waited for, and name / position changes from the app are saved at most every 30 s.
+
+What the app can do: contacts (auto-add from adverts, add, remove, share, import/export), direct messages with delivery confirmation, Public and hashtag/private channels, logins, status, telemetry and binary requests to repeaters and rooms (including this room), path discovery, traces, adverts, flood scope, message signing and statistics. Messages that arrive while no app is connected are kept until the app collects them.
+
+Settings that belong to the whole radio or to hardware the companion doesn't have are **acknowledged and ignored**: radio frequency/bandwidth/SF/CR, TX power, tuning, path hash mode, the Bluetooth PIN, reboot, factory reset, private key import, setting the clock (the Pi's clock is used) and app CLI commands. The app may show the value it sent until it reconnects and reads the real one. The node name, position, contact, channel, telemetry-permission and auto-add settings from the app are applied.
+
+The companion, the room and the Virtual Repeater share one radio, so traffic between them never goes on the air: logging in to this room, room posts and their ACKs are handed over internally, and the room skips the companion's own repeater at the start of its routes. Everything else is sent and received over RF as usual.
+
+Its data — contacts, channels, settings and messages waiting for the app — is kept in `companion.db` in `data_dir`, separate from `room.db` and readable only by the pyMeshRoom user. It is created the first time the companion is enabled; deleting it (while pyMeshRoom is stopped) resets only the companion.
+
+**Security:** the companion protocol has no authentication. Anyone who can reach the port can read the companion's messages and send as it. Keep the port on a trusted network, never forward it from the internet, and use `companion_allow` to restrict it.
+
+## Rooms
+
+The server hosts rooms; it has no room of its own. Its dashboard (the host page) runs the radio, the map, discovery,
+the virtual repeater and companion, KaaS and web users, and lists the **Rooms**. Each room is a full MeshCore room
+server with its own identity, members, posts, bans and passwords, and its own web page for its admins.
+
+The admin creates rooms from the **Rooms** card: room name, path (the page is at `http://<server>/<path>/`), private
+key (optional: a random one is generated if it's left blank), join password, admin password (used from MeshCore apps)
+and a web UI password for the room's page. **Create** starts the room straight away and announces it with an advert.
+Each room in the list has an **Actions** menu: **Reset web UI password** (anyone logged in to that room's page is logged
+out) and **Delete room**, which asks for the admin password and erases the room's members, posts, settings and key for
+good. Up to 100 rooms.
+
+A room's page shows its own members (active and suspended), bans, the room chat and the same repeater map and
+neighbour data as the host page. Its admins can post to the room, send its advert (zero-hop or flood) and set its location from the **Room** card,
+set its welcome DM, resync, suggest
+routes, kick, ban and unban, all for their room only. The host's admin can also act on any room's page.
+
+Nothing a room's admin does reaches outside their room. Over RF, a room's admin can change its name, position and
+passwords, read settings and manage its members, but not the radio, the push timing, discovery or the service (no
+reboot). The radio's settings and everything else in the config are shared and can only be changed by the host's admin.
+
+How it fits together:
+
+* `tenant_rooms` in the config lists each room's name, path and public key, nothing else. Everything else, including
+  its private key and passwords, is in its own database, `tenants/<public key>.db` in `data_dir` (readable only by the
+  pyMeshRoom user). The web UI password is stored hashed.
+* The host never advertises or answers logins. Its key (the modem's) is used only for the radio work: discovery and
+  traces. The MQTT observer reports as a room or the virtual repeater, chosen on its card.
+* Rooms share the host's map: heard repeaters, links and routes to repeaters, which the host learns.
+* All rooms share one radio and its airtime (a max transmit duty cycle, 50% by default, split by weight
+  between ACKs and replies, relays, room delivery, web users, the virtual companion, API clients and adverts: see the
+  dashboard's **Airtime** card and docs/api.md): they take turns pushing posts, and messages between rooms, the virtual
+  companion and the virtual repeater on this radio never go on the air.
+* **Upgrading from a version with a built-in room:** that room is no longer served. Its members and posts stay in
+  `room.db`, untouched, and the log says so at startup.
+
+## Optional KaaS API
+
+KaaS ("KISS radio as an API service") lets bots and other integrations use the radio over a websocket at
+`/api/v1/kaas` on the dashboard's port. A client with a **Receive** key gets every packet the radio hears and
+sends. A **Send** key can also send raw packets:
+
+* 3 in any 20 s per key (ACKs and path returns excepted)
+* within the API clients' share of airtime (by weight: 3% by default), more when the channel is quiet
+* at the lowest priority, after everything the room, its repeater and its pushes send
+
+Clients do all MeshCore crypto themselves. They can also ask the room what it has learned of the mesh: which
+repeaters hear a node, and the best routes from this radio to a repeater.
+
+The main admin makes keys on the **KaaS** card: Receive and/or Send, a description and an optional expiry date. Each key
+is shown once, when it's saved. The config keeps only its hash, so a lost key can only be revoked and replaced. The
+card lists every key with its last use, live connections, and packets received, packets sent and errors (24 h and
+total), and **Revoke** disconnects a key's clients at once.
+
+* Protocol: [docs/api.md](docs/api.md), and [docs/asyncapi.yaml](docs/asyncapi.yaml) for tools.
+* **MeshCore Web logins** (off by default; **Web users** card): people log in by signing with their node's private key,
+  which never leaves their browser. (API keys are for bots; browsers log in this way only.) Anyone can read. A key can send once this radio has
+  heard it advertise, or once the admin allows it, and only as itself. The card lists each user's name, key, access,
+  last activity and packet counts, with Allow send, Kick and Ban by key. See [docs/api.md](docs/api.md).
+
+### MeshCore Web
+
+pyMeshRoom serves a MeshCore chat client at `/meshcore-web/` on the dashboard's port, for example
+`https://mesh.example.com/meshcore-web/`. People log in with their node's private key and a name. The key never leaves
+their browser: the page signs a login challenge, and encrypts and signs messages itself, so the server only sees
+signatures and encrypted packets.
+
+It covers the Public channel, hashtag and private channels, DMs, rooms, contacts with a map, adverts, `@` mentions with
+autocomplete, and GIFs from Giphy links.
+
+It also reads and sends reactions, in MeshCore One's format as MeshTrax uses it. While someone is away, the server keeps
+channel messages and DMs (30 days by default, optionally including MQTT), and their browser catches up when they come
+back.
+
+Turn it on with **Allow web logins** on the **Web users** card. A **page password** there keeps the page, and logging
+in through it, to people who know it. Its source is in [web/](web/README.md).
+* Python client: [client/](client/README.md). It works with raw packets, or as a full chat node: adverts, contacts,
+  DMs, hashtag and private channels, and joining rooms.
+
+With no keys, nothing can connect and nothing changes. The dashboard serves plain HTTP, so give remote clients `wss://`
+through an HTTPS reverse proxy.
 
 ## Operations, upgrades, and rollback
 

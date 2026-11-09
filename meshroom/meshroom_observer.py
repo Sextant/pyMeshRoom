@@ -51,7 +51,7 @@ def _b64url(data):
 
 
 def make_auth_token(identity, public_key, audience, ttl=3600):
-    """Create a MeshCore MQTT token; the modem-backed identity does the signing."""
+    """Create a MeshCore MQTT token, signed by the identity the observer reports as."""
     now = int(time.time())
     header = {"alg": "Ed25519", "typ": "JWT"}
     payload = {
@@ -71,11 +71,14 @@ def make_auth_token(identity, public_key, audience, ttl=3600):
 class ObserverBridge:
     """Non-blocking handoff between MeshRoom RX and MQTT observer workers."""
 
-    def __init__(self, cfg, identity, start=True):
+    def __init__(self, cfg, identity, start=True, name=None):
         self.cfg = cfg
-        self.identity = identity
+        self.identity = identity                     # the node it reports as: the virtual repeater, or a room
         self.public_key = identity.pub_key.hex().upper()
-        self.iata = str(getattr(cfg, "observer_iata", "SJC")).upper()
+        self.origin = str(name if name is not None else getattr(cfg, "name", ""))
+        self.iata = str(getattr(cfg, "observer_iata", "") or "").upper()
+        if len(self.iata) != 3 or not self.iata.isalpha():
+            raise ValueError("no IATA region code set (your nearest airport, like SJC)")
         self.q = queue.Queue(maxsize=max(10, int(getattr(cfg, "observer_queue_max", 1000))))
         self.dropped = 0
         self.started = time.time()
@@ -94,7 +97,7 @@ class ObserverBridge:
         self._lock = threading.Lock()
         self._refresh = threading.Event()
         # Paho reconnects its own network loop, but a reconnect needs a new
-        # modem-signed JWT.  The callback only queues this work; the observer
+        # freshly signed JWT.  The callback only queues this work; the observer
         # worker owns stopping and replacing clients.
         self._reconnect = threading.Event()
         self._reconnect_brokers = set()
@@ -244,7 +247,7 @@ class ObserverBridge:
     def _status_message(self, online=True):
         snapshot = self.status()
         return json.dumps({
-            "origin": str(self.cfg.name),
+            "origin": self.origin,
             "origin_id": self.public_key,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "online": bool(online),
@@ -315,7 +318,7 @@ class ObserverBridge:
 
     def _sync_clients(self, mqtt, rebuild=False):
         """Reconcile broker settings in the observer worker thread."""
-        self.iata = str(getattr(self.cfg, "observer_iata", "SJC")).upper()
+        self.iata = str(getattr(self.cfg, "observer_iata", "") or self.iata).upper()
         self.q.maxsize = max(10, int(getattr(self.cfg, "observer_queue_max", 1000)))
         specs = self._servers()
         enabled = set(self._enabled())
@@ -429,7 +432,7 @@ class ObserverBridge:
         ptype, route, payload_len = self._packet_metadata(raw)
         dt = datetime.fromtimestamp(received_at, timezone.utc)
         message = {
-            "origin": str(self.cfg.name),
+            "origin": self.origin,
             "origin_id": self.public_key,
             "timestamp": dt.isoformat(),
             "type": "PACKET",
